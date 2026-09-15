@@ -291,6 +291,11 @@ func (ws *WriteSession) Prefetch(fetcher func() error) error {
 	}
 
 	if err := fetcher(); err != nil {
+		// Drop any partial download so the staged file never holds bytes the
+		// session does not account for. The next open retries the fetch.
+		if ws.File != nil {
+			_ = ws.File.Truncate(ws.Size)
+		}
 		return err
 	}
 

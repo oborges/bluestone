@@ -161,11 +161,15 @@ churn (zero errors across a 3-minute total outage):
   the sync worker retires the object when the backend heals.
 - Readdir serves staged entries when the object store cannot answer.
 
-Operations with no local truth (cold reads of never-cached data, creation of
-new directories, renames of clean files) still fail until the backend
-responds. Retaining staged data after sync (`staging.clean_after_sync: false`)
-widens local coverage: everything written since the staged copies were last
-cleaned remains readable through an outage.
+Operations with no local truth still fail until the backend responds: cold
+reads of never-cached data, creation of new directories, renames of clean
+files, and writable opens that keep an existing file's content when that
+content is not already staged. Refusing those opens is deliberate: the
+object's bytes cannot be staged, and writes to an empty staged copy would
+replace the object on sync. Truncating creates still work. Retaining staged
+data after sync (`staging.clean_after_sync: false`) widens local coverage:
+everything written since the staged copies were last cleaned remains
+readable through an outage.
 
 ### Directory And Metadata Path
 
