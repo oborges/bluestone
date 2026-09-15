@@ -32,6 +32,9 @@ type StagingManager struct {
 	tombstoneMu   sync.RWMutex
 	pressureMu    sync.Mutex
 	reservedBytes int64
+	// sidecarMu serializes read-modify-write updates of path metadata
+	// sidecars. Lock order: mu before sidecarMu.
+	sidecarMu sync.Mutex
 }
 
 var ErrPathConflicted = errors.New("staging path has unresolved conflict")
@@ -71,6 +74,9 @@ type ExternalChangeSnapshot struct {
 // without marking it dirty. Existing observed COS state and generation are
 // preserved.
 func (sm *StagingManager) EnsurePathMetadata(path, stagingPath string, size int64) error {
+	sm.sidecarMu.Lock()
+	defer sm.sidecarMu.Unlock()
+
 	metadataPath := sm.pathMetadataPath(stagingPath)
 	state, err := readPathMetadataState(metadataPath)
 	if err != nil && !os.IsNotExist(err) {
@@ -103,6 +109,13 @@ func (sm *StagingManager) EnsurePathMetadata(path, stagingPath string, size int6
 // details used to compare a staged write with the object state observed before
 // or during the write.
 func (sm *StagingManager) MarkPathDirtyMetadata(path string, size int64) (*PathMetadataState, error) {
+	// Read the session's attributes before taking the sidecar lock: the
+	// lookup takes mu, which must be acquired first.
+	attrs := sm.sessionAttributes(path)
+
+	sm.sidecarMu.Lock()
+	defer sm.sidecarMu.Unlock()
+
 	stagingPath := sm.stagingFilePath(path)
 	metadataPath := sm.pathMetadataPath(stagingPath)
 	state, err := readPathMetadataState(metadataPath)
@@ -134,6 +147,9 @@ func (sm *StagingManager) MarkPathDirtyMetadata(path string, size int64) (*PathM
 		state.DirtySince = now
 	}
 	state.LastModified = now
+	if attrs != nil {
+		state.Attributes = attrs
+	}
 
 	if err := writePathMetadataState(metadataPath, state); err != nil {
 		return nil, err
@@ -544,6 +560,10 @@ func (sm *StagingManager) RecoverSessionFromStaging(path string) (*WriteSession,
 	session, err := NewWriteSession(sm, path, stagingPath)
 	if err != nil {
 		return nil, err
+	}
+	// Upload the recovered bytes with the attributes they were staged with.
+	if state, err := readPathMetadataState(sm.pathMetadataPath(stagingPath)); err == nil && state.Attributes != nil {
+		session.restoreAttributes(*state.Attributes)
 	}
 
 	session.Size = info.Size()

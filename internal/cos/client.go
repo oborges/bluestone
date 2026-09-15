@@ -499,11 +499,13 @@ func (c *Client) HeadObject(ctx context.Context, key string) (*types.ObjectMetad
 		return nil, fmt.Errorf("failed to get object metadata: %w", err)
 	}
 
-	// Convert metadata
+	// Convert metadata. Keys are lowercased: header names are
+	// case-insensitive, and the SDK otherwise returns them canonicalized
+	// ("Mode" for x-amz-meta-mode), which callers would not match.
 	metadata := make(map[string]string)
 	for k, v := range result.Metadata {
 		if v != nil {
-			metadata[k] = *v
+			metadata[strings.ToLower(k)] = *v
 		}
 	}
 

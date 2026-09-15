@@ -589,6 +589,11 @@ type fakeObjectStore struct {
 	objects   map[string][]byte
 	deleted   map[string]bool
 	deleteErr error
+	// metadata holds each object's user metadata.
+	metadata map[string]map[string]string
+	// putCalls counts object writes, telling data rewrites from
+	// metadata-only updates.
+	putCalls int
 	// lookupErr fails HeadObject and ListObjects, as during an outage.
 	lookupErr error
 	// streamErr fails GetObjectStream bodies after streamPartialBytes bytes.
@@ -619,9 +624,42 @@ func (s *fakeObjectStore) failLookups(err error) {
 
 func newFakeObjectStore() *fakeObjectStore {
 	return &fakeObjectStore{
-		objects: make(map[string][]byte),
-		deleted: make(map[string]bool),
+		objects:  make(map[string][]byte),
+		deleted:  make(map[string]bool),
+		metadata: make(map[string]map[string]string),
 	}
+}
+
+func copyMetadata(metadata map[string]string) map[string]string {
+	if metadata == nil {
+		return nil
+	}
+	out := make(map[string]string, len(metadata))
+	for k, v := range metadata {
+		out[k] = v
+	}
+	return out
+}
+
+// putWithMetadata stores an object with user metadata, as another tool or an
+// earlier upload would have.
+func (s *fakeObjectStore) putWithMetadata(key string, data []byte, metadata map[string]string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.objects[key] = data
+	s.metadata[key] = copyMetadata(metadata)
+}
+
+func (s *fakeObjectStore) metadataOf(key string) map[string]string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return copyMetadata(s.metadata[key])
+}
+
+func (s *fakeObjectStore) putCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.putCalls
 }
 
 func (s *fakeObjectStore) put(key string, data []byte) {
@@ -695,6 +733,8 @@ func (s *fakeObjectStore) PutObject(ctx context.Context, key string, data []byte
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.objects[key] = append([]byte(nil), data...)
+	s.metadata[key] = copyMetadata(metadata)
+	s.putCalls++
 	return nil
 }
 
@@ -719,7 +759,7 @@ func (s *fakeObjectStore) HeadObject(ctx context.Context, key string) (*types.Ob
 	if !ok {
 		return nil, os.ErrNotExist
 	}
-	return &types.ObjectMetadata{Key: key, Size: int64(len(data))}, nil
+	return &types.ObjectMetadata{Key: key, Size: int64(len(data)), Metadata: copyMetadata(s.metadata[key])}, nil
 }
 
 func (s *fakeObjectStore) ListObjects(ctx context.Context, prefix string, maxKeys int) ([]*types.ObjectMetadata, error) {
@@ -748,10 +788,17 @@ func (s *fakeObjectStore) CopyObject(ctx context.Context, sourceKey, destKey str
 		return os.ErrNotExist
 	}
 	s.objects[destKey] = append([]byte(nil), data...)
+	s.metadata[destKey] = copyMetadata(s.metadata[sourceKey])
 	return nil
 }
 
 func (s *fakeObjectStore) UpdateObjectMetadata(ctx context.Context, key string, metadata map[string]string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.objects[key]; !ok {
+		return os.ErrNotExist
+	}
+	s.metadata[key] = copyMetadata(metadata)
 	return nil
 }
 

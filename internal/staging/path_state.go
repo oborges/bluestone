@@ -32,6 +32,9 @@ type PathMetadataState struct {
 	Size                 int64     `json:"size"`
 	DirtySince           time.Time `json:"dirty_since,omitempty"`
 	LastModified         time.Time `json:"last_modified,omitempty"`
+	// Attributes are the POSIX attributes the staged file syncs with, kept
+	// here so crash recovery uploads it with them.
+	Attributes *StagedAttributes `json:"attributes,omitempty"`
 }
 
 func objectKeyFromPath(path string) string {

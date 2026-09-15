@@ -187,6 +187,24 @@ listings, and affected data cache entries. Directory rename and delete also
 invalidate cached data under the affected prefixes so range/chunk reads do not
 serve stale bytes through old logical paths.
 
+### File Attributes
+
+POSIX attributes (mode, owner, and times) are stored in COS user metadata
+under the keys `mode`, `uid`, `gid`, `atime`, `mtime`, and `ctime`.
+Attributes that earlier gateway versions stored under double-prefixed keys
+still decode, and are rewritten under the current keys on the next attribute
+change.
+
+- `chmod`, `chown`, and time changes on synced files are metadata-only
+  copy-in-place updates that keep unrelated user metadata; they do not
+  rewrite file contents.
+- Staged files carry the mode and owner of the object they replace, so
+  editing a file does not reset them on sync. Those attributes are persisted
+  in the staging sidecar, so crash recovery and staged renames keep them.
+- COS listings do not return object metadata. Directory listings reuse
+  attributes cached from a recent stat when the listed size and modification
+  time still match, and report defaults otherwise.
+
 ### Object-Side Refresh Path
 
 Direct changes made in COS by tools outside the gateway are discovered in two
