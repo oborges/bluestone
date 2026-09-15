@@ -6,6 +6,8 @@ import "context"
 const (
 	// ProtocolNFS marks requests issued by the NFS server.
 	ProtocolNFS = "nfs"
+	// ProtocolSMB marks requests issued by the SMB server.
+	ProtocolSMB = "smb"
 	// ProtocolInternal marks requests with no protocol attached, such as
 	// background work inside the gateway.
 	ProtocolInternal = "internal"
