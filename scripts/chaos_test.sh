@@ -50,7 +50,9 @@ echo "Hello Cache" > /mnt/cos-nfs/trunc_test.txt
 sleep 1
 truncate -s 0 /mnt/cos-nfs/trunc_test.txt
 echo "Truncated!" >> /mnt/cos-nfs/trunc_test.txt
-if grep -q "Truncated" /mnt/cos-nfs/trunc_test.txt; then
+# Compare exact content: a truncate that silently does nothing leaves
+# "Hello Cache" in front, which a grep for "Truncated" would not catch.
+if [ "$(cat /mnt/cos-nfs/trunc_test.txt)" = "Truncated!" ]; then
     echo "✓ TEST 2 PASSED: Truncation logic gracefully supported!"
 else
     echo "❌ TEST 2 FAILED: Truncation corrupted staging bindings!"

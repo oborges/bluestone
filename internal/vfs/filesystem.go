@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -1142,6 +1143,12 @@ type File struct {
 	stagingManager *staging.StagingManager
 	syncWorker     *staging.SyncWorker
 	featureFlags   *feature.FeatureFlags
+
+	// mu guards the mutable handle state above (offset, size, data, loaded,
+	// isNew, writeSession, counters) and closed, so one open file can serve
+	// concurrent requests, as SMB clients send on a single handle.
+	mu     sync.Mutex
+	closed bool
 }
 
 // Name returns the file name
@@ -1159,6 +1166,12 @@ func (f *File) maxBufferedWriteBytes() int64 {
 
 // Read reads data from the file
 func (f *File) Read(p []byte) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.closed {
+		return 0, os.ErrClosed
+	}
+
 	// STAGING PATH: Check staging session first for dirty files
 	if f.featureFlags != nil && f.featureFlags.IsStagingEnabled() && f.stagingSession != nil {
 		// Read from staging session
@@ -1241,34 +1254,63 @@ func (f *File) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-// Write writes data to the file with session-based buffering
+// Write writes data at the handle offset and advances it.
 func (f *File) Write(p []byte) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.closed {
+		return 0, os.ErrClosed
+	}
+	n, err := f.writeLocked(p, f.offset)
+	f.offset += int64(n)
+	return n, err
+}
+
+// WriteAt writes data at off without moving the handle offset, so protocols
+// with positional writes can share one open file across concurrent requests.
+func (f *File) WriteAt(p []byte, off int64) (int, error) {
+	if off < 0 {
+		return 0, &os.PathError{Op: "writeat", Path: f.path, Err: os.ErrInvalid}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.closed {
+		return 0, os.ErrClosed
+	}
+	return f.writeLocked(p, off)
+}
+
+// writeLocked writes data at offset with session-based buffering. The caller
+// holds f.mu and owns the handle offset.
+func (f *File) writeLocked(p []byte, offset int64) (int, error) {
 	f.totalWrites++
 
 	// STAGING PATH: Write to staging session
 	if f.featureFlags != nil && f.featureFlags.IsStagingEnabled() && f.stagingSession != nil {
-		n, err := f.stagingSession.Write(p, f.offset)
+		n, err := f.stagingSession.Write(p, offset)
 		if err != nil {
 			f.logger.Error("STAGING WRITE ERROR",
 				"file_id", f.fileID,
 				"path", f.path,
-				"offset", f.offset,
+				"offset", offset,
 				"bytes", len(p),
 				"error", err)
 			return 0, err
 		}
 
-		f.offset += int64(n)
+		// Other handles may be writing the same session; read its size
+		// under the session lock.
+		sessionSize := f.stagingSession.GetSize()
 
 		// Mark file as dirty and update size
-		f.stagingManager.MarkDirty(f.path, f.stagingSession.Size)
+		f.stagingManager.MarkDirty(f.path, sessionSize)
 
 		f.logger.Info("STAGING WRITE",
 			"file_id", f.fileID,
 			"path", f.path,
-			"offset", f.offset-int64(n),
+			"offset", offset,
 			"bytes", n,
-			"session_size", f.stagingSession.Size,
+			"session_size", sessionSize,
 			"write_count", f.totalWrites)
 
 		return n, nil
@@ -1291,7 +1333,7 @@ func (f *File) Write(p []byte) (int, error) {
 
 	// Write to session buffer (thread-safe)
 	f.writeSession.Mu.Lock()
-	n, err := f.writeSession.Buffer.Write(f.offset, p)
+	n, err := f.writeSession.Buffer.Write(offset, p)
 	shouldFlush := f.writeSession.Buffer.ShouldFlush()
 	bufferSize := f.writeSession.Buffer.Size()
 	f.writeSession.Mu.Unlock()
@@ -1301,19 +1343,17 @@ func (f *File) Write(p []byte) (int, error) {
 			"file_id", f.fileID,
 			"session_id", f.writeSession.SessionID,
 			"path", f.path,
-			"offset", f.offset,
+			"offset", offset,
 			"bytes", len(p),
 			"error", err)
 		return 0, err
 	}
 
-	f.offset += int64(n)
-
 	f.logger.Info("WRITE",
 		"file_id", f.fileID,
 		"session_id", f.writeSession.SessionID,
 		"path", f.path,
-		"offset", f.offset-int64(n),
+		"offset", offset,
 		"bytes", n,
 		"buffer_size_bytes", bufferSize,
 		"buffer_size_mb", float64(bufferSize)/(1024*1024),
@@ -1543,9 +1583,18 @@ func (f *File) flushSessionBuffer() error {
 
 // Close closes the file and releases the write session
 func (f *File) Close() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	// A repeated Close must not release the shared staging session again:
+	// that would drop a reference another handle still holds.
+	if f.closed {
+		return nil
+	}
+	f.closed = true
+
 	// STAGING PATH: Release staging session
 	if f.featureFlags != nil && f.featureFlags.IsStagingEnabled() && f.stagingSession != nil {
-		sessionSize := f.stagingSession.Size
+		sessionSize := f.stagingSession.GetSize()
 		isDirty := f.stagingSession.Dirty
 		refCount := f.stagingSession.GetRefCount()
 
@@ -1573,7 +1622,7 @@ func (f *File) Close() error {
 				"file_id", f.fileID,
 				"path", f.path,
 				"total_writes", f.totalWrites,
-				"session_size", f.stagingSession.Size)
+				"session_size", sessionSize)
 		}
 
 		return nil
@@ -1583,6 +1632,8 @@ func (f *File) Close() error {
 	if f.writeSession != nil {
 		if err := f.flushSessionBuffer(); err != nil {
 			f.logger.Error("Failed to flush session buffer on close", "error", err)
+			// Buffered data is still held; leave the handle open for a retry.
+			f.closed = false
 			return err
 		}
 
@@ -1632,16 +1683,16 @@ func (f *File) Close() error {
 
 // Seek sets the file offset
 func (f *File) Seek(offset int64, whence int) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.closed {
+		return 0, os.ErrClosed
+	}
 	if err := f.ensureLoaded(); err != nil && !f.isNew {
 		return 0, err
 	}
 
-	var fileSize int64
-	if f.data != nil {
-		fileSize = int64(len(f.data))
-	} else {
-		fileSize = f.size
-	}
+	fileSize := f.currentSizeLocked()
 
 	switch whence {
 	case io.SeekStart:
@@ -1661,6 +1712,19 @@ func (f *File) Seek(offset int64, whence int) (int64, error) {
 	return f.offset, nil
 }
 
+// currentSizeLocked returns the live file size. Staged bytes change through
+// this and other handles, so the size cached at load time goes stale.
+func (f *File) currentSizeLocked() int64 {
+	switch {
+	case f.featureFlags != nil && f.featureFlags.IsStagingEnabled() && f.stagingSession != nil:
+		return f.stagingSession.GetSize()
+	case f.data != nil:
+		return int64(len(f.data))
+	default:
+		return f.size
+	}
+}
+
 // Lock locks the file (no-op for COS)
 func (f *File) Lock() error {
 	return nil
@@ -1673,12 +1737,22 @@ func (f *File) Unlock() error {
 
 // ReadAt reads data from the file at a specific offset
 func (f *File) ReadAt(p []byte, off int64) (int, error) {
+	// Hold the handle lock only while loading state. The staging and object
+	// reads below are positional, so concurrent ReadAt calls on one handle
+	// run in parallel.
+	f.mu.Lock()
+	if f.closed {
+		f.mu.Unlock()
+		return 0, os.ErrClosed
+	}
 	if err := f.ensureLoaded(); err != nil {
+		f.mu.Unlock()
 		return 0, err
 	}
 
 	// If data is loaded in memory (writable file), use it
 	if f.data != nil {
+		defer f.mu.Unlock()
 		if off >= int64(len(f.data)) {
 			return 0, io.EOF
 		}
@@ -1688,6 +1762,8 @@ func (f *File) ReadAt(p []byte, off int64) (int, error) {
 		}
 		return n, nil
 	}
+	size := f.size
+	f.mu.Unlock()
 
 	// Read from local staging session natively to support FIO caching guarantees
 	if f.featureFlags != nil && f.featureFlags.IsStagingEnabled() && f.stagingSession != nil {
@@ -1701,7 +1777,7 @@ func (f *File) ReadAt(p []byte, off int64) (int, error) {
 	}
 
 	// Check if we're at or past EOF
-	if off >= f.size {
+	if off >= size {
 		return 0, io.EOF
 	}
 
@@ -1725,27 +1801,107 @@ func (f *File) ReadAt(p []byte, off int64) (int, error) {
 	// Per io.ReaderAt contract: return EOF only if no bytes were read
 	// If we read some bytes but less than requested, that's still success
 	// The caller will detect EOF on the next call when off >= size
-	if n < len(p) && off+int64(n) >= f.size {
+	if n < len(p) && off+int64(n) >= size {
 		return n, io.EOF
 	}
 
 	return n, nil
 }
 
-// Truncate truncates the file to a specified size
+// Truncate changes the file size, shrinking or zero-extending it. NFS
+// SETATTR size (truncate(1), ftruncate) arrives here.
 func (f *File) Truncate(size int64) error {
-	if err := f.ensureLoaded(); err != nil && !f.isNew {
+	if size < 0 {
+		return &os.PathError{Op: "truncate", Path: f.path, Err: os.ErrInvalid}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.closed {
+		return os.ErrClosed
+	}
+	if f.flag&(os.O_WRONLY|os.O_RDWR) == 0 {
+		return &os.PathError{Op: "truncate", Path: f.path, Err: os.ErrPermission}
+	}
+
+	if f.featureFlags != nil && f.featureFlags.IsStagingEnabled() && f.stagingSession != nil {
+		// Resize the staged bytes: they are what reads, Stat, and the sync
+		// worker see. The handle's in-memory buffer is unused on this path.
+		if err := f.stagingSession.Truncate(size); err != nil {
+			f.logger.Error("Failed to truncate staging file",
+				"file_id", f.fileID,
+				"path", f.path,
+				"size", size,
+				"error", err)
+			return err
+		}
+		f.stagingManager.MarkDirty(f.path, size)
+		return nil
+	}
+
+	return f.truncateObjectLocked(size)
+}
+
+// truncateObjectLocked resizes the object directly when staging is disabled.
+// Buffered writes are flushed first so the resize applies on top of them.
+func (f *File) truncateObjectLocked(size int64) error {
+	if size > f.maxBufferedWriteBytes() {
+		return fmt.Errorf("truncate of %s to %d bytes exceeds max_buffered_write_mb=%d; enable staging or raise the limit",
+			f.path, size, f.maxBufferedWriteBytes()/(1024*1024))
+	}
+
+	if f.writeSession != nil {
+		f.writeSession.Mu.Lock()
+		buffered := f.writeSession.Buffer.Size() > 0
+		f.writeSession.Mu.Unlock()
+		if err := f.flushSessionBuffer(); err != nil {
+			return err
+		}
+		if buffered {
+			// The flush created or rewrote the object.
+			f.isNew = false
+		}
+	}
+
+	ctx := context.Background()
+	mode := f.perm
+	var existing []byte
+	switch {
+	case f.data != nil:
+		existing = f.data
+	case !f.isNew:
+		info, err := f.ops.Stat(ctx, f.path)
+		if err != nil {
+			return err
+		}
+		mode = info.Mode().Perm()
+		if size > 0 && info.Size() > 0 {
+			data, err := f.ops.ReadFile(ctx, f.path, 0, 0)
+			if err != nil {
+				return err
+			}
+			existing = data
+		}
+	}
+	if mode == 0 {
+		mode = 0644
+	}
+
+	resized := make([]byte, size)
+	copy(resized, existing)
+	attrs := &types.POSIXAttributes{
+		Mode:  mode,
+		UID:   1000,
+		GID:   1000,
+		Mtime: time.Now(),
+	}
+	if err := f.ops.WriteFile(ctx, f.path, resized, attrs); err != nil {
 		return err
 	}
 
-	if size < int64(len(f.data)) {
-		f.data = f.data[:size]
-	} else if size > int64(len(f.data)) {
-		newData := make([]byte, size)
-		copy(newData, f.data)
-		f.data = newData
-	}
-
+	f.data = nil
+	f.size = size
+	f.loaded = true
+	f.isNew = false
 	return nil
 }
 
