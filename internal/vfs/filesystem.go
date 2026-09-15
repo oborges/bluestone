@@ -256,9 +256,14 @@ func (fs *Filesystem) OpenFile(filename string, flag int, perm os.FileMode) (bil
 	}
 
 	writable := flag&(os.O_WRONLY|os.O_RDWR|os.O_CREATE) != 0
+	var existingAttrs *types.POSIXAttributes
 	if !existenceKnown {
-		_, err := fs.ops.Stat(fs.requestContext(), fullPath)
+		info, err := fs.ops.Stat(fs.requestContext(), fullPath)
 		fileExists = err == nil && !pendingDelete
+		if fileExists {
+			attrs := info.Attributes()
+			existingAttrs = &attrs
+		}
 
 		// A writable open that keeps existing content needs that content
 		// staged first. If the object store cannot say whether an object is
@@ -277,6 +282,12 @@ func (fs *Filesystem) OpenFile(filename string, flag int, perm os.FileMode) (bil
 	}
 
 	if useStagingPath && file.stagingSession != nil && flag&(os.O_WRONLY|os.O_RDWR|os.O_CREATE) != 0 {
+		// The staged bytes replace the object on sync, so they carry the
+		// object's mode and owner, even when this open truncates it.
+		if existingAttrs != nil {
+			file.stagingSession.SeedAttributes(existingAttrs.Mode, uint32(existingAttrs.UID), uint32(existingAttrs.GID))
+		}
+
 		// Automatically pre-fetch existing COS objects if modifying without truncating
 		if fileExists && !existenceKnown && flag&os.O_TRUNC == 0 {
 			err := file.stagingSession.Prefetch(func() error {
@@ -1053,41 +1064,18 @@ func (fs *Filesystem) Root() string {
 
 // Chmod changes the mode of the named file
 func (fs *Filesystem) Chmod(name string, mode os.FileMode) error {
-	// COS doesn't support chmod directly, but we can update metadata
 	fullPath := fs.Join(fs.root, name)
 
 	if fs.featureFlags != nil && fs.featureFlags.IsStagingEnabled() && fs.stagingManager != nil {
 		if session, exists := fs.stagingManager.GetSession(fullPath); exists {
-			session.UpdateAttributes(mode, session.UID, session.GID)
-			return nil // Staged files bypass COS metadata swaps safely bound natively!
+			// Staged files carry their mode to COS on the next sync.
+			session.SetMode(mode)
+			return nil
 		}
 	}
 
-	// Get current file info
-	info, err := fs.ops.Stat(fs.requestContext(), fullPath)
-	if err != nil {
-		return err
-	}
-
-	// Update with new mode
-	attrs := &types.POSIXAttributes{
-		Mode:  mode,
-		UID:   1000,
-		GID:   1000,
-		Mtime: time.Now(),
-	}
-
-	// For files, we need to read and rewrite with new attributes
-	if !info.IsDir() {
-		data, err := fs.ops.ReadFile(fs.requestContext(), fullPath, 0, 0)
-		if err != nil {
-			return err
-		}
-		return fs.ops.WriteFile(fs.requestContext(), fullPath, data, attrs)
-	}
-
-	// For directories, just update the marker
-	return fs.ops.CreateDirectory(fs.requestContext(), fullPath, attrs)
+	// A metadata-only update: the object's bytes are not rewritten.
+	return fs.ops.UpdateAttributes(fs.requestContext(), fullPath, posix.AttributeUpdate{Mode: &mode})
 }
 
 // Lchown changes the uid and gid of the named file (link itself)
@@ -1102,36 +1090,14 @@ func (fs *Filesystem) Chown(name string, uid, gid int) error {
 
 	if fs.featureFlags != nil && fs.featureFlags.IsStagingEnabled() && fs.stagingManager != nil {
 		if session, exists := fs.stagingManager.GetSession(fullPath); exists {
-			session.UpdateAttributes(session.Mode, uint32(uid), uint32(gid))
-			return nil // Staged files bypass COS metadata swaps safely bounded
+			// Staged files carry their owner to COS on the next sync.
+			session.SetOwner(uint32(uid), uint32(gid))
+			return nil
 		}
 	}
 
-	// Get current file info
-	info, err := fs.ops.Stat(fs.requestContext(), fullPath)
-	if err != nil {
-		return err
-	}
-
-	// Update with new ownership
-	attrs := &types.POSIXAttributes{
-		Mode:  info.Mode(),
-		UID:   uid,
-		GID:   gid,
-		Mtime: time.Now(),
-	}
-
-	// For files, read and rewrite with new attributes
-	if !info.IsDir() {
-		data, err := fs.ops.ReadFile(fs.requestContext(), fullPath, 0, 0)
-		if err != nil {
-			return err
-		}
-		return fs.ops.WriteFile(fs.requestContext(), fullPath, data, attrs)
-	}
-
-	// For directories, update the marker
-	return fs.ops.CreateDirectory(fs.requestContext(), fullPath, attrs)
+	// A metadata-only update: the object's bytes are not rewritten.
+	return fs.ops.UpdateAttributes(fs.requestContext(), fullPath, posix.AttributeUpdate{UID: &uid, GID: &gid})
 }
 
 // Chtimes changes the access and modification times
@@ -1142,23 +1108,8 @@ func (fs *Filesystem) Chtimes(name string, atime time.Time, mtime time.Time) err
 		return nil // Staged files bypass COS metadata swaps
 	}
 
-	// Get current file info
-	info, err := fs.ops.Stat(fs.requestContext(), fullPath)
-	if err != nil {
-		return err
-	}
-
-	// Update with new times
-	attrs := &types.POSIXAttributes{
-		Mode:  info.Mode(),
-		UID:   1000,
-		GID:   1000,
-		Mtime: mtime,
-		Atime: atime,
-	}
-
-	// Use efficient metadata update (no need to read/rewrite entire file)
-	return fs.ops.UpdateAttributes(fs.requestContext(), fullPath, attrs)
+	// A metadata-only update that keeps every other attribute.
+	return fs.ops.UpdateAttributes(fs.requestContext(), fullPath, posix.AttributeUpdate{Atime: &atime, Mtime: &mtime})
 }
 
 // File implements billy.File interface

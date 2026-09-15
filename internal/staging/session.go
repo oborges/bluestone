@@ -27,6 +27,9 @@ type WriteSession struct {
 	UID         uint32
 	GID         uint32
 	mu          sync.Mutex
+	// attributesSet records that Mode, UID, and GID came from the staged
+	// object or a client rather than the new-session defaults.
+	attributesSet bool
 }
 
 // NewWriteSession creates a new write session
@@ -70,16 +73,59 @@ func NewWriteSession(manager *StagingManager, path string, stagingPath string) (
 	}, nil
 }
 
-// UpdateAttributes seamlessly mutates POSIX tracking bounds natively
-func (ws *WriteSession) UpdateAttributes(mode os.FileMode, uid uint32, gid uint32) {
+// SeedAttributes adopts the mode and owner of the object this session stages,
+// so the staged bytes sync with them. It applies once: attributes already
+// seeded or set by a client are kept.
+func (ws *WriteSession) SeedAttributes(mode os.FileMode, uid, gid uint32) {
+	ws.mu.Lock()
+	if ws.attributesSet {
+		ws.mu.Unlock()
+		return
+	}
+	ws.Mode, ws.UID, ws.GID = mode, uid, gid
+	ws.attributesSet = true
+	ws.mu.Unlock()
+	ws.persistAttributes()
+}
+
+// SetMode changes the mode the staged file syncs with.
+func (ws *WriteSession) SetMode(mode os.FileMode) {
+	ws.mu.Lock()
+	ws.Mode = mode
+	ws.attributesSet = true
+	ws.mu.Unlock()
+	ws.persistAttributes()
+}
+
+// SetOwner changes the owner the staged file syncs with.
+func (ws *WriteSession) SetOwner(uid, gid uint32) {
+	ws.mu.Lock()
+	ws.UID, ws.GID = uid, gid
+	ws.attributesSet = true
+	ws.mu.Unlock()
+	ws.persistAttributes()
+}
+
+// restoreAttributes applies attributes recovered from the sidecar.
+func (ws *WriteSession) restoreAttributes(attrs StagedAttributes) {
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
-	if mode != 0 {
-		ws.Mode = mode
+	ws.Mode, ws.UID, ws.GID = attrs.Mode, attrs.UID, attrs.GID
+	ws.attributesSet = true
+}
+
+// stagedAttributes returns the session's attributes, its staging path, and
+// whether the attributes were seeded or set rather than defaults.
+func (ws *WriteSession) stagedAttributes() (StagedAttributes, string, bool) {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+	return StagedAttributes{Mode: ws.Mode, UID: ws.UID, GID: ws.GID}, ws.StagingPath, ws.attributesSet
+}
+
+func (ws *WriteSession) persistAttributes() {
+	if ws.Manager != nil {
+		ws.Manager.persistSessionAttributes(ws)
 	}
-	// Avoid wiping 0 explicitly unless bounded but standard NFS propagates variables accurately
-	ws.UID = uid
-	ws.GID = gid
 }
 
 // Rekey points the session at a renamed path. The open descriptor still

@@ -221,6 +221,7 @@ func (h *OperationsHandler) Stat(ctx context.Context, path string) (_ *FileInfo,
 				mode:    mode,
 				modTime: modTime,
 				isDir:   entry.IsDir,
+				attrs:   entry.Attributes,
 			}, nil
 		}
 		// Implicit directory - fall through to validate
@@ -240,6 +241,7 @@ func (h *OperationsHandler) Stat(ctx context.Context, path string) (_ *FileInfo,
 			mode:    attrs.Mode | os.ModeDir,
 			modTime: attrs.Mtime,
 			isDir:   true,
+			attrs:   attrs,
 		}
 		h.metadataCache.SetFileInfo(path, info, attrs)
 		return info, nil
@@ -285,6 +287,7 @@ func (h *OperationsHandler) Stat(ctx context.Context, path string) (_ *FileInfo,
 			mode:    attrs.Mode,
 			modTime: metadata.LastModified,
 			isDir:   false,
+			attrs:   attrs,
 		}
 
 		// Cache the result
@@ -307,6 +310,7 @@ func (h *OperationsHandler) Stat(ctx context.Context, path string) (_ *FileInfo,
 			mode:    attrs.Mode | os.ModeDir,
 			modTime: metadata.LastModified,
 			isDir:   true,
+			attrs:   attrs,
 		}
 
 		// Cache the result
@@ -339,6 +343,7 @@ func (h *OperationsHandler) Stat(ctx context.Context, path string) (_ *FileInfo,
 			mode:    attrs.Mode,
 			modTime: attrs.Mtime,
 			isDir:   true,
+			attrs:   attrs,
 		}
 
 		// Cache the result as a normal directory (NOT implicit)
@@ -422,7 +427,23 @@ func fileInfoFromCacheEntry(path string, entry *cache.MetadataEntry) *FileInfo {
 		mode:    mode,
 		modTime: modTime,
 		isDir:   entry.IsDir,
+		attrs:   entry.Attributes,
 	}
+}
+
+// cachedAttributes returns attributes an earlier Stat cached for path when
+// they still describe the listed object (same kind, and for files the same
+// size and modification time). COS listings carry no object metadata, so this
+// lets listings report real attributes without a HEAD request per entry.
+func (h *OperationsHandler) cachedAttributes(path string, obj *types.ObjectMetadata, isDir bool) *types.POSIXAttributes {
+	entry, ok := h.metadataCache.Get(path)
+	if !ok || entry.Negative || entry.Attributes == nil || entry.FileInfo == nil || entry.IsDir != isDir {
+		return nil
+	}
+	if !isDir && (entry.FileInfo.Size() != obj.Size || !entry.FileInfo.ModTime().Equal(obj.LastModified)) {
+		return nil
+	}
+	return entry.Attributes
 }
 
 // DownloadToFile streams the object from COS into a local file path
@@ -1014,6 +1035,9 @@ fetchFromCOS:
 		seen[name] = true
 
 		attrs := DecodePOSIXAttributes(obj.Metadata, isDir)
+		if cached := h.cachedAttributes(JoinPath(NormalizePath(path), name), obj, isDir); cached != nil {
+			attrs = cached
+		}
 		mode := attrs.Mode
 		if isDir && (mode&os.ModeDir) == 0 {
 			mode = mode | os.ModeDir
@@ -1025,6 +1049,7 @@ fetchFromCOS:
 			mode:    mode,
 			modTime: obj.LastModified,
 			isDir:   isDir,
+			attrs:   attrs,
 		}
 
 		log.Debug("Adding entry",
@@ -1166,37 +1191,55 @@ func (h *OperationsHandler) renameDirectory(ctx context.Context, oldPath, newPat
 	return nil
 }
 
-// UpdateAttributes updates file/directory attributes without rewriting content
-func (h *OperationsHandler) UpdateAttributes(ctx context.Context, path string, attrs *types.POSIXAttributes) (err error) {
+// UpdateAttributes applies a metadata-only attribute change without rewriting
+// content. The update merges into the object's current metadata, read fresh,
+// so other attributes and unrelated user metadata are kept.
+func (h *OperationsHandler) UpdateAttributes(ctx context.Context, path string, update AttributeUpdate) (err error) {
 	log := logging.WithOperation("UpdateAttributes").With(zap.String("path", path))
 	start := time.Now()
 	defer func() {
 		metrics.RecordRequest(ctx, "setattr", err, time.Since(start))
 	}()
 
-	objectKey := h.translator.ToObjectKey(path)
-
-	// Check if it's a directory
 	info, err := h.Stat(ctx, path)
 	if err != nil {
 		return err
 	}
-
+	objectKey := h.translator.ToObjectKey(path)
 	if info.IsDir() {
 		objectKey = ToDirectoryKey(objectKey)
 	}
 
-	// Encode attributes
-	metadata := EncodePOSIXAttributes(attrs)
+	// A cached Stat may predate another client's change, so merge into the
+	// metadata the object has now.
+	existing := map[string]string{}
+	markerMissing := false
+	head, headErr := h.cosClient.HeadObject(ctx, objectKey)
+	switch {
+	case headErr == nil:
+		existing = head.Metadata
+	case info.IsDir() && errors.Is(headErr, os.ErrNotExist):
+		// An implicit directory has no marker object to update.
+		markerMissing = true
+	default:
+		return headErr
+	}
 
-	// Update metadata using copy-to-self
-	err = h.cosClient.UpdateObjectMetadata(ctx, objectKey, metadata)
+	attrs := DecodePOSIXAttributes(existing, info.IsDir())
+	update.Apply(attrs, time.Now())
+	metadata := MergePOSIXMetadata(existing, attrs)
+
+	if markerMissing {
+		err = h.cosClient.PutObject(ctx, objectKey, []byte{}, metadata)
+	} else {
+		// Copy-to-self with replaced metadata: the bytes are not rewritten.
+		err = h.cosClient.UpdateObjectMetadata(ctx, objectKey, metadata)
+	}
 	if err != nil {
 		log.Error("Failed to update attributes", zap.Error(err))
 		return err
 	}
 
-	// Invalidate metadata cache
 	h.metadataCache.InvalidatePath(path)
 
 	log.Debug("Attributes updated successfully")
@@ -1210,6 +1253,7 @@ type FileInfo struct {
 	mode    os.FileMode
 	modTime time.Time
 	isDir   bool
+	attrs   *types.POSIXAttributes
 }
 
 // Implement os.FileInfo interface
@@ -1219,6 +1263,15 @@ func (f *FileInfo) Mode() os.FileMode  { return f.mode }
 func (f *FileInfo) ModTime() time.Time { return f.modTime }
 func (f *FileInfo) IsDir() bool        { return f.isDir }
 func (f *FileInfo) Sys() interface{}   { return nil }
+
+// Attributes returns the entry's POSIX attributes: decoded from object
+// metadata, or defaults when its source (such as a listing) carried none.
+func (f *FileInfo) Attributes() types.POSIXAttributes {
+	if f.attrs == nil {
+		return *DefaultAttributes(f.isDir)
+	}
+	return *f.attrs
+}
 
 var _ os.FileInfo = (*FileInfo)(nil)
 var _ io.Closer = (*OperationsHandler)(nil)

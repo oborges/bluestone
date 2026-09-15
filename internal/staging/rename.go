@@ -78,6 +78,7 @@ func (sm *StagingManager) RenameStagedPath(oldPath, newPath string) error {
 		}
 		state.LocalDirtyGeneration = meta.LocalDirtyGeneration + 1
 	}
+	state.Attributes = sm.renamedAttributes(oldPath, oldStaging)
 	if err := writePathMetadataState(sm.pathMetadataPath(newStaging), state); err != nil {
 		return fmt.Errorf("failed to persist renamed staging metadata: %w", err)
 	}
