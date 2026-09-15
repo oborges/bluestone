@@ -37,6 +37,28 @@ type Config struct {
 	Logging       LoggingConfig       `mapstructure:"logging"`
 	Staging       StagingConfig       `mapstructure:"staging"`
 	HA            HAConfig            `mapstructure:"ha"`
+	SMB           SMBConfig           `mapstructure:"smb"`
+}
+
+// SMBConfig controls the SMB server, which serves the same bucket as NFS with
+// Windows naming (case-insensitive names, mapped reserved characters).
+type SMBConfig struct {
+	Enabled bool `mapstructure:"enabled"`
+	Port    int  `mapstructure:"port"`
+	// ShareName is the share clients connect to, as in \\host\bluestone.
+	ShareName string `mapstructure:"share_name"`
+	// Domain is the NTLM domain and server name the gateway advertises.
+	Domain string `mapstructure:"domain"`
+	// EncryptionRequired rejects sessions that do not encrypt traffic.
+	EncryptionRequired bool `mapstructure:"encryption_required"`
+	// Users are the accounts allowed to connect, authenticated with NTLM.
+	Users []SMBUser `mapstructure:"users"`
+}
+
+// SMBUser is an account allowed to connect to the SMB share.
+type SMBUser struct {
+	Username string `mapstructure:"username"`
+	Password string `mapstructure:"password"`
 }
 
 // HAConfig controls active/passive fencing through a bucket lease. Exactly
@@ -322,6 +344,11 @@ func bindEnvOverrides(v *viper.Viper) error {
 		"ha.heartbeat_interval",
 		"ha.lease_timeout",
 		"ha.force_takeover",
+		"smb.enabled",
+		"smb.port",
+		"smb.share_name",
+		"smb.domain",
+		"smb.encryption_required",
 	}
 
 	for _, key := range keys {
@@ -463,6 +490,13 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("ha.heartbeat_interval", "15s")
 	v.SetDefault("ha.lease_timeout", "60s")
 	v.SetDefault("ha.force_takeover", false)
+
+	// SMB server defaults (disabled unless explicitly enabled)
+	v.SetDefault("smb.enabled", false)
+	v.SetDefault("smb.port", 445)
+	v.SetDefault("smb.share_name", "bluestone")
+	v.SetDefault("smb.domain", "BLUESTONE")
+	v.SetDefault("smb.encryption_required", false)
 }
 
 // GetReadTimeout returns the parsed read timeout duration

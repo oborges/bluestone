@@ -23,9 +23,6 @@ import (
 	"github.com/oborges/bluestone/internal/staging"
 	"github.com/oborges/bluestone/internal/vfs"
 	"github.com/oborges/bluestone/pkg/types"
-	"github.com/sonroyaalmerol/go-smb-server/smb/ntlmssp"
-	"github.com/sonroyaalmerol/go-smb-server/smb/server"
-	smbvfs "github.com/sonroyaalmerol/go-smb-server/smb/vfs"
 	"go.uber.org/zap"
 )
 
@@ -150,12 +147,14 @@ func (s *memStore) UpdateObjectMetadata(_ context.Context, key string, metadata 
 type testGateway struct {
 	store   *memStore
 	manager *staging.StagingManager
+	server  *Server
 	share   *client.Share
 }
 
-// startGateway serves a staging-backed filesystem over SMB on a local port
-// and mounts it with a real SMB client.
-func startGateway(t *testing.T) *testGateway {
+// startGateway serves a staging-backed filesystem over SMB on a local port.
+// Unless configure clears Users or blocks the client, it also mounts the
+// share as alice.
+func startGateway(t *testing.T, configure ...func(*ServerOptions)) *testGateway {
 	t.Helper()
 
 	manager, err := staging.NewStagingManager(&config.StagingConfig{
@@ -193,61 +192,61 @@ func startGateway(t *testing.T) *testGateway {
 		WithWindowsNames().
 		ForProtocol(metrics.ProtocolSMB)
 
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("reserve port: %v", err)
+	opts := ServerOptions{
+		Address:   "127.0.0.1:0",
+		ShareName: "share",
+		Domain:    "BLUESTONE",
+		Users:     []User{{Name: "alice", Password: "secret"}},
 	}
-	addr := listener.Addr().String()
-	_ = listener.Close()
-
-	creds := ntlmssp.NewMemoryCredentials()
-	creds.Add("BLUESTONE", "alice", "secret")
-	srv, err := server.New(
-		server.WithAddr(addr),
-		server.WithShares(smbvfs.NewDiskShare("share", NewBackend(filesystem))),
-		server.WithAuth(ntlmssp.NewServer(creds, "BLUESTONE")),
-	)
-	if err != nil {
-		t.Fatalf("server.New() error = %v", err)
+	for _, apply := range configure {
+		apply(&opts)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	served := make(chan struct{})
-	go func() {
-		defer close(served)
-		_ = srv.ListenAndServe(ctx)
-	}()
-	t.Cleanup(func() {
-		cancel()
-		_ = srv.Shutdown()
-		<-served
-	})
+	srv, err := NewServer(filesystem, opts)
+	if err != nil {
+		t.Fatalf("NewServer() error = %v", err)
+	}
+	if err := srv.Start(); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	t.Cleanup(func() { _ = srv.Stop() })
 
-	var conn net.Conn
-	for deadline := time.Now().Add(3 * time.Second); ; {
-		conn, err = net.Dial("tcp", addr)
-		if err == nil || time.Now().After(deadline) {
-			break
+	g := &testGateway{store: store, manager: manager, server: srv}
+	if len(configure) == 0 {
+		g.share, err = g.mount(t, "alice", "secret", "BLUESTONE")
+		if err != nil {
+			t.Fatalf("mount share: %v", err)
 		}
-		time.Sleep(20 * time.Millisecond)
 	}
-	if err != nil {
-		t.Fatalf("dial SMB server: %v", err)
-	}
-	t.Cleanup(func() { conn.Close() })
+	return g
+}
 
-	dialer := &client.Dialer{Initiator: &client.NTLMInitiator{User: "alice", Password: "secret", Domain: "BLUESTONE"}}
+// mount connects a real SMB client and mounts the share.
+func (g *testGateway) mount(t *testing.T, user, password, domain string) (*client.Share, error) {
+	t.Helper()
+	conn, err := net.DialTimeout("tcp", g.server.Address(), 3*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	dialer := &client.Dialer{Initiator: &client.NTLMInitiator{User: user, Password: password, Domain: domain}}
 	session, err := dialer.Dial(conn)
 	if err != nil {
-		t.Fatalf("SMB session setup: %v", err)
+		conn.Close()
+		return nil, err
 	}
-	t.Cleanup(func() { _ = session.Logoff() })
 	share, err := session.Mount("share")
 	if err != nil {
-		t.Fatalf("SMB tree connect: %v", err)
+		_ = session.Logoff()
+		conn.Close()
+		return nil, err
 	}
-	t.Cleanup(func() { _ = share.Umount() })
-
-	return &testGateway{store: store, manager: manager, share: share}
+	_ = conn.SetDeadline(time.Time{})
+	t.Cleanup(func() {
+		_ = share.Umount()
+		_ = session.Logoff()
+		conn.Close()
+	})
+	return share, nil
 }
 
 func (g *testGateway) readFile(t *testing.T, name string) string {
@@ -368,5 +367,57 @@ func TestSMBClientMappedNamesAndReadOnlyOpens(t *testing.T) {
 	}
 	if !g.manager.IsDirty("/draft*.txt") {
 		t.Fatal("mapped create must stage the key draft*.txt")
+	}
+}
+
+func TestSMBAuthentication(t *testing.T) {
+	g := startGateway(t, func(*ServerOptions) {})
+
+	// Usernames match case-insensitively and any client domain is accepted,
+	// as Windows clients send their own workgroup or domain.
+	if _, err := g.mount(t, "ALICE", "secret", "WORKGROUP"); err != nil {
+		t.Fatalf("mount as ALICE from another domain: %v", err)
+	}
+	if _, err := g.mount(t, "alice", "wrong", "BLUESTONE"); err == nil {
+		t.Fatal("mount with a wrong password succeeded")
+	}
+	if _, err := g.mount(t, "bob", "secret", ""); err == nil {
+		t.Fatal("mount as an unknown user succeeded")
+	}
+}
+
+func TestSMBAllowedClients(t *testing.T) {
+	blocked := startGateway(t, func(opts *ServerOptions) { opts.AllowedClients = []string{"10.0.0.0/8"} })
+	if _, err := blocked.mount(t, "alice", "secret", "BLUESTONE"); err == nil {
+		t.Fatal("mount from an address outside allowed_clients succeeded")
+	}
+
+	allowed := startGateway(t, func(opts *ServerOptions) { opts.AllowedClients = []string{"127.0.0.1"} })
+	if _, err := allowed.mount(t, "alice", "secret", "BLUESTONE"); err != nil {
+		t.Fatalf("mount from an allowed address: %v", err)
+	}
+}
+
+func TestSMBServerStopClosesOpenSessions(t *testing.T) {
+	g := startGateway(t)
+	if _, err := g.share.Stat(""); err != nil {
+		t.Fatalf("Stat(root) error = %v", err)
+	}
+
+	stopped := make(chan error, 1)
+	go func() { stopped <- g.server.Stop() }()
+	select {
+	case err := <-stopped:
+		if err != nil {
+			t.Fatalf("Stop() error = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop() did not return while a client session was open")
+	}
+}
+
+func TestNewServerRequiresUsers(t *testing.T) {
+	if _, err := NewServer(nil, ServerOptions{Address: "127.0.0.1:0", ShareName: "share", Domain: "BLUESTONE"}); err == nil {
+		t.Fatal("NewServer() without users succeeded")
 	}
 }

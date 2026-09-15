@@ -93,6 +93,22 @@ ha:
   heartbeat_interval: "15s"
   lease_timeout: "60s"
 
+# SMB server (experimental). Serves the same bucket as NFS to Windows, macOS,
+# and Linux SMB clients, with Windows naming: names match case-insensitively
+# and characters Windows cannot use are shown as private-use characters.
+# Users authenticate with NTLM; keep this file readable only by the gateway's
+# service account. server.allowed_clients applies to the SMB port too.
+# Port 445 needs root or CAP_NET_BIND_SERVICE on Linux.
+smb:
+  enabled: false
+  port: 445
+  share_name: "bluestone"   # clients connect to \\<host>\bluestone
+  domain: "BLUESTONE"
+  encryption_required: false
+  # users:
+  #   - username: "alice"
+  #     password: "change-me"
+
 logging:
   level: "info"     # debug, info, warn, error
   format: "json"    # json or text

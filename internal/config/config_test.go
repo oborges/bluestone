@@ -214,3 +214,71 @@ logging:
 	}
 	return configPath
 }
+
+func TestLoadSMBDefaultsAndOverrides(t *testing.T) {
+	setRequiredTestEnv(t)
+
+	cfg, err := Load(writeTestConfig(t, "staging:\n  enabled: false\n"))
+	if err != nil {
+		t.Fatalf("Load() returned error: %v", err)
+	}
+	if cfg.SMB.Enabled || cfg.SMB.Port != 445 || cfg.SMB.ShareName != "bluestone" || cfg.SMB.Domain != "BLUESTONE" {
+		t.Fatalf("SMB defaults = %+v, want disabled on 445 sharing bluestone in domain BLUESTONE", cfg.SMB)
+	}
+
+	t.Setenv("BLUESTONE_SMB_PORT", "1445")
+	cfg, err = Load(writeTestConfig(t, "staging:\n  enabled: false\nsmb:\n  enabled: true\n  share_name: data\n  users:\n    - username: alice\n      password: secret\n"))
+	if err != nil {
+		t.Fatalf("Load() with SMB enabled returned error: %v", err)
+	}
+	if !cfg.SMB.Enabled || cfg.SMB.Port != 1445 || cfg.SMB.ShareName != "data" {
+		t.Fatalf("SMB = %+v, want enabled on 1445 sharing data", cfg.SMB)
+	}
+	if len(cfg.SMB.Users) != 1 || cfg.SMB.Users[0].Username != "alice" || cfg.SMB.Users[0].Password != "secret" {
+		t.Fatalf("SMB.Users = %+v, want alice", cfg.SMB.Users)
+	}
+
+	if _, err := Load(writeTestConfig(t, "staging:\n  enabled: false\nsmb:\n  enabled: true\n")); err == nil || !strings.Contains(err.Error(), "smb config") {
+		t.Fatalf("Load() with SMB enabled and no users error = %v, want an smb config error", err)
+	}
+}
+
+func TestValidateSMB(t *testing.T) {
+	valid := func() SMBConfig {
+		return SMBConfig{
+			Enabled:   true,
+			Port:      445,
+			ShareName: "bluestone",
+			Domain:    "BLUESTONE",
+			Users:     []SMBUser{{Username: "alice", Password: "secret"}},
+		}
+	}
+	tests := []struct {
+		name    string
+		mutate  func(*SMBConfig)
+		wantErr bool
+	}{
+		{name: "valid", mutate: func(*SMBConfig) {}},
+		{name: "disabled skips checks", mutate: func(c *SMBConfig) { *c = SMBConfig{} }},
+		{name: "port out of range", mutate: func(c *SMBConfig) { c.Port = 0 }, wantErr: true},
+		{name: "empty share name", mutate: func(c *SMBConfig) { c.ShareName = "" }, wantErr: true},
+		{name: "share name with separator", mutate: func(c *SMBConfig) { c.ShareName = "a/b" }, wantErr: true},
+		{name: "reserved share name", mutate: func(c *SMBConfig) { c.ShareName = "ipc$" }, wantErr: true},
+		{name: "empty domain", mutate: func(c *SMBConfig) { c.Domain = " " }, wantErr: true},
+		{name: "no users", mutate: func(c *SMBConfig) { c.Users = nil }, wantErr: true},
+		{name: "empty username", mutate: func(c *SMBConfig) { c.Users[0].Username = "" }, wantErr: true},
+		{name: "empty password", mutate: func(c *SMBConfig) { c.Users[0].Password = "" }, wantErr: true},
+		{name: "duplicate username", mutate: func(c *SMBConfig) {
+			c.Users = append(c.Users, SMBUser{Username: "Alice", Password: "other"})
+		}, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := valid()
+			tt.mutate(&cfg)
+			if err := validateSMB(&cfg); (err != nil) != tt.wantErr {
+				t.Fatalf("validateSMB() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}

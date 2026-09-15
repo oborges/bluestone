@@ -40,6 +40,10 @@ func Validate(config *Config) error {
 		return fmt.Errorf("ha config: %w", err)
 	}
 
+	if err := validateSMB(&config.SMB); err != nil {
+		return fmt.Errorf("smb config: %w", err)
+	}
+
 	return nil
 }
 
@@ -54,6 +58,47 @@ func validateHA(config *HAConfig) error {
 	}
 	if config.Enabled && timeout <= heartbeat*2 {
 		return fmt.Errorf("lease_timeout (%s) must be more than twice heartbeat_interval (%s) or transient heartbeat delays cause spurious takeovers", timeout, heartbeat)
+	}
+	return nil
+}
+
+// validateSMB validates the SMB server configuration. Nothing is checked
+// while the server is disabled.
+func validateSMB(config *SMBConfig) error {
+	if !config.Enabled {
+		return nil
+	}
+	if config.Port < 1 || config.Port > 65535 {
+		return fmt.Errorf("invalid port: %d (must be 1-65535)", config.Port)
+	}
+	if config.ShareName == "" || len(config.ShareName) > 80 {
+		return fmt.Errorf("invalid share_name %q: must be 1-80 characters", config.ShareName)
+	}
+	if strings.ContainsAny(config.ShareName, `\/:*?"<>|`) || strings.ContainsFunc(config.ShareName, func(r rune) bool { return r < 0x20 }) {
+		return fmt.Errorf("invalid share_name %q: contains a character share names cannot use", config.ShareName)
+	}
+	if strings.EqualFold(config.ShareName, "IPC$") {
+		return fmt.Errorf("invalid share_name %q: reserved", config.ShareName)
+	}
+	if strings.TrimSpace(config.Domain) == "" {
+		return fmt.Errorf("domain must not be empty")
+	}
+	if len(config.Users) == 0 {
+		return fmt.Errorf("at least one user is required when enabled")
+	}
+	seen := make(map[string]bool, len(config.Users))
+	for i, user := range config.Users {
+		if strings.TrimSpace(user.Username) == "" {
+			return fmt.Errorf("users[%d]: username must not be empty", i)
+		}
+		if user.Password == "" {
+			return fmt.Errorf("users[%d] (%s): password must not be empty", i, user.Username)
+		}
+		key := strings.ToLower(user.Username)
+		if seen[key] {
+			return fmt.Errorf("users[%d]: duplicate username %q", i, user.Username)
+		}
+		seen[key] = true
 	}
 	return nil
 }

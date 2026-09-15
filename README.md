@@ -22,6 +22,9 @@ Test carefully with your own workload before relying on it.
 - Serves an NFSv4 export backed by one IBM Cloud COS bucket, with optional
   NFSv3 or dual-protocol serving.
 - Accepts POSIX-style file operations from Linux NFS clients.
+- Optionally serves the same bucket over SMB 3 (experimental) to Windows,
+  macOS, and Linux clients, with NTLM users and Windows naming. See
+  [SMB](#smb).
 - Uses a local staging layer for writes.
 - Syncs staged dirty files to COS asynchronously in background workers.
 - Uses multipart upload for large staged objects.
@@ -213,6 +216,39 @@ user authentication, so combine the allowlist with OS/VPC firewalling and
 trusted networks. `nfs_concurrent_handlers` is an operational escape hatch for
 the per-connection request parallelism: set it to `1` to restore fully serial
 handling if a client misbehaves with concurrent replies.
+
+### SMB
+
+```yaml
+smb:
+  enabled: true
+  port: 445
+  share_name: "bluestone"
+  domain: "BLUESTONE"
+  encryption_required: false
+  users:
+    - username: "alice"
+      password: "change-me"
+```
+
+The SMB server is experimental and disabled by default. It serves the same
+bucket and staging layer as NFS, so both protocols see the same files. SMB
+clients get Windows naming: names match case-insensitively, and characters
+Windows cannot use in names are shown as Unicode private-use characters and
+mapped back to the stored key. Creation time and the read-only, hidden,
+system, and archive attributes are stored in object metadata.
+
+Users authenticate with NTLM against the accounts listed under `users`. Keep
+the configuration file readable only by the gateway's service account.
+`server.allowed_clients` also applies to the SMB port. Binding port 445 on
+Linux needs root or `CAP_NET_BIND_SERVICE`. `smb.enabled`, `smb.port`,
+`smb.share_name`, `smb.domain`, and `smb.encryption_required` can be
+overridden with `BLUESTONE_SMB_*` environment variables; users are read from
+the file only.
+
+Not supported yet: share modes (sharing violations), leases, alternate data
+streams, and security descriptors. Signing uses AES-CMAC and encryption
+AES-128-CCM.
 
 ### Staging And Async Sync
 
