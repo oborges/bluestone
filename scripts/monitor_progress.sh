@@ -1,7 +1,7 @@
 #!/bin/bash
-# Monitor NFS Gateway Progress During Stress Tests
+# Monitor Bluestone Progress During Stress Tests
 
-echo "=== NFS Gateway Progress Monitor ==="
+echo "=== Bluestone Progress Monitor ==="
 echo "This script monitors download progress, throughput, and errors"
 echo "Press Ctrl+C to stop"
 echo ""
@@ -52,10 +52,10 @@ format_logs() {
 # Check if log file path is provided
 if [ -z "$1" ]; then
     echo "Usage: $0 <log-file-path>"
-    echo "Example: $0 /var/log/nfs-gateway/gateway.log"
+    echo "Example: $0 /var/log/bluestone/gateway.log"
     echo ""
     echo "Or pipe logs directly:"
-    echo "  tail -f /var/log/nfs-gateway/gateway.log | $0"
+    echo "  tail -f /var/log/bluestone/gateway.log | $0"
     echo ""
     
     # If no argument, try to read from stdin

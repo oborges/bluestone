@@ -27,7 +27,7 @@ log_error() { echo -e "${RED}[$(date +'%H:%M:%S')] ✗${NC} $1" | tee -a "$LOG_F
 MONITOR_PID=""
 setup_monitoring() {
     log "Initiating Gateway Background Daemon Resource Tracker..."
-    GW_PID=$(pgrep -f "nfs-gateway" || echo "")
+    GW_PID=$(pgrep -f "bluestone" || echo "")
     if [ -n "$GW_PID" ]; then
         echo "Timestamp,CPU(%),MEM(MB)" > "$RESULTS_DIR/hardware_metrics.csv"
         while true; do
@@ -57,7 +57,7 @@ setup_environment() {
     
     # Initialize the Markdown structure
     cat > "$MD_REPORT" << EOF
-# 🚀 Enterprise NFS Gateway Benchmark Dashboard
+# 🚀 Bluestone Benchmark Dashboard
 > Evaluating IBM COS Cache Optimizations (MMap, S3 Multipart, HW Quotas)
 **Test Target**: \`$TEST_DIR\`  
 **Date**: $(date)

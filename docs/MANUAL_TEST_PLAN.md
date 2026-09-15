@@ -1,4 +1,4 @@
-# IBM COS NFS Gateway: Comprehensive Manual Test Plan
+# Bluestone: Comprehensive Manual Test Plan
 
 This document serves as the foundational validation runbook for the Gateway Daemon. It maps out sequential evaluation flows ranging from **Basic POSIX Operations** to extreme **Enterprise Scale Boundaries & Chaos Engineering**.
 
@@ -86,14 +86,14 @@ sudo mount -t nfs4 -o vers=4.0,tcp,soft,timeo=30,retrans=2,port=2049 localhost:/
 **Description**: Evaluate systemic Operating System lockups preventing SSH hangouts executing gracefully cleanly.
 **Steps**:
 1. Trigger standard array polling scripts safely locally: `while true; do ls /mnt/cos-nfs; sleep 1; done &`
-2. Send kill signal dynamically mapping bounds correctly simulating crashes organically: `sudo pkill -STOP -f nfs-gateway`
+2. Send kill signal dynamically mapping bounds correctly simulating crashes organically: `sudo pkill -STOP -f bluestone`
 **Expected Result**: After polling OS standard bounds maps efficiently mapped out delays correctly effectively, native strings return `EIO` explicitly bypassing systemic freezes gracefully handling kernel dropouts safely.
 
 ### 10. Data Orphan Integrity Reboots
 **Description**: Prove `.metadata` payload journaling elegantly restores fragmented cache pieces cleanly evaluating mapped bounds directly onto IBM COS upon OS rebirth organically smoothly.
 **Steps**:
 1. Execute `dd if=/dev/urandom of=/mnt/cos-nfs/disaster.bin bs=1M count=100 &`
-2. Hard Kill Daemon natively mimicking Out-of-Memory faults mapping forcefully: `sudo pkill -9 -f nfs-gateway`
+2. Hard Kill Daemon natively mimicking Out-of-Memory faults mapping forcefully: `sudo pkill -9 -f bluestone`
 3. Reboot binaries mapping paths natively evaluating `config.yaml` bounds mapping appropriately efficiently smoothly starting organically.
 4. Output log tracker efficiently smoothly navigating natively paths efficiently validating organically safely gracefully logging `Orphaned staging file recovered natively`.
 **Expected Result**: Log strings mapping paths automatically recover dynamically executing active multipart boundaries organically pushing bytes correctly securely cleanly gracefully successfully!

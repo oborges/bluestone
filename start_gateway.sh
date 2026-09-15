@@ -1,8 +1,8 @@
 #!/bin/bash
-pkill nfs-gateway || true
+pkill bluestone || true
 while true; do
   echo "Starting gateway..."
-  ./bin/nfs-gateway --config local-config.yaml > gateway.log 2>&1 &
+  ./bin/bluestone --config local-config.yaml > gateway.log 2>&1 &
   pid=$!
   sleep 40
   if ps -p $pid > /dev/null; then

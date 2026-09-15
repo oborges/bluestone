@@ -1,9 +1,9 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: nfs-gateway-config
+  name: bluestone-config
   labels:
-    app: nfs-gateway
+    app: bluestone
 data:
   cos.endpoint: "s3.us-south.cloud-object-storage.appdomain.cloud"
   cos.bucket: "my-nfs-bucket"
@@ -36,7 +36,7 @@ data:
       data:
         enabled: true
         size_gb: 10
-        path: "/var/cache/nfs-gateway"
+        path: "/var/cache/bluestone"
         chunk_size_kb: 1024
 
     performance:

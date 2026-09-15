@@ -15,6 +15,8 @@ down.
 
 - The active gateway writes `.nfs-gateway.lease` (hidden from the NFS
   namespace) and renews it every `ha.heartbeat_interval` (default 15s).
+  The key predates the Bluestone rename and is intentionally unchanged, so
+  gateways from before and after the rename contend for the same lease.
 - A gateway starting against a bucket with a *fresh* foreign lease exits
   fatally. Fresh means renewed within `ha.lease_timeout` (default 60s).
 - A *stale* lease (holder crashed) is taken over automatically, incrementing
@@ -23,7 +25,7 @@ down.
 - Crash recovery on the same node works during a COS outage via a local
   holder marker in the staging root; a standby that never held the lease
   cannot promote blind while COS is unreachable.
-- Break-glass: `NFS_GATEWAY_HA_FORCE_TAKEOVER=true` (or
+- Break-glass: `BLUESTONE_HA_FORCE_TAKEOVER=true` (or
   `ha-promote.sh --force`) steals a fresh lease. Only when the holder is
   confirmed dead.
 
@@ -40,27 +42,27 @@ ha:
 
 ## Standby setup
 
-1. Install the gateway and the same `/etc/nfs-gateway/config.yaml` (same
-   bucket, credentials, `ha.enabled: true`). Keep `nfs-gateway.service`
+1. Install the gateway and the same `/etc/bluestone/config.yaml` (same
+   bucket, credentials, `ha.enabled: true`). Keep `bluestone.service`
    disabled and stopped.
 2. Replicate the primary's staging directory continuously; it is the durable
    record of accepted-but-unsynced writes and pending deletes, and its format
    is crash-consistent (safe to copy live). Example systemd units:
 
 ```ini
-# /etc/systemd/system/nfs-gateway-replicate.service
+# /etc/systemd/system/bluestone-replicate.service
 [Unit]
-Description=Pull NFS gateway staging state from the primary
+Description=Pull Bluestone staging state from the primary
 [Service]
 Type=oneshot
 SuccessExitStatus=24
 ExecStart=/usr/bin/rsync -a --delete --timeout=20 \
   --exclude=ha-holder-marker \
   -e "ssh -i /root/.ssh/id_ed25519" --rsync-path="sudo rsync" \
-  vpcuser@PRIMARY_IP:/var/staging/nfs-gateway/ /var/staging/nfs-gateway/
-ExecStartPost=/usr/bin/chown -R nfs-gateway:nfs-gateway /var/staging/nfs-gateway
+  vpcuser@PRIMARY_IP:/var/staging/bluestone/ /var/staging/bluestone/
+ExecStartPost=/usr/bin/chown -R bluestone:bluestone /var/staging/bluestone
 
-# /etc/systemd/system/nfs-gateway-replicate.timer
+# /etc/systemd/system/bluestone-replicate.timer
 [Timer]
 OnBootSec=30
 OnUnitActiveSec=15
@@ -86,9 +88,9 @@ the promotion step so clients remount to a stable name.
 ## Failback
 
 ```
-standby# systemctl disable --now nfs-gateway        # releases the lease
-standby# systemctl enable --now nfs-gateway-replicate.timer
-primary# systemctl start nfs-gateway                # acquires immediately
+standby# systemctl disable --now bluestone        # releases the lease
+standby# systemctl enable --now bluestone-replicate.timer
+primary# systemctl start bluestone                # acquires immediately
 client#  remount to the primary
 ```
 

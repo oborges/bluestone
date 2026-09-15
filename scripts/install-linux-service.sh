@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SERVICE_NAME="nfs-gateway"
-SERVICE_USER="${SERVICE_USER:-nfs-gateway}"
-SERVICE_GROUP="${SERVICE_GROUP:-nfs-gateway}"
-INSTALL_BIN="${INSTALL_BIN:-/usr/local/bin/nfs-gateway}"
-CONFIG_DIR="${CONFIG_DIR:-/etc/nfs-gateway}"
+SERVICE_NAME="bluestone"
+SERVICE_USER="${SERVICE_USER:-bluestone}"
+SERVICE_GROUP="${SERVICE_GROUP:-bluestone}"
+INSTALL_BIN="${INSTALL_BIN:-/usr/local/bin/bluestone}"
+CONFIG_DIR="${CONFIG_DIR:-/etc/bluestone}"
 CONFIG_FILE="${CONFIG_FILE:-${CONFIG_DIR}/config.yaml}"
-ENV_FILE="${ENV_FILE:-/etc/default/nfs-gateway}"
+ENV_FILE="${ENV_FILE:-/etc/default/bluestone}"
 SERVICE_FILE="${SERVICE_FILE:-/etc/systemd/system/${SERVICE_NAME}.service}"
-CACHE_DIR="${CACHE_DIR:-/var/cache/nfs-gateway}"
-STAGING_DIR="${STAGING_DIR:-/var/staging/nfs-gateway}"
-LOG_DIR="${LOG_DIR:-/var/log/nfs-gateway}"
+CACHE_DIR="${CACHE_DIR:-/var/cache/bluestone}"
+STAGING_DIR="${STAGING_DIR:-/var/staging/bluestone}"
+LOG_DIR="${LOG_DIR:-/var/log/bluestone}"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." >/dev/null 2>&1 && pwd)"
@@ -29,15 +29,15 @@ usage() {
 	cat <<EOF
 Usage: sudo ./scripts/install-linux-service.sh [options]
 
-Installs IBM Cloud COS NFS Gateway as a Linux systemd service.
+Installs Bluestone as a Linux systemd service.
 
 Options:
-  --build             Build ./bin/nfs-gateway before installing.
-  --no-build          Do not build; install ./bin/nfs-gateway or --binary PATH.
-  --binary PATH       Install an existing nfs-gateway binary.
-  --config PATH       Install this config as /etc/nfs-gateway/config.yaml.
-  --force-config      Replace an existing /etc/nfs-gateway/config.yaml.
-  --force-env         Replace an existing /etc/default/nfs-gateway.
+  --build             Build ./bin/bluestone before installing.
+  --no-build          Do not build; install ./bin/bluestone or --binary PATH.
+  --binary PATH       Install an existing bluestone binary.
+  --config PATH       Install this config as /etc/bluestone/config.yaml.
+  --force-config      Replace an existing /etc/bluestone/config.yaml.
+  --force-env         Replace an existing /etc/default/bluestone.
   --enable            Enable the service at boot.
   --start             Start or restart the service after installation.
   --dry-run           Print actions without changing the system.
@@ -130,6 +130,9 @@ check_host() {
 	need_command systemctl
 	need_command getent
 	[[ -d /run/systemd/system ]] || die "systemd does not appear to be running on this host"
+	if [[ -e /etc/systemd/system/nfs-gateway.service && "${SERVICE_NAME}" != "nfs-gateway" ]]; then
+		die "found pre-rename /etc/systemd/system/nfs-gateway.service; installing ${SERVICE_NAME}.service alongside it would run two gateways on the same port and bucket. Migrate first: see docs/LINUX_SERVICE.md (Migrating From nfs-gateway)"
+	fi
 }
 
 create_service_account() {
@@ -151,7 +154,7 @@ create_service_account() {
 		run useradd \
 			--system \
 			--gid "${SERVICE_GROUP}" \
-			--home-dir /var/lib/nfs-gateway \
+			--home-dir /var/lib/bluestone \
 			--no-create-home \
 			--shell "${nologin}" \
 			"${SERVICE_USER}"
@@ -173,7 +176,7 @@ resolve_version() {
 }
 
 build_binary() {
-	local default_binary="${REPO_ROOT}/bin/nfs-gateway"
+	local default_binary="${REPO_ROOT}/bin/bluestone"
 	local version
 
 	if [[ -n "${BINARY_SOURCE}" ]]; then
@@ -195,7 +198,7 @@ build_binary() {
 			run env CGO_ENABLED="${CGO_ENABLED:-0}" go build \
 				-ldflags "-X main.Version=${version}" \
 				-o "${default_binary}" \
-				./cmd/nfs-gateway
+				./cmd/bluestone
 		)
 	fi
 
@@ -217,20 +220,20 @@ render_unit() {
 	config_file="$(sed_replacement_escape "${CONFIG_FILE}")"
 	env_file="$(sed_replacement_escape "${ENV_FILE}")"
 	writable_paths="$(sed_replacement_escape "${CACHE_DIR} ${STAGING_DIR} ${LOG_DIR}")"
-	exec_start="$(sed_replacement_escape "${INSTALL_BIN} --config \${NFS_GATEWAY_CONFIG}")"
-	cache_directory="nfs-gateway"
-	logs_directory="nfs-gateway"
-	if [[ "${CACHE_DIR}" != "/var/cache/nfs-gateway" ]]; then
+	exec_start="$(sed_replacement_escape "${INSTALL_BIN} --config \${BLUESTONE_CONFIG}")"
+	cache_directory="bluestone"
+	logs_directory="bluestone"
+	if [[ "${CACHE_DIR}" != "/var/cache/bluestone" ]]; then
 		cache_directory=""
 	fi
-	if [[ "${LOG_DIR}" != "/var/log/nfs-gateway" ]]; then
+	if [[ "${LOG_DIR}" != "/var/log/bluestone" ]]; then
 		logs_directory=""
 	fi
 
 	sed \
 		-e "s|^User=.*|User=${user}|" \
 		-e "s|^Group=.*|Group=${group}|" \
-		-e "s|^Environment=NFS_GATEWAY_CONFIG=.*|Environment=NFS_GATEWAY_CONFIG=${config_file}|" \
+		-e "s|^Environment=BLUESTONE_CONFIG=.*|Environment=BLUESTONE_CONFIG=${config_file}|" \
 		-e "s|^EnvironmentFile=.*|EnvironmentFile=-${env_file}|" \
 		-e "s|^ExecStart=.*|ExecStart=${exec_start}|" \
 		-e "s|^ReadWritePaths=.*|ReadWritePaths=${writable_paths}|" \
@@ -241,8 +244,8 @@ render_unit() {
 
 install_files() {
 	local config_template="${CONFIG_SOURCE:-${REPO_ROOT}/configs/config.example.yaml}"
-	local env_template="${REPO_ROOT}/deployments/systemd/nfs-gateway.env"
-	local unit_template="${REPO_ROOT}/deployments/systemd/nfs-gateway.service"
+	local env_template="${REPO_ROOT}/deployments/systemd/bluestone.env"
+	local unit_template="${REPO_ROOT}/deployments/systemd/bluestone.service"
 	local config_parent rendered_unit
 
 	[[ -f "${BINARY_SOURCE}" ]] || die "binary not found: ${BINARY_SOURCE}"

@@ -1,8 +1,8 @@
-# IBM Cloud COS NFS Gateway - Quick Start Guide
+# Bluestone - Quick Start Guide
 
 ## Overview
 
-The IBM Cloud COS NFS Gateway provides NFS filesystem access to IBM Cloud Object Storage (COS), enabling you to mount COS buckets as network filesystems on your IBM Cloud Virtual Server Instances (VSIs).
+Bluestone provides NFS filesystem access to IBM Cloud Object Storage (COS), enabling you to mount COS buckets as network filesystems on your IBM Cloud Virtual Server Instances (VSIs).
 
 ## Prerequisites
 
@@ -16,26 +16,26 @@ The IBM Cloud COS NFS Gateway provides NFS filesystem access to IBM Cloud Object
 ### 1. Install the Service
 
 ```bash
-git clone https://github.com/oborges/ibm-cos-nfs-gateway.git
-cd ibm-cos-nfs-gateway
+git clone https://github.com/oborges/bluestone.git
+cd bluestone
 sudo ./scripts/install-linux-service.sh --build
 ```
 
 ### 2. Configure COS
 
 ```bash
-sudoedit /etc/nfs-gateway/config.yaml
+sudoedit /etc/bluestone/config.yaml
 ```
 
 Set your COS endpoint, bucket, region, and credentials. Secrets may also be
-placed in `/etc/default/nfs-gateway` as `NFS_GATEWAY_` environment overrides.
+placed in `/etc/default/bluestone` as `BLUESTONE_` environment overrides.
 
 ### 3. Start the Service
 
 ```bash
-sudo systemctl enable --now nfs-gateway
-sudo systemctl status nfs-gateway
-sudo journalctl -u nfs-gateway -f
+sudo systemctl enable --now bluestone
+sudo systemctl status bluestone
+sudo journalctl -u bluestone -f
 ```
 
 ### 4. Mount the Export
@@ -74,7 +74,7 @@ cache:
   data:
     enabled: true
     size_gb: 10
-    path: "/var/cache/nfs-gateway"
+    path: "/var/cache/bluestone"
 
 logging:
   level: "info"
@@ -89,14 +89,14 @@ export IBM_CLOUD_API_KEY="your-api-key-here"
 
 # Run the container
 docker run -d \
-  --name cos-nfs-gateway \
+  --name cos-bluestone \
   -p 2049:2049 \
   -p 8080:8080 \
   -p 8081:8081 \
-  -e NFS_GATEWAY_COS_API_KEY="${IBM_CLOUD_API_KEY}" \
-  -v $(pwd)/config.yaml:/etc/nfs-gateway/config.yaml \
-  -v nfs-cache:/var/cache/nfs-gateway \
-  oborges/cos-nfs-gateway:1.0.0
+  -e BLUESTONE_COS_API_KEY="${IBM_CLOUD_API_KEY}" \
+  -v $(pwd)/config.yaml:/etc/bluestone/config.yaml \
+  -v nfs-cache:/var/cache/bluestone \
+  oborges/bluestone:1.0.0
 ```
 
 ### 3. Mount the NFS Share
@@ -135,20 +135,20 @@ cat /mnt/cos/test.txt
 version: '3.8'
 
 services:
-  nfs-gateway:
-    image: oborges/cos-nfs-gateway:1.0.0
+  bluestone:
+    image: oborges/bluestone:1.0.0
     ports:
       - "2049:2049"
       - "8080:8080"
       - "8081:8081"
     environment:
-      - NFS_GATEWAY_COS_ENDPOINT=s3.us-south.cloud-object-storage.appdomain.cloud
-      - NFS_GATEWAY_COS_BUCKET=my-nfs-bucket
-      - NFS_GATEWAY_COS_REGION=us-south
-      - NFS_GATEWAY_COS_API_KEY=${IBM_CLOUD_API_KEY}
+      - BLUESTONE_COS_ENDPOINT=s3.us-south.cloud-object-storage.appdomain.cloud
+      - BLUESTONE_COS_BUCKET=my-nfs-bucket
+      - BLUESTONE_COS_REGION=us-south
+      - BLUESTONE_COS_API_KEY=${IBM_CLOUD_API_KEY}
     volumes:
-      - ./config.yaml:/etc/nfs-gateway/config.yaml
-      - nfs-cache:/var/cache/nfs-gateway
+      - ./config.yaml:/etc/bluestone/config.yaml
+      - nfs-cache:/var/cache/bluestone
     restart: unless-stopped
 
 volumes:
@@ -173,7 +173,7 @@ docker-compose logs -f
 ### 1. Create Secret
 
 ```bash
-kubectl create secret generic nfs-gateway-secret \
+kubectl create secret generic bluestone-secret \
   --from-literal=ibm-cloud-api-key="your-api-key-here"
 ```
 
@@ -184,15 +184,15 @@ kubectl create secret generic nfs-gateway-secret \
 kubectl apply -f deployments/kubernetes/
 
 # Check status
-kubectl get pods -l app=nfs-gateway
-kubectl get svc nfs-gateway
+kubectl get pods -l app=bluestone
+kubectl get svc bluestone
 ```
 
 ### 3. Get Service IP
 
 ```bash
 # Get the LoadBalancer IP
-kubectl get svc nfs-gateway -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
+kubectl get svc bluestone -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
 ```
 
 ### 4. Mount from Client
@@ -228,26 +228,26 @@ curl http://localhost:8080/metrics
 
 ```bash
 # Docker
-docker logs -f cos-nfs-gateway
+docker logs -f cos-bluestone
 
 # Docker Compose
 docker-compose logs -f
 
 # Kubernetes
-kubectl logs -f -l app=nfs-gateway
+kubectl logs -f -l app=bluestone
 ```
 
 ## Configuration
 
 ### Environment Variables
 
-All configuration can be overridden with environment variables using the `NFS_GATEWAY_` prefix:
+All configuration can be overridden with environment variables using the `BLUESTONE_` prefix:
 
 ```bash
 # Example
-export NFS_GATEWAY_LOGGING_LEVEL=debug
-export NFS_GATEWAY_CACHE_METADATA_ENABLED=true
-export NFS_GATEWAY_CACHE_DATA_SIZE_GB=20
+export BLUESTONE_LOGGING_LEVEL=debug
+export BLUESTONE_CACHE_METADATA_ENABLED=true
+export BLUESTONE_CACHE_DATA_SIZE_GB=20
 ```
 
 ### Authentication Methods
@@ -315,7 +315,7 @@ curl http://localhost:8081/health/live
 curl http://localhost:8081/health/ready
 
 # View logs
-docker logs cos-nfs-gateway
+docker logs cos-bluestone
 ```
 
 ### Mount Issues
@@ -354,5 +354,5 @@ curl http://localhost:8080/metrics | grep cos_api_duration
 ## Support
 
 For issues and questions:
-- GitHub Issues: https://github.com/oborges/cos-nfs-gateway/issues
-- Documentation: https://github.com/oborges/cos-nfs-gateway/docs
+- GitHub Issues: https://github.com/oborges/bluestone/issues
+- Documentation: https://github.com/oborges/bluestone/docs

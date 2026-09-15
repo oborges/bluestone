@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Quick 5-minute stress test for COS NFS Gateway
+# Quick 5-minute stress test for Bluestone
 # This script runs basic performance tests to quickly validate the mountpoint
 # Usage: ./quick_test.sh [test_number] [test_dir]
 #   test_number: 1, 2, 3, or 4 to run a specific test, or omit to run all tests
@@ -25,7 +25,7 @@ YELLOW='\033[0;33m'
 NC='\033[0m'
 
 echo "=========================================="
-echo "Quick COS NFS Gateway Performance Test"
+echo "Quick Bluestone Performance Test"
 echo "=========================================="
 echo
 

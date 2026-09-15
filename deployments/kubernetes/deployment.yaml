@@ -1,29 +1,29 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: cos-nfs-gateway
+  name: bluestone
   labels:
-    app: nfs-gateway
+    app: bluestone
     version: v1
 spec:
   replicas: 2
   selector:
     matchLabels:
-      app: nfs-gateway
+      app: bluestone
   template:
     metadata:
       labels:
-        app: nfs-gateway
+        app: bluestone
         version: v1
       annotations:
         prometheus.io/scrape: "true"
         prometheus.io/port: "8080"
         prometheus.io/path: "/metrics"
     spec:
-      serviceAccountName: nfs-gateway
+      serviceAccountName: bluestone
       containers:
-      - name: nfs-gateway
-        image: oborges/cos-nfs-gateway:1.0.0
+      - name: bluestone
+        image: oborges/bluestone:1.0.0
         imagePullPolicy: IfNotPresent
         ports:
         - name: nfs
@@ -36,25 +36,25 @@ spec:
           containerPort: 8081
           protocol: TCP
         env:
-        - name: NFS_GATEWAY_COS_ENDPOINT
+        - name: BLUESTONE_COS_ENDPOINT
           valueFrom:
             configMapKeyRef:
-              name: nfs-gateway-config
+              name: bluestone-config
               key: cos.endpoint
-        - name: NFS_GATEWAY_COS_BUCKET
+        - name: BLUESTONE_COS_BUCKET
           valueFrom:
             configMapKeyRef:
-              name: nfs-gateway-config
+              name: bluestone-config
               key: cos.bucket
-        - name: NFS_GATEWAY_COS_REGION
+        - name: BLUESTONE_COS_REGION
           valueFrom:
             configMapKeyRef:
-              name: nfs-gateway-config
+              name: bluestone-config
               key: cos.region
-        - name: NFS_GATEWAY_COS_API_KEY
+        - name: BLUESTONE_COS_API_KEY
           valueFrom:
             secretKeyRef:
-              name: nfs-gateway-secret
+              name: bluestone-secret
               key: ibm-cloud-api-key
         resources:
           requests:
@@ -65,10 +65,10 @@ spec:
             cpu: "2000m"
         volumeMounts:
         - name: config
-          mountPath: /etc/nfs-gateway
+          mountPath: /etc/bluestone
           readOnly: true
         - name: cache
-          mountPath: /var/cache/nfs-gateway
+          mountPath: /var/cache/bluestone
         livenessProbe:
           httpGet:
             path: /health/live
@@ -96,7 +96,7 @@ spec:
       volumes:
       - name: config
         configMap:
-          name: nfs-gateway-config
+          name: bluestone-config
       - name: cache
         emptyDir:
           sizeLimit: 10Gi
@@ -110,7 +110,7 @@ spec:
                 - key: app
                   operator: In
                   values:
-                  - nfs-gateway
+                  - bluestone
               topologyKey: kubernetes.io/hostname
 
 # Made with Bob

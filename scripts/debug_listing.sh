@@ -5,7 +5,7 @@
 
 set -e
 
-echo "=== NFS Gateway Directory Listing Debug ==="
+echo "=== Bluestone Directory Listing Debug ==="
 echo ""
 
 # Check if mount point is provided
@@ -27,9 +27,9 @@ count_logs() {
 > /tmp/nfs_debug.log
 
 echo "Step 1: Starting log capture in background..."
-# Capture NFS gateway logs (adjust this based on how you run the gateway)
+# Capture Bluestone logs (adjust this based on how you run the gateway)
 # This assumes logs go to stdout/stderr
-echo "  (Make sure your NFS gateway is running and logging to a file or use journalctl)"
+echo "  (Make sure Bluestone is running and logging to a file or use journalctl)"
 echo ""
 
 echo "Step 2: Performing ls operation..."
@@ -54,7 +54,7 @@ echo "Step 3: Analysis"
 echo "  Duration: ${DURATION}s"
 echo ""
 
-echo "Expected log patterns to look for in your NFS gateway logs:"
+echo "Expected log patterns to look for in the Bluestone logs:"
 echo "  1. 'ListDirectory cache miss' - Should appear once"
 echo "  2. 'Got objects from COS' - Should appear once with object count"
 echo "  3. 'Directory listed and cached' - Should appear once"
@@ -70,13 +70,13 @@ echo "  - No 'ListDirectory' logs: NFS client never calls ReadDir"
 echo ""
 
 echo "Next steps:"
-echo "  1. Check your NFS gateway logs for the patterns above"
+echo "  1. Check the Bluestone logs for the patterns above"
 echo "  2. Look for the 'ListDirectory completed' message with duration"
 echo "  3. If duration > 5s for 100 files, there's a performance issue"
 echo "  4. Count how many 'Stat cache miss' messages appear"
 echo ""
 
 echo "To monitor logs in real-time, run:"
-echo "  tail -f <your-nfs-gateway-log-file> | grep -E 'ListDirectory|Stat|Implicit'"
+echo "  tail -f <your-bluestone-log-file> | grep -E 'ListDirectory|Stat|Implicit'"
 
 # Made with Bob
