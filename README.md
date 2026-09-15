@@ -386,7 +386,10 @@ Important metrics include:
 - `object_refresh_cache_invalidations_total`
 - `object_refresh_skipped_dirty_paths_total`
 - `object_refresh_conflicts_total`
-- `nfs_requests_total`
+- `filesystem_requests_total` (labels `protocol`, `operation`, `status`)
+- `filesystem_request_duration_seconds` (labels `protocol`, `operation`)
+- `nfs_requests_total` (deprecated: the same requests without a `protocol`
+  label; use `filesystem_requests_total`)
 - `cos_api_calls_total`
 
 Health endpoints are available when `server.health_enabled` is true:

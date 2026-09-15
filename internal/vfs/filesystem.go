@@ -36,6 +36,8 @@ type Filesystem struct {
 	stagingManager *staging.StagingManager
 	syncWorker     *staging.SyncWorker
 	featureFlags   *feature.FeatureFlags
+	// protocol attributes this view's requests in metrics.
+	protocol string
 }
 
 // NewFilesystem creates a new COS filesystem with configuration
@@ -78,6 +80,20 @@ func NewFilesystem(ops *posix.OperationsHandler, logger *logging.KVLogger, root 
 		syncWorker:     syncWorker,
 		featureFlags:   featureFlags,
 	}
+}
+
+// ForProtocol returns a view of the filesystem whose requests are attributed
+// to protocol in metrics. Views share all state; each protocol server serves
+// its own view.
+func (fs *Filesystem) ForProtocol(protocol string) *Filesystem {
+	view := *fs
+	view.protocol = protocol
+	return &view
+}
+
+// requestContext carries the view's protocol to the operations it calls.
+func (fs *Filesystem) requestContext() context.Context {
+	return metrics.WithProtocol(context.Background(), fs.protocol)
 }
 
 // Create creates a new file
@@ -186,6 +202,7 @@ func (fs *Filesystem) OpenFile(filename string, flag int, perm os.FileMode) (bil
 		stagingManager: fs.stagingManager,
 		syncWorker:     fs.syncWorker,
 		featureFlags:   fs.featureFlags,
+		protocol:       fs.protocol,
 	}
 
 	// A path with an accepted-but-unconfirmed delete must look nonexistent:
@@ -240,7 +257,7 @@ func (fs *Filesystem) OpenFile(filename string, flag int, perm os.FileMode) (bil
 
 	writable := flag&(os.O_WRONLY|os.O_RDWR|os.O_CREATE) != 0
 	if !existenceKnown {
-		_, err := fs.ops.Stat(context.Background(), fullPath)
+		_, err := fs.ops.Stat(fs.requestContext(), fullPath)
 		fileExists = err == nil && !pendingDelete
 
 		// A writable open that keeps existing content needs that content
@@ -266,7 +283,7 @@ func (fs *Filesystem) OpenFile(filename string, flag int, perm os.FileMode) (bil
 				fs.logger.Info("Prefetching existing COS object to local staging cache",
 					"file_id", fileID,
 					"path", fullPath)
-				return fs.ops.DownloadToFile(context.Background(), fullPath, file.stagingSession.StagingPath)
+				return fs.ops.DownloadToFile(fs.requestContext(), fullPath, file.stagingSession.StagingPath)
 			})
 			if err != nil {
 				// Without the object's bytes staged, writes would land on an
@@ -317,7 +334,7 @@ func (fs *Filesystem) OpenFile(filename string, flag int, perm os.FileMode) (bil
 				GID:   1000,
 				Mtime: time.Now(),
 			}
-			err := fs.ops.WriteFile(context.Background(), fullPath, []byte{}, attrs)
+			err := fs.ops.WriteFile(fs.requestContext(), fullPath, []byte{}, attrs)
 			if err != nil {
 				return nil, err
 			}
@@ -334,7 +351,7 @@ func (fs *Filesystem) OpenFile(filename string, flag int, perm os.FileMode) (bil
 			file.offset = file.stagingSession.Size
 		} else {
 			// Legacy path: load from COS
-			data, err := fs.ops.ReadFile(context.Background(), fullPath, 0, 0)
+			data, err := fs.ops.ReadFile(fs.requestContext(), fullPath, 0, 0)
 			if err != nil {
 				return nil, err
 			}
@@ -422,7 +439,7 @@ func (fs *Filesystem) Stat(filename string) (os.FileInfo, error) {
 		}
 	}
 
-	info, err := fs.ops.Stat(context.Background(), fullPath)
+	info, err := fs.ops.Stat(fs.requestContext(), fullPath)
 	if err != nil && !os.IsNotExist(err) {
 		// The object store could not answer, but local staging state can
 		// vouch for some paths: a retained staged session answers for the
@@ -516,7 +533,7 @@ func (fs *Filesystem) Rename(oldpath, newpath string) error {
 		}
 	}
 
-	return fs.ops.RenameFile(context.Background(), oldFull, newFull)
+	return fs.ops.RenameFile(fs.requestContext(), oldFull, newFull)
 }
 
 // renameDirtyStagedFile renames a dirty staged source by re-keying the staged
@@ -527,7 +544,7 @@ func (fs *Filesystem) renameDirtyStagedFile(oldFull, newFull string) error {
 		if os.IsNotExist(err) {
 			// Staged bytes vanished (stale dirty entry); fall back to the
 			// object-store rename.
-			return fs.ops.RenameFile(context.Background(), oldFull, newFull)
+			return fs.ops.RenameFile(fs.requestContext(), oldFull, newFull)
 		}
 		return err
 	}
@@ -535,7 +552,7 @@ func (fs *Filesystem) renameDirtyStagedFile(oldFull, newFull string) error {
 	// Finish the source delete inline when no upload is in flight; otherwise
 	// the sync worker completes it after the upload lands.
 	if fs.stagingManager.TryLockSync(oldFull) {
-		if err := fs.ops.DeleteFile(context.Background(), oldFull); err != nil {
+		if err := fs.ops.DeleteFile(fs.requestContext(), oldFull); err != nil {
 			fs.logger.Error("COS delete of rename source failed; sync worker will retry",
 				zap.String("old_path", oldFull),
 				zap.Error(err))
@@ -621,7 +638,7 @@ func (fs *Filesystem) Remove(filename string) error {
 	}
 
 	if info.IsDir() {
-		return fs.ops.DeleteDirectory(context.Background(), fullPath)
+		return fs.ops.DeleteDirectory(fs.requestContext(), fullPath)
 	}
 
 	if !stagingEnabled {
@@ -633,7 +650,7 @@ func (fs *Filesystem) Remove(filename string) error {
 		}
 	}
 
-	if err := fs.ops.DeleteFile(context.Background(), fullPath); err != nil {
+	if err := fs.ops.DeleteFile(fs.requestContext(), fullPath); err != nil {
 		if stagingEnabled && !os.IsNotExist(err) {
 			// The object store could not perform the delete (outage or
 			// transient failure). Accept it write-back style: a durable
@@ -671,7 +688,7 @@ func (fs *Filesystem) removeDirtyStagedFile(fullPath string) error {
 		return nil
 	}
 
-	if err := fs.ops.DeleteFile(context.Background(), fullPath); err != nil {
+	if err := fs.ops.DeleteFile(fs.requestContext(), fullPath); err != nil {
 		// The tombstone persists; the sync worker retries the COS delete.
 		fs.logger.Error("COS delete failed after tombstone was accepted; sync worker will retry",
 			zap.String("path", fullPath),
@@ -745,7 +762,7 @@ func (fs *Filesystem) cleanupCleanStagingSessionAfterDelete(path string) {
 
 // cleanupSessionsBeforeDelete ensures any active sessions are flushed before file deletion.
 func (fs *Filesystem) cleanupSessionsBeforeDelete(path string) error {
-	ctx := context.Background()
+	ctx := fs.requestContext()
 
 	// Handle staging path (new architecture)
 	if fs.featureFlags != nil && fs.featureFlags.IsStagingEnabled() && fs.stagingManager != nil {
@@ -862,7 +879,7 @@ func (fs *Filesystem) ReadDir(path string) ([]os.FileInfo, error) {
 	metrics.GetGlobalCounters().RecordPathCall(fullPath)
 
 	listStart := time.Now()
-	entries, err := fs.ops.ListDirectory(context.Background(), fullPath)
+	entries, err := fs.ops.ListDirectory(fs.requestContext(), fullPath)
 	listDuration := time.Since(listStart)
 
 	if err != nil {
@@ -995,7 +1012,7 @@ func (fs *Filesystem) MkdirAll(filename string, perm os.FileMode) error {
 		GID:   1000,
 		Mtime: time.Now(),
 	}
-	return fs.ops.CreateDirectory(context.Background(), fullPath, attrs)
+	return fs.ops.CreateDirectory(fs.requestContext(), fullPath, attrs)
 }
 
 // Lstat returns file information (same as Stat for COS)
@@ -1025,6 +1042,7 @@ func (fs *Filesystem) Chroot(path string) (billy.Filesystem, error) {
 		stagingManager: fs.stagingManager,
 		syncWorker:     fs.syncWorker,
 		featureFlags:   fs.featureFlags,
+		protocol:       fs.protocol,
 	}, nil
 }
 
@@ -1046,7 +1064,7 @@ func (fs *Filesystem) Chmod(name string, mode os.FileMode) error {
 	}
 
 	// Get current file info
-	info, err := fs.ops.Stat(context.Background(), fullPath)
+	info, err := fs.ops.Stat(fs.requestContext(), fullPath)
 	if err != nil {
 		return err
 	}
@@ -1061,15 +1079,15 @@ func (fs *Filesystem) Chmod(name string, mode os.FileMode) error {
 
 	// For files, we need to read and rewrite with new attributes
 	if !info.IsDir() {
-		data, err := fs.ops.ReadFile(context.Background(), fullPath, 0, 0)
+		data, err := fs.ops.ReadFile(fs.requestContext(), fullPath, 0, 0)
 		if err != nil {
 			return err
 		}
-		return fs.ops.WriteFile(context.Background(), fullPath, data, attrs)
+		return fs.ops.WriteFile(fs.requestContext(), fullPath, data, attrs)
 	}
 
 	// For directories, just update the marker
-	return fs.ops.CreateDirectory(context.Background(), fullPath, attrs)
+	return fs.ops.CreateDirectory(fs.requestContext(), fullPath, attrs)
 }
 
 // Lchown changes the uid and gid of the named file (link itself)
@@ -1090,7 +1108,7 @@ func (fs *Filesystem) Chown(name string, uid, gid int) error {
 	}
 
 	// Get current file info
-	info, err := fs.ops.Stat(context.Background(), fullPath)
+	info, err := fs.ops.Stat(fs.requestContext(), fullPath)
 	if err != nil {
 		return err
 	}
@@ -1105,15 +1123,15 @@ func (fs *Filesystem) Chown(name string, uid, gid int) error {
 
 	// For files, read and rewrite with new attributes
 	if !info.IsDir() {
-		data, err := fs.ops.ReadFile(context.Background(), fullPath, 0, 0)
+		data, err := fs.ops.ReadFile(fs.requestContext(), fullPath, 0, 0)
 		if err != nil {
 			return err
 		}
-		return fs.ops.WriteFile(context.Background(), fullPath, data, attrs)
+		return fs.ops.WriteFile(fs.requestContext(), fullPath, data, attrs)
 	}
 
 	// For directories, update the marker
-	return fs.ops.CreateDirectory(context.Background(), fullPath, attrs)
+	return fs.ops.CreateDirectory(fs.requestContext(), fullPath, attrs)
 }
 
 // Chtimes changes the access and modification times
@@ -1125,7 +1143,7 @@ func (fs *Filesystem) Chtimes(name string, atime time.Time, mtime time.Time) err
 	}
 
 	// Get current file info
-	info, err := fs.ops.Stat(context.Background(), fullPath)
+	info, err := fs.ops.Stat(fs.requestContext(), fullPath)
 	if err != nil {
 		return err
 	}
@@ -1140,7 +1158,7 @@ func (fs *Filesystem) Chtimes(name string, atime time.Time, mtime time.Time) err
 	}
 
 	// Use efficient metadata update (no need to read/rewrite entire file)
-	return fs.ops.UpdateAttributes(context.Background(), fullPath, attrs)
+	return fs.ops.UpdateAttributes(fs.requestContext(), fullPath, attrs)
 }
 
 // File implements billy.File interface
@@ -1167,12 +1185,19 @@ type File struct {
 	stagingManager *staging.StagingManager
 	syncWorker     *staging.SyncWorker
 	featureFlags   *feature.FeatureFlags
+	// protocol attributes this handle's requests in metrics.
+	protocol string
 
 	// mu guards the mutable handle state above (offset, size, data, loaded,
 	// isNew, writeSession, counters) and closed, so one open file can serve
 	// concurrent requests, as SMB clients send on a single handle.
 	mu     sync.Mutex
 	closed bool
+}
+
+// requestContext carries the handle's protocol to the operations it calls.
+func (f *File) requestContext() context.Context {
+	return metrics.WithProtocol(context.Background(), f.protocol)
 }
 
 // Name returns the file name
@@ -1256,7 +1281,7 @@ func (f *File) Read(p []byte) (int, error) {
 	}
 
 	// Read-only file: fetch data on-demand using range read
-	data, err := f.ops.ReadFile(context.Background(), f.path, f.offset, int64(len(p)))
+	data, err := f.ops.ReadFile(f.requestContext(), f.path, f.offset, int64(len(p)))
 	if err != nil {
 		// Check if it's EOF (no more data to read)
 		if err.Error() == "EOF" || strings.Contains(err.Error(), "EOF") {
@@ -1448,7 +1473,7 @@ func (f *File) flushSessionBuffer() error {
 	// Check current file size in COS
 	var currentSize int64
 	if !f.isNew {
-		info, err := f.ops.Stat(context.Background(), f.path)
+		info, err := f.ops.Stat(f.requestContext(), f.path)
 		if err != nil && !strings.Contains(err.Error(), "not found") {
 			f.logger.Error("Failed to stat file during flush",
 				"file_id", f.fileID,
@@ -1471,7 +1496,7 @@ func (f *File) flushSessionBuffer() error {
 			Mtime: time.Now(),
 		}
 
-		err := f.ops.WriteFile(context.Background(), f.path, data, attrs)
+		err := f.ops.WriteFile(f.requestContext(), f.path, data, attrs)
 		if err != nil {
 			f.logger.Error("Failed to write file during flush",
 				"file_id", f.fileID,
@@ -1498,7 +1523,7 @@ func (f *File) flushSessionBuffer() error {
 			"append_bytes", flushSize)
 
 		// Read existing file once
-		existingData, err := f.ops.ReadFile(context.Background(), f.path, 0, 0)
+		existingData, err := f.ops.ReadFile(f.requestContext(), f.path, 0, 0)
 		if err != nil {
 			f.logger.Error("Failed to read existing file for sequential append",
 				"file_id", f.fileID,
@@ -1519,7 +1544,7 @@ func (f *File) flushSessionBuffer() error {
 			Mtime: time.Now(),
 		}
 
-		err = f.ops.WriteFile(context.Background(), f.path, finalData, attrs)
+		err = f.ops.WriteFile(f.requestContext(), f.path, finalData, attrs)
 		if err != nil {
 			f.logger.Error("Failed to write file during sequential append",
 				"file_id", f.fileID,
@@ -1545,7 +1570,7 @@ func (f *File) flushSessionBuffer() error {
 			"start_offset", startOffset,
 			"write_bytes", flushSize)
 
-		existingData, err := f.ops.ReadFile(context.Background(), f.path, 0, 0)
+		existingData, err := f.ops.ReadFile(f.requestContext(), f.path, 0, 0)
 		if err != nil && !strings.Contains(err.Error(), "not found") {
 			f.logger.Error("Failed to read existing file for merge",
 				"file_id", f.fileID,
@@ -1570,7 +1595,7 @@ func (f *File) flushSessionBuffer() error {
 			Mtime: time.Now(),
 		}
 
-		err = f.ops.WriteFile(context.Background(), f.path, existingData, attrs)
+		err = f.ops.WriteFile(f.requestContext(), f.path, existingData, attrs)
 		if err != nil {
 			f.logger.Error("Failed to write merged file during flush",
 				"file_id", f.fileID,
@@ -1696,7 +1721,7 @@ func (f *File) Close() error {
 			GID:   1000,
 			Mtime: time.Now(),
 		}
-		err := f.ops.WriteFile(context.Background(), f.path, f.data, attrs)
+		err := f.ops.WriteFile(f.requestContext(), f.path, f.data, attrs)
 		if err != nil {
 			return err
 		}
@@ -1806,7 +1831,7 @@ func (f *File) ReadAt(p []byte, off int64) (int, error) {
 	}
 
 	// Read-only file: fetch data on-demand using range read
-	data, err := f.ops.ReadFile(context.Background(), f.path, off, int64(len(p)))
+	data, err := f.ops.ReadFile(f.requestContext(), f.path, off, int64(len(p)))
 	if err != nil {
 		// Check if it's EOF (no more data to read)
 		if err.Error() == "EOF" || strings.Contains(err.Error(), "EOF") {
@@ -1886,7 +1911,7 @@ func (f *File) truncateObjectLocked(size int64) error {
 		}
 	}
 
-	ctx := context.Background()
+	ctx := f.requestContext()
 	mode := f.perm
 	var existing []byte
 	switch {
@@ -1948,7 +1973,7 @@ func (f *File) ensureLoaded() error {
 	// The write buffer handles append-only operations efficiently
 	// Only load file size for metadata operations
 	if f.writeSession != nil {
-		info, err := f.ops.Stat(context.Background(), f.path)
+		info, err := f.ops.Stat(f.requestContext(), f.path)
 		if err != nil {
 			return err
 		}
@@ -1964,7 +1989,7 @@ func (f *File) ensureLoaded() error {
 	if f.flag&(os.O_WRONLY|os.O_RDWR) != 0 {
 		// Writable file - get file size but don't load data
 		// Write session will be created on first Write() call
-		info, err := f.ops.Stat(context.Background(), f.path)
+		info, err := f.ops.Stat(f.requestContext(), f.path)
 		if err != nil {
 			return err
 		}
@@ -1978,7 +2003,7 @@ func (f *File) ensureLoaded() error {
 	// Instead, use lazy loading and read from COS on demand
 	// Read-only mode - get file size but don't load data
 	// Data will be fetched on-demand in Read/ReadAt operations
-	info, err := f.ops.Stat(context.Background(), f.path)
+	info, err := f.ops.Stat(f.requestContext(), f.path)
 	if err != nil {
 		return err
 	}

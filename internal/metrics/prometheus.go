@@ -1,8 +1,11 @@
 package metrics
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/oborges/bluestone/internal/logging"
@@ -12,11 +15,31 @@ import (
 )
 
 var (
-	// NFS request metrics
+	// Filesystem request metrics, by the protocol that issued the request
+	filesystemRequestsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "filesystem_requests_total",
+			Help: "Total filesystem requests by protocol, operation, and outcome",
+		},
+		[]string{"protocol", "operation", "status"},
+	)
+
+	filesystemRequestDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "filesystem_request_duration_seconds",
+			Help:    "Filesystem request duration in seconds by protocol and operation",
+			Buckets: prometheus.DefBuckets,
+		},
+		[]string{"protocol", "operation"},
+	)
+
+	// Deprecated: the same requests without a protocol label, kept so
+	// existing dashboards keep working. Use filesystem_requests_total and
+	// filesystem_request_duration_seconds.
 	nfsRequestsTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "nfs_requests_total",
-			Help: "Total number of NFS requests",
+			Help: "Deprecated: use filesystem_requests_total. Total filesystem requests by operation and outcome",
 		},
 		[]string{"operation", "status"},
 	)
@@ -24,7 +47,7 @@ var (
 	nfsRequestDuration = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Name:    "nfs_request_duration_seconds",
-			Help:    "NFS request duration in seconds",
+			Help:    "Deprecated: use filesystem_request_duration_seconds. Filesystem request duration in seconds",
 			Buckets: prometheus.DefBuckets,
 		},
 		[]string{"operation"},
@@ -278,6 +301,8 @@ var (
 // Initialize registers all metrics with Prometheus
 func Initialize() {
 	prometheus.MustRegister(
+		filesystemRequestsTotal,
+		filesystemRequestDuration,
 		nfsRequestsTotal,
 		nfsRequestDuration,
 		cosAPICallsTotal,
@@ -344,10 +369,34 @@ func StartMetricsServer(port int) error {
 	return nil
 }
 
-// RecordNFSRequest records an NFS request
-func RecordNFSRequest(operation, status string, duration time.Duration) {
+// Request outcome labels.
+const (
+	StatusSuccess  = "success"
+	StatusNotFound = "not_found"
+	StatusError    = "error"
+)
+
+// RecordRequest records a filesystem request under the protocol carried by
+// ctx (see WithProtocol); err, the request's result, sets the status.
+func RecordRequest(ctx context.Context, operation string, err error, duration time.Duration) {
+	status := RequestStatus(err)
+	protocol := ProtocolFrom(ctx)
+	filesystemRequestsTotal.WithLabelValues(protocol, operation, status).Inc()
+	filesystemRequestDuration.WithLabelValues(protocol, operation).Observe(duration.Seconds())
 	nfsRequestsTotal.WithLabelValues(operation, status).Inc()
 	nfsRequestDuration.WithLabelValues(operation).Observe(duration.Seconds())
+}
+
+// RequestStatus classifies a request result for the status label.
+func RequestStatus(err error) string {
+	switch {
+	case err == nil:
+		return StatusSuccess
+	case errors.Is(err, os.ErrNotExist):
+		return StatusNotFound
+	default:
+		return StatusError
+	}
 }
 
 // RecordCOSAPICall records a COS API call
