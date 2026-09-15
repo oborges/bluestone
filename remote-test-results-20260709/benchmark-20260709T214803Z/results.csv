@@ -1,7 +1,0 @@
-category,name,status,duration_seconds,throughput_mib_s,iops,p50_latency_ms,p95_latency_ms,p99_latency_ms,sync_latency_seconds,cache_hit_ratio,staging_used_bytes,dirty_bytes,sync_queue_bytes,writes_rejected_delta,writes_blocked_delta,error_count,error
-backpressure,below-high-watermark,pass,2.427595110999846,26.4231303115189,,,,,,,20971520.0,20971520,20971520.0,44.0,0.0,0,
-backpressure,above-high-watermark,pass,0.2883041280001635,225.83969262040125,,,,,,,20971520.0,20971520,20971520.0,64.0,0.0,0,
-backpressure,above-critical-watermark,pass,0.8315469540000322,77.60680895367103,,,,,,,20971520.0,20971520,20971520.0,64.0,0.0,0,
-backpressure,sync-drain-releases-pressure,pass,6.024633097000105,,,,,,,,,,,0.0,0.0,0,
-backpressure,block-mode,skip,0,,,,,,,,,,,,,,mode-specific validation requires restarting gateway with block mode
-backpressure,fail-fast-mode,skip,0,,,,,,,,,,,,,,mode-specific validation requires restarting gateway with fail_fast mode

@@ -1,6 +1,0 @@
-category,name,status,duration_seconds,throughput_mib_s,iops,p50_latency_ms,p95_latency_ms,p99_latency_ms,sync_latency_seconds,cache_hit_ratio,staging_used_bytes,dirty_bytes,sync_queue_bytes,writes_rejected_delta,writes_blocked_delta,error_count,error
-read,cold-read-from-cos,pass,2.5112225689990737,57.142578125,57.142857,5.931008,115.867648,160.432128,,0.8625954198473282,,,,0.0,0.0,0,
-read,warm-read-local-cache,pass,2.7979304030013736,49.5927734375,49.593181,11.993088,46.399488,48.49664,,1.0,,,,0.0,0.0,0,
-read,partial-range-read,pass,0.4536006659982377,247.103515625,247.104247,4.079616,8.716288,10.027008,,1.0,,,,0.0,0.0,0,
-read,random-4k-read,pass,30.192593730000226,17.072265625,4370.587647,0.201728,0.33792,0.7168,,1.0,,,,0.0,0.0,0,
-read,large-sequential-read,pass,0.8060906249993423,209.1494140625,52.287582,17.69472,27.131904,34.865152,,1.0,,,,0.0,0.0,0,

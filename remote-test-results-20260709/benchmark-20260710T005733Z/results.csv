@@ -1,6 +1,0 @@
-category,name,status,duration_seconds,throughput_mib_s,iops,p50_latency_ms,p95_latency_ms,p99_latency_ms,sync_latency_seconds,cache_hit_ratio,staging_used_bytes,dirty_bytes,sync_queue_bytes,writes_rejected_delta,writes_blocked_delta,error_count,error
-small-files,create-read-delete-100,pass,23.482758258000104,,,,,,,0.0,0.0,0,0.0,0.0,0.0,0,
-small-files,create-read-delete-1000,pass,221.07299620599952,,,,,,,0.0,0.0,0,0.0,0.0,0.0,0,
-mixed,concurrent-readers-writers,pass,39.11772448699958,,,,,,,0.4375,285212672.0,285212672,285212672.0,0.0,0.0,0,
-mixed,large-writes-plus-small-reads,pass,30.721280880999984,,,,,,,0.0008094357076780758,872415232.0,872415232,872415232.0,0.0,0.0,0,
-mixed,dirty-file-reads-during-sync,pass,4.151214878000246,,,,,,,0.0008094357076780758,402653184.0,402653184,402653184.0,0.0,0.0,0,

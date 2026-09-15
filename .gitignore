@@ -85,3 +85,10 @@ docs/STAGING_ARCHITECTURE_COMPLETE.md
 docs/STRESS_TEST_EXECUTION_GUIDE.md
 docs/STRESS_TEST_SUMMARY.md
 docs/STRESS_TESTING_GUIDE.md
+
+# Locally built binary at repo root
+/bluestone
+/nfs-gateway
+
+# Remote benchmark run artifacts (kept locally, not versioned)
+remote-test-results-*/

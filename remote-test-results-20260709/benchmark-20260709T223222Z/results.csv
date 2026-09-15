@@ -1,3 +1,0 @@
-category,name,status,duration_seconds,throughput_mib_s,iops,p50_latency_ms,p95_latency_ms,p99_latency_ms,sync_latency_seconds,cache_hit_ratio,staging_used_bytes,dirty_bytes,sync_queue_bytes,writes_rejected_delta,writes_blocked_delta,error_count,error
-small-files,create-read-delete-100,pass,25.77197625200006,,,,,,,,0.0,0,0.0,0.0,0.0,0,
-small-files,create-read-delete-1000,pass,225.43498934699983,,,,,,,0.0,0.0,0,0.0,0.0,0.0,0,
