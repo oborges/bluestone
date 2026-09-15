@@ -2,6 +2,7 @@ package vfs
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -237,9 +238,25 @@ func (fs *Filesystem) OpenFile(filename string, flag int, perm os.FileMode) (bil
 		}
 	}
 
+	writable := flag&(os.O_WRONLY|os.O_RDWR|os.O_CREATE) != 0
 	if !existenceKnown {
 		_, err := fs.ops.Stat(context.Background(), fullPath)
 		fileExists = err == nil && !pendingDelete
+
+		// A writable open that keeps existing content needs that content
+		// staged first. If the object store cannot say whether an object is
+		// here, refuse: writes would land on an empty staged copy that later
+		// replaces the object. Truncating opens discard the content anyway,
+		// and a pending delete means the object is already gone.
+		if err != nil && !errors.Is(err, os.ErrNotExist) && !pendingDelete &&
+			writable && flag&os.O_TRUNC == 0 && file.stagingSession != nil {
+			fs.stagingManager.ReleaseSessionDiscardingIfEmpty(fullPath)
+			fs.logger.Error("Refusing writable open: object store cannot confirm existing content",
+				"file_id", fileID,
+				"path", fullPath,
+				"error", err)
+			return nil, &os.PathError{Op: "open", Path: filename, Err: err}
+		}
 	}
 
 	if useStagingPath && file.stagingSession != nil && flag&(os.O_WRONLY|os.O_RDWR|os.O_CREATE) != 0 {
@@ -252,7 +269,14 @@ func (fs *Filesystem) OpenFile(filename string, flag int, perm os.FileMode) (bil
 				return fs.ops.DownloadToFile(context.Background(), fullPath, file.stagingSession.StagingPath)
 			})
 			if err != nil {
-				fs.logger.Error("Prefetch error intercepted", zap.Error(err))
+				// Without the object's bytes staged, writes would land on an
+				// empty or partial copy that later replaces the object.
+				fs.stagingManager.ReleaseSessionDiscardingIfEmpty(fullPath)
+				fs.logger.Error("Refusing writable open: prefetch of existing object failed",
+					"file_id", fileID,
+					"path", fullPath,
+					"error", err)
+				return nil, &os.PathError{Op: "open", Path: filename, Err: err}
 			}
 		}
 

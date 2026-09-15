@@ -589,6 +589,32 @@ type fakeObjectStore struct {
 	objects   map[string][]byte
 	deleted   map[string]bool
 	deleteErr error
+	// lookupErr fails HeadObject and ListObjects, as during an outage.
+	lookupErr error
+	// streamErr fails GetObjectStream bodies after streamPartialBytes bytes.
+	streamErr          error
+	streamPartialBytes int
+}
+
+// failingReader returns its error on every read, like a dropped connection.
+type failingReader struct{ err error }
+
+func (r *failingReader) Read([]byte) (int, error) { return 0, r.err }
+
+// failDownloads makes object bodies fail after partialBytes bytes; a nil err
+// restores normal downloads.
+func (s *fakeObjectStore) failDownloads(partialBytes int, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.streamPartialBytes = partialBytes
+	s.streamErr = err
+}
+
+// failLookups makes existence probes fail; a nil err restores them.
+func (s *fakeObjectStore) failLookups(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lookupErr = err
 }
 
 func newFakeObjectStore() *fakeObjectStore {
@@ -652,6 +678,16 @@ func (s *fakeObjectStore) GetObjectStream(ctx context.Context, key string) (io.R
 	if err != nil {
 		return nil, err
 	}
+	s.mu.Lock()
+	streamErr, partial := s.streamErr, s.streamPartialBytes
+	s.mu.Unlock()
+	if streamErr != nil {
+		if partial > len(data) {
+			partial = len(data)
+		}
+		body := io.MultiReader(bytes.NewReader(data[:partial]), &failingReader{err: streamErr})
+		return io.NopCloser(body), nil
+	}
 	return io.NopCloser(bytes.NewReader(data)), nil
 }
 
@@ -676,6 +712,9 @@ func (s *fakeObjectStore) DeleteObject(ctx context.Context, key string) error {
 func (s *fakeObjectStore) HeadObject(ctx context.Context, key string) (*types.ObjectMetadata, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.lookupErr != nil {
+		return nil, s.lookupErr
+	}
 	data, ok := s.objects[key]
 	if !ok {
 		return nil, os.ErrNotExist
@@ -686,6 +725,9 @@ func (s *fakeObjectStore) HeadObject(ctx context.Context, key string) (*types.Ob
 func (s *fakeObjectStore) ListObjects(ctx context.Context, prefix string, maxKeys int) ([]*types.ObjectMetadata, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.lookupErr != nil {
+		return nil, s.lookupErr
+	}
 	var result []*types.ObjectMetadata
 	for key, data := range s.objects {
 		if strings.HasPrefix(key, prefix) {
