@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -43,6 +44,60 @@ func (downObjectStore) UpdateObjectMetadata(context.Context, string, map[string]
 	return errBackendDown
 }
 
+// switchableObjectStore forwards to a healthy store until taken down, then
+// fails every call like downObjectStore. The switch goes through a mutex
+// because the handler's own goroutines may still be calling the store:
+// Stat returns as soon as the file probe answers, leaving its directory
+// probe running. Replacing the handler's store field instead races with it.
+type switchableObjectStore struct {
+	mu      sync.RWMutex
+	healthy ObjectStore
+	down    bool
+}
+
+func (s *switchableObjectStore) takeDown() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.down = true
+}
+
+func (s *switchableObjectStore) current() ObjectStore {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.down {
+		return downObjectStore{}
+	}
+	return s.healthy
+}
+
+func (s *switchableObjectStore) GetObject(ctx context.Context, key string) ([]byte, error) {
+	return s.current().GetObject(ctx, key)
+}
+func (s *switchableObjectStore) GetObjectRange(ctx context.Context, key string, offset, length int64) ([]byte, error) {
+	return s.current().GetObjectRange(ctx, key, offset, length)
+}
+func (s *switchableObjectStore) GetObjectStream(ctx context.Context, key string) (io.ReadCloser, error) {
+	return s.current().GetObjectStream(ctx, key)
+}
+func (s *switchableObjectStore) PutObject(ctx context.Context, key string, data []byte, metadata map[string]string) error {
+	return s.current().PutObject(ctx, key, data, metadata)
+}
+func (s *switchableObjectStore) DeleteObject(ctx context.Context, key string) error {
+	return s.current().DeleteObject(ctx, key)
+}
+func (s *switchableObjectStore) HeadObject(ctx context.Context, key string) (*types.ObjectMetadata, error) {
+	return s.current().HeadObject(ctx, key)
+}
+func (s *switchableObjectStore) ListObjects(ctx context.Context, prefix string, maxKeys int) ([]*types.ObjectMetadata, error) {
+	return s.current().ListObjects(ctx, prefix, maxKeys)
+}
+func (s *switchableObjectStore) CopyObject(ctx context.Context, sourceKey, destKey string) error {
+	return s.current().CopyObject(ctx, sourceKey, destKey)
+}
+func (s *switchableObjectStore) UpdateObjectMetadata(ctx context.Context, key string, metadata map[string]string) error {
+	return s.current().UpdateObjectMetadata(ctx, key, metadata)
+}
+
 func TestStatDuringBackendOutage(t *testing.T) {
 	ctx := context.Background()
 	ops, _ := newRefreshTestOps(t, nil)
@@ -73,13 +128,14 @@ func TestStatServesStaleMetadataDuringOutage(t *testing.T) {
 	store := newFakeObjectStore()
 	store.put("stale.txt", []byte("payload-12"), time.Unix(100, 0))
 	store.put("dir/child.txt", []byte("c"), time.Unix(100, 0))
+	backend := &switchableObjectStore{healthy: store}
 
 	metadataCache := cache.NewMetadataCache(&config.MetadataCacheConfig{
 		Enabled:    true,
 		TTLSeconds: 1, // expire quickly so the outage hits stale entries
 		MaxEntries: 100,
 	})
-	ops := NewOperationsHandler(store, metadataCache, nil, &config.PerformanceConfig{
+	ops := NewOperationsHandler(backend, metadataCache, nil, &config.PerformanceConfig{
 		MaxDirectoryEntries: 100,
 		MaxFullObjectReadMB: 1,
 	})
@@ -97,7 +153,7 @@ func TestStatServesStaleMetadataDuringOutage(t *testing.T) {
 
 	// Let the TTL lapse, then take the backend down.
 	time.Sleep(1100 * time.Millisecond)
-	ops.cosClient = downObjectStore{}
+	backend.takeDown()
 
 	info, err = ops.Stat(ctx, "/stale.txt")
 	if err != nil {
