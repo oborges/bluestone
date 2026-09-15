@@ -413,3 +413,31 @@ func TestWriteSession_MultipleWrites(t *testing.T) {
 }
 
 // Made with Bob
+
+func TestWriteSession_TruncateIntoUploadedPartIsNotSequential(t *testing.T) {
+	ws, err := NewWriteSession(nil, "/big.bin", t.TempDir()+"/big.data")
+	if err != nil {
+		t.Fatalf("NewWriteSession() error = %v", err)
+	}
+	defer ws.Close()
+
+	if _, err := ws.Write(make([]byte, 64), 0); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	// Simulate a progressive multipart upload that already sent bytes 0-31.
+	ws.Multipart.PartSize = 32
+	ws.Multipart.AddCompletedPart(1, "etag-1")
+	if !ws.Multipart.IsSequential() {
+		t.Fatal("precondition: state should be sequential after a part upload")
+	}
+
+	if err := ws.Truncate(16); err != nil {
+		t.Fatalf("Truncate() error = %v", err)
+	}
+	if ws.Multipart.IsSequential() {
+		t.Fatal("truncating into an uploaded part must invalidate the progressive upload")
+	}
+	if got := ws.GetSize(); got != 16 {
+		t.Fatalf("GetSize() = %d, want 16", got)
+	}
+}

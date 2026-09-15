@@ -263,6 +263,15 @@ func (ws *WriteSession) Truncate(size int64) error {
 		return fmt.Errorf("failed to truncate: %w", err)
 	}
 
+	// Bytes from the lower of the old and new end onward changed. Record it
+	// like a write, so a progressive multipart upload that already covered
+	// those bytes is not completed as if the file had only grown.
+	firstChanged := size
+	if ws.Size < firstChanged {
+		firstChanged = ws.Size
+	}
+	ws.Multipart.MarkModified(firstChanged)
+
 	// Update size and mark as dirty
 	ws.Size = size
 	ws.Dirty = true
