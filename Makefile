@@ -1,8 +1,8 @@
 .PHONY: all build test clean install install-service run docker-build docker-push k8s-deploy benchmark-suite help
 
 # Variables
-BINARY_NAME=nfs-gateway
-DOCKER_IMAGE=oborges/cos-nfs-gateway
+BINARY_NAME=bluestone
+DOCKER_IMAGE=oborges/bluestone
 VERSION?=1.0.0
 GO=go
 GOFLAGS=-v
@@ -15,16 +15,16 @@ all: clean build
 build:
 	@echo "Building ${BINARY_NAME}..."
 	@mkdir -p bin
-	${GO} build ${GOFLAGS} ${LDFLAGS} -o bin/${BINARY_NAME} ./cmd/nfs-gateway
+	${GO} build ${GOFLAGS} ${LDFLAGS} -o bin/${BINARY_NAME} ./cmd/bluestone
 
 # Build for multiple platforms
 build-all:
 	@echo "Building for multiple platforms..."
 	@mkdir -p bin
-	GOOS=linux GOARCH=amd64 ${GO} build ${GOFLAGS} ${LDFLAGS} -o bin/${BINARY_NAME}-linux-amd64 ./cmd/nfs-gateway
-	GOOS=linux GOARCH=arm64 ${GO} build ${GOFLAGS} ${LDFLAGS} -o bin/${BINARY_NAME}-linux-arm64 ./cmd/nfs-gateway
-	GOOS=darwin GOARCH=amd64 ${GO} build ${GOFLAGS} ${LDFLAGS} -o bin/${BINARY_NAME}-darwin-amd64 ./cmd/nfs-gateway
-	GOOS=darwin GOARCH=arm64 ${GO} build ${GOFLAGS} ${LDFLAGS} -o bin/${BINARY_NAME}-darwin-arm64 ./cmd/nfs-gateway
+	GOOS=linux GOARCH=amd64 ${GO} build ${GOFLAGS} ${LDFLAGS} -o bin/${BINARY_NAME}-linux-amd64 ./cmd/bluestone
+	GOOS=linux GOARCH=arm64 ${GO} build ${GOFLAGS} ${LDFLAGS} -o bin/${BINARY_NAME}-linux-arm64 ./cmd/bluestone
+	GOOS=darwin GOARCH=amd64 ${GO} build ${GOFLAGS} ${LDFLAGS} -o bin/${BINARY_NAME}-darwin-amd64 ./cmd/bluestone
+	GOOS=darwin GOARCH=arm64 ${GO} build ${GOFLAGS} ${LDFLAGS} -o bin/${BINARY_NAME}-darwin-arm64 ./cmd/bluestone
 
 # Run tests
 test:
@@ -60,7 +60,7 @@ bench:
 
 # Run the formal mounted-gateway benchmark suite
 benchmark-suite:
-	@echo "Running COS NFS Gateway benchmark suite..."
+	@echo "Running Bluestone benchmark suite..."
 	./scripts/run_benchmark_suite.sh
 
 # Clean build artifacts
@@ -84,12 +84,12 @@ install-service:
 # Run the application
 run:
 	@echo "Running ${BINARY_NAME}..."
-	${GO} run ./cmd/nfs-gateway --config configs/config.yaml
+	${GO} run ./cmd/bluestone --config configs/config.yaml
 
 # Run with development config
 run-dev:
 	@echo "Running ${BINARY_NAME} in development mode..."
-	${GO} run ./cmd/nfs-gateway --config configs/config.example.yaml
+	${GO} run ./cmd/bluestone --config configs/config.example.yaml
 
 # Format code
 fmt:
@@ -121,8 +121,8 @@ docker-push:
 docker-run:
 	@echo "Running Docker container..."
 	docker run -p 2049:2049 -p 8080:8080 -p 8081:8081 \
-		-v $(PWD)/configs:/etc/nfs-gateway \
-		-v $(PWD)/cache:/var/cache/nfs-gateway \
+		-v $(PWD)/configs:/etc/bluestone \
+		-v $(PWD)/cache:/var/cache/bluestone \
 		${DOCKER_IMAGE}:${VERSION}
 
 # Deploy to Kubernetes
@@ -138,12 +138,12 @@ k8s-delete:
 # Show Kubernetes status
 k8s-status:
 	@echo "Kubernetes status..."
-	kubectl get all -l app=nfs-gateway
+	kubectl get all -l app=bluestone
 
 # View logs
 k8s-logs:
 	@echo "Viewing logs..."
-	kubectl logs -l app=nfs-gateway -f
+	kubectl logs -l app=bluestone -f
 
 # Generate mocks for testing
 mocks:

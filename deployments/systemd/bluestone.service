@@ -1,16 +1,16 @@
 [Unit]
-Description=IBM Cloud COS NFS Gateway
-Documentation=https://github.com/oborges/ibm-cos-nfs-gateway
+Description=Bluestone
+Documentation=https://github.com/oborges/bluestone
 Wants=network-online.target
 After=network-online.target
 
 [Service]
 Type=simple
-User=nfs-gateway
-Group=nfs-gateway
-Environment=NFS_GATEWAY_CONFIG=/etc/nfs-gateway/config.yaml
-EnvironmentFile=-/etc/default/nfs-gateway
-ExecStart=/usr/local/bin/nfs-gateway --config ${NFS_GATEWAY_CONFIG}
+User=bluestone
+Group=bluestone
+Environment=BLUESTONE_CONFIG=/etc/bluestone/config.yaml
+EnvironmentFile=-/etc/default/bluestone
+ExecStart=/usr/local/bin/bluestone --config ${BLUESTONE_CONFIG}
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=45s
@@ -39,10 +39,10 @@ LockPersonality=true
 MemoryDenyWriteExecute=true
 SystemCallArchitectures=native
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
-ReadWritePaths=/var/cache/nfs-gateway /var/staging/nfs-gateway /var/log/nfs-gateway
-CacheDirectory=nfs-gateway
-LogsDirectory=nfs-gateway
-RuntimeDirectory=nfs-gateway
+ReadWritePaths=/var/cache/bluestone /var/staging/bluestone /var/log/bluestone
+CacheDirectory=bluestone
+LogsDirectory=bluestone
+RuntimeDirectory=bluestone
 RuntimeDirectoryMode=0750
 
 [Install]

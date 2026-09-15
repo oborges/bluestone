@@ -1,4 +1,4 @@
-# Architecture Comparison: IBM COS NFS Gateway And AWS S3 Files
+# Architecture Comparison: Bluestone And AWS S3 Files
 
 This document compares this gateway with AWS's newer S3 file-access direction,
 represented in public AWS documentation by Mountpoint for Amazon S3. It does

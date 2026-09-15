@@ -1,12 +1,12 @@
-# COS NFS Gateway Benchmark Suite
+# Bluestone Benchmark Suite
 
-This suite provides repeatable, machine-comparable benchmarks for the COS NFS Gateway. It assumes the gateway is already running and mounted, and it does not change gateway behavior.
+This suite provides repeatable, machine-comparable benchmarks for Bluestone. It assumes the gateway is already running and mounted, and it does not change gateway behavior.
 
 The suite writes every run into a timestamped directory under `benchmark-results/` by default. Each run captures the environment, raw fio output, monitor samples, summary tables, JSON, CSV, and a compact baseline file for future comparisons.
 
 ## Prerequisites
 
-- A running COS NFS Gateway.
+- A running Bluestone gateway.
 - The NFS export mounted, normally at `/mnt/cos-nfs`.
 - `fio` installed on the benchmark host for write/read performance tests.
 - Debug and metrics endpoints enabled for sync, staging, cache, and backpressure metrics.
@@ -85,7 +85,7 @@ Enable crash-safety scenarios with a non-blocking restart command:
 ./scripts/run_benchmark_suite.sh \
   --categories crash-safety \
   --allow-crash \
-  --gateway-command 'cd ~/ibm-cos-nfs-gateway && sudo nohup ./bin/nfs-gateway --config configs/config.yaml >/tmp/nfs-gateway-benchmark.log 2>&1 &' \
+  --gateway-command 'cd ~/bluestone && sudo nohup ./bin/bluestone --config configs/config.yaml >/tmp/bluestone-benchmark.log 2>&1 &' \
   --post-restart-command 'sudo umount /mnt/cos-nfs -f || true; sudo mount -t nfs4 -o vers=4.0,tcp,port=2049 localhost:/ /mnt/cos-nfs'
 ```
 
@@ -101,7 +101,7 @@ Use `baseline.json` as the stable comparison artifact across commits, VM sizes, 
 
 ```json
 {
-  "schema_version": "cos-nfs-gateway-baseline/v1",
+  "schema_version": "cos-bluestone-baseline/v1",
   "commit": "<git commit>",
   "profile": "standard",
   "benchmarks": {

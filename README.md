@@ -1,6 +1,14 @@
-# IBM Cloud COS NFS Gateway
+# Bluestone
 
-IBM Cloud COS NFS Gateway exposes an IBM Cloud Object Storage bucket through an
+**A file gateway for IBM Cloud Object Storage.**
+
+> Bluestone was previously named *IBM Cloud COS NFS Gateway*. Existing
+> `NFS_GATEWAY_*` environment variables and `/etc/nfs-gateway` config paths
+> still work and log a deprecation notice. To move a systemd installation to
+> the new names, see
+> [Migrating From nfs-gateway](docs/LINUX_SERVICE.md#migrating-from-nfs-gateway).
+
+Bluestone exposes an IBM Cloud Object Storage bucket through an
 NFSv4 mount by default, with optional NFSv3 compatibility. It is intended for
 Linux workloads that need a filesystem-shaped interface while storing file data
 in COS.
@@ -118,8 +126,8 @@ firewall, VPC, security group, or Kubernetes network policy boundaries.
 Clone and build:
 
 ```bash
-git clone https://github.com/oborges/ibm-cos-nfs-gateway.git
-cd ibm-cos-nfs-gateway
+git clone https://github.com/oborges/bluestone.git
+cd bluestone
 make build
 ```
 
@@ -144,18 +152,18 @@ cos:
 Run the gateway:
 
 ```bash
-sudo ./bin/nfs-gateway --config configs/config.yaml
+sudo ./bin/bluestone --config configs/config.yaml
 ```
 
 Or install it as a Linux `systemd` service:
 
 ```bash
 sudo ./scripts/install-linux-service.sh --build
-sudoedit /etc/nfs-gateway/config.yaml
-sudo systemctl enable --now nfs-gateway
+sudoedit /etc/bluestone/config.yaml
+sudo systemctl enable --now bluestone
 ```
 
-The installer creates a dedicated `nfs-gateway` system user, installs the unit
+The installer creates a dedicated `bluestone` system user, installs the unit
 file, preserves existing config by default, and prepares cache and staging
 directories. See [Linux Service Installation](docs/LINUX_SERVICE.md) for the
 operator runbook.
@@ -176,8 +184,8 @@ sudo umount /mnt/cos-nfs -f
 ## Configuration Areas
 
 The full example lives in `configs/config.example.yaml`. All nested settings can
-also be overridden with environment variables using the `NFS_GATEWAY_` prefix.
-For example, `cos.api_key` becomes `NFS_GATEWAY_COS_API_KEY`.
+also be overridden with environment variables using the `BLUESTONE_` prefix.
+For example, `cos.api_key` becomes `BLUESTONE_COS_API_KEY`.
 
 ### Server
 
@@ -211,7 +219,7 @@ handling if a client misbehaves with concurrent replies.
 ```yaml
 staging:
   enabled: true
-  root_dir: "/var/staging/nfs-gateway"
+  root_dir: "/var/staging/bluestone"
   sync_interval: "30s"
   sync_threshold_mb: 10
   max_dirty_age: "5m"
@@ -267,7 +275,7 @@ cache:
   data:
     enabled: true
     size_gb: 10
-    path: "/var/cache/nfs-gateway"
+    path: "/var/cache/bluestone"
     chunk_size_kb: 1024
 
 performance:
@@ -431,7 +439,7 @@ staging capacity or kill the gateway:
 ./scripts/run_benchmark_suite.sh \
   --categories crash-safety \
   --allow-crash \
-  --gateway-command 'cd ~/ibm-cos-nfs-gateway && sudo nohup ./bin/nfs-gateway --config configs/config.yaml >/tmp/nfs-gateway-benchmark.log 2>&1 &' \
+  --gateway-command 'cd ~/bluestone && sudo nohup ./bin/bluestone --config configs/config.yaml >/tmp/bluestone-benchmark.log 2>&1 &' \
   --post-restart-command 'sudo umount /mnt/cos-nfs -f || true; sudo mount -t nfs4 -o vers=4.0,tcp,port=2049 localhost:/ /mnt/cos-nfs'
 ```
 
@@ -454,7 +462,7 @@ Docker and Kubernetes manifests are provided under `deployments/`.
 Build the image:
 
 ```bash
-docker build -t cos-nfs-gateway -f deployments/docker/Dockerfile .
+docker build -t cos-bluestone -f deployments/docker/Dockerfile .
 ```
 
 Run with Docker Compose:
@@ -490,7 +498,7 @@ Gateway fails to start:
 
 ```bash
 sudo ss -tlnp | grep 2049
-sudo ./bin/nfs-gateway --config configs/config.yaml
+sudo ./bin/bluestone --config configs/config.yaml
 ```
 
 Mount fails:
@@ -514,7 +522,7 @@ object.
 Backpressure rejects or blocks writes:
 
 ```bash
-df -h /var/staging/nfs-gateway
+df -h /var/staging/bluestone
 curl http://127.0.0.1:8082/debug/staging/sync
 curl http://127.0.0.1:8080/metrics | grep -E 'staging_pressure|writes_blocked|writes_rejected|backpressure'
 ```

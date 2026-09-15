@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Formal benchmark suite for the IBM COS NFS Gateway.
+"""Formal benchmark suite for Bluestone.
 
 The suite assumes the gateway is already running and mounted. Destructive
 scenarios such as crash-safety require explicit opt-in flags.
@@ -391,9 +391,9 @@ class BenchmarkSuite:
     def crash_recovery_case(self, label: str, size_mib: int) -> dict[str, Any]:
         target = self.test_root / f"crash-{label}-{size_mib}MiB.dat"
         write_pattern_file(target, size_mib)
-        gateway_pids = pgrep("nfs-gateway")
+        gateway_pids = pgrep("bluestone")
         if not gateway_pids:
-            raise RuntimeError("nfs-gateway process not found")
+            raise RuntimeError("bluestone process not found")
         os.kill(gateway_pids[0], signal.SIGKILL)
         time.sleep(2)
         run_shell(self.args.gateway_command, timeout=self.args.command_timeout)
@@ -642,7 +642,7 @@ class BenchmarkSuite:
 
     def write_summary_markdown(self, env: dict[str, Any]) -> None:
         lines = [
-            "# COS NFS Gateway Benchmark Summary",
+            "# Bluestone Benchmark Summary",
             "",
             f"- Run ID: `{self.run_id}`",
             f"- Commit: `{env.get('git_commit', '').strip()}`",

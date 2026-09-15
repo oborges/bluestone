@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Mountpoint Stress Test Script
-# Automated performance testing for IBM Cloud COS NFS Gateway
+# Automated performance testing for Bluestone
 
 set -e
 

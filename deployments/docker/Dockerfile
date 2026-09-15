@@ -1,4 +1,4 @@
-# Multi-stage build for IBM Cloud COS NFS Gateway
+# Multi-stage build for Bluestone
 
 ARG ALPINE_VERSION=3.20
 
@@ -23,8 +23,8 @@ COPY . .
 # Build the binary
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
     -ldflags="-w -s -X main.Version=${VERSION:-dev}" \
-    -o nfs-gateway \
-    ./cmd/nfs-gateway
+    -o bluestone \
+    ./cmd/bluestone
 
 # Runtime stage
 FROM alpine:${ALPINE_VERSION}
@@ -40,14 +40,14 @@ RUN apk add --no-cache \
 WORKDIR /app
 
 # Copy binary from builder
-COPY --from=builder /build/nfs-gateway .
+COPY --from=builder /build/bluestone .
 
 # Copy non-secret example configuration as the runtime default.
-COPY --from=builder /build/configs/config.example.yaml /etc/nfs-gateway/config.yaml
+COPY --from=builder /build/configs/config.example.yaml /etc/bluestone/config.yaml
 
 # Create cache directory
-RUN mkdir -p /var/cache/nfs-gateway && \
-    chown -R nfs:nfs /var/cache/nfs-gateway /app
+RUN mkdir -p /var/cache/bluestone && \
+    chown -R nfs:nfs /var/cache/bluestone /app
 
 # Switch to non-root user
 USER nfs
@@ -60,7 +60,7 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD wget --no-verbose --tries=1 --spider http://localhost:8081/health/live || exit 1
 
 # Set entrypoint
-ENTRYPOINT ["./nfs-gateway"]
+ENTRYPOINT ["./bluestone"]
 
 # Default command
-CMD ["--config", "/etc/nfs-gateway/config.yaml"]
+CMD ["--config", "/etc/bluestone/config.yaml"]

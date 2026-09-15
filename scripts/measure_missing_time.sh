@@ -100,7 +100,7 @@ fi
 echo ""
 echo "========================================="
 echo "Next steps:"
-echo "1. Check server logs: journalctl -u nfs-gateway -n 500"
+echo "1. Check server logs: journalctl -u bluestone -n 500"
 echo "2. Look for 'ReadDir loop detected' or 'ReadDir timing' messages"
 echo "3. Share this output for analysis"
 echo "========================================="

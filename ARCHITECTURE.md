@@ -1,8 +1,8 @@
-# IBM Cloud COS NFS Gateway Architecture
+# Bluestone Architecture
 
 ## Overview
 
-IBM Cloud COS NFS Gateway exposes a single IBM Cloud Object Storage bucket as an
+Bluestone exposes a single IBM Cloud Object Storage bucket as an
 NFSv4 filesystem by default, with optional NFSv3 compatibility. Linux clients
 speak NFS to the gateway; the gateway translates filesystem operations into COS
 object operations and uses local disk for staging, write-back sync, and read
@@ -29,7 +29,7 @@ The current architecture is intentionally centered on local correctness:
 flowchart TB
     client["Linux NFS client"] -->|NFSv4 TCP by default| nfs["NFS server layer"]
 
-    subgraph gateway["COS NFS Gateway"]
+    subgraph gateway["Bluestone"]
         nfs --> wrappers["NFS wrappers: auth, cache, instrumentation, stable verifier"]
         wrappers --> fs["COSFilesystem"]
         fs --> ops["POSIX operations handler"]
@@ -220,13 +220,13 @@ through normal cache expiry and subsequent COS stat/list misses.
 
 ## Core Components
 
-### `cmd/nfs-gateway`
+### `cmd/bluestone`
 
 The executable loads configuration, initializes logging, COS, caches, staging,
 sync workers, health endpoints, metrics, debug endpoints, and the NFS server.
 
 Configuration can be provided by YAML and overridden with environment variables
-using the `NFS_GATEWAY_` prefix.
+using the `BLUESTONE_` prefix.
 
 ### `internal/nfs`
 
@@ -478,7 +478,7 @@ cache:
   data:
     enabled: true
     size_gb: 10
-    path: "/var/cache/nfs-gateway"
+    path: "/var/cache/bluestone"
     chunk_size_kb: 1024
 
 performance:
@@ -498,7 +498,7 @@ object_refresh:
 
 staging:
   enabled: true
-  root_dir: "/var/staging/nfs-gateway"
+  root_dir: "/var/staging/bluestone"
   sync_interval: "30s"
   sync_threshold_mb: 10
   max_dirty_age: "5m"

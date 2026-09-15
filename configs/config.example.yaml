@@ -1,4 +1,4 @@
-# IBM Cloud COS NFS Gateway - Example Configuration
+# Bluestone - Example Configuration
 # Copy this file to config.yaml and update with your values
 
 server:
@@ -62,7 +62,7 @@ cache:
   data:
     enabled: true
     size_gb: 10           # Disk cache size for file data
-    path: "/var/cache/nfs-gateway"
+    path: "/var/cache/bluestone"
     chunk_size_kb: 1024   # Size of cache chunks
 
 performance:
@@ -87,7 +87,7 @@ object_refresh:
 # namespace); a second gateway refuses to start while a fresh foreign lease
 # exists. A standby promotes automatically once the lease is stale (holder
 # crashed) or immediately after a graceful shutdown. Break-glass takeover of
-# a fresh lease: NFS_GATEWAY_HA_FORCE_TAKEOVER=true (never set in this file).
+# a fresh lease: BLUESTONE_HA_FORCE_TAKEOVER=true (never set in this file).
 ha:
   enabled: false
   heartbeat_interval: "15s"
@@ -100,7 +100,7 @@ logging:
 
 staging:
   enabled: true
-  root_dir: "/var/staging/nfs-gateway"
+  root_dir: "/var/staging/bluestone"
   sync_interval: "30s"
   sync_threshold_mb: 10
   max_dirty_age: "5m"

@@ -1,39 +1,39 @@
 version: '3.8'
 
 services:
-  nfs-gateway:
+  bluestone:
     build:
       context: ../..
       dockerfile: deployments/docker/Dockerfile
-    image: oborges/cos-nfs-gateway:${NFS_GATEWAY_IMAGE_TAG:-1.0.0}
-    container_name: cos-nfs-gateway
+    image: oborges/bluestone:${BLUESTONE_IMAGE_TAG:-1.0.0}
+    container_name: bluestone
     ports:
       - "2049:2049"   # NFS
       - "8080:8080"   # Metrics
       - "8081:8081"   # Health
     environment:
       # COS Configuration
-      - NFS_GATEWAY_COS_ENDPOINT=${COS_ENDPOINT}
-      - NFS_GATEWAY_COS_BUCKET=${COS_BUCKET}
-      - NFS_GATEWAY_COS_REGION=${COS_REGION:-us-south}
-      - NFS_GATEWAY_COS_API_KEY=${IBM_CLOUD_API_KEY}
+      - BLUESTONE_COS_ENDPOINT=${COS_ENDPOINT}
+      - BLUESTONE_COS_BUCKET=${COS_BUCKET}
+      - BLUESTONE_COS_REGION=${COS_REGION:-us-south}
+      - BLUESTONE_COS_API_KEY=${IBM_CLOUD_API_KEY}
       
       # Logging
-      - NFS_GATEWAY_LOGGING_LEVEL=${LOG_LEVEL:-info}
-      - NFS_GATEWAY_LOGGING_FORMAT=json
+      - BLUESTONE_LOGGING_LEVEL=${LOG_LEVEL:-info}
+      - BLUESTONE_LOGGING_FORMAT=json
       
       # Cache
-      - NFS_GATEWAY_CACHE_METADATA_ENABLED=true
-      - NFS_GATEWAY_CACHE_DATA_ENABLED=true
+      - BLUESTONE_CACHE_METADATA_ENABLED=true
+      - BLUESTONE_CACHE_DATA_ENABLED=true
     volumes:
       # Configuration
-      - ./config.yaml:/etc/nfs-gateway/config.yaml:ro
+      - ./config.yaml:/etc/bluestone/config.yaml:ro
       
       # Cache storage
-      - nfs-cache:/var/cache/nfs-gateway
+      - nfs-cache:/var/cache/bluestone
       
       # Logs (optional)
-      - ./logs:/var/log/nfs-gateway
+      - ./logs:/var/log/bluestone
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8081/health/live"]
