@@ -2,16 +2,42 @@ package staging
 
 import (
 	"os"
+	"time"
 
 	"github.com/oborges/bluestone/internal/logging"
+	"github.com/oborges/bluestone/pkg/types"
 	"go.uber.org/zap"
 )
 
-// StagedAttributes are the POSIX attributes a staged file syncs to COS with.
+// StagedAttributes are the attributes a staged file syncs to COS with.
 type StagedAttributes struct {
-	Mode os.FileMode `json:"mode"`
-	UID  uint32      `json:"uid"`
-	GID  uint32      `json:"gid"`
+	Mode              os.FileMode `json:"mode"`
+	UID               uint32      `json:"uid"`
+	GID               uint32      `json:"gid"`
+	Btime             time.Time   `json:"btime,omitempty"`
+	WindowsAttributes uint32      `json:"windows_attributes,omitempty"`
+}
+
+// StagedAttributesFrom converts object attributes for staging.
+func StagedAttributesFrom(attrs types.POSIXAttributes) StagedAttributes {
+	return StagedAttributes{
+		Mode:              attrs.Mode,
+		UID:               uint32(attrs.UID),
+		GID:               uint32(attrs.GID),
+		Btime:             attrs.Btime,
+		WindowsAttributes: attrs.WindowsAttributes,
+	}
+}
+
+// POSIX returns the attributes in the form COS metadata is encoded from.
+func (a StagedAttributes) POSIX() *types.POSIXAttributes {
+	return &types.POSIXAttributes{
+		Mode:              a.Mode,
+		UID:               int(a.UID),
+		GID:               int(a.GID),
+		Btime:             a.Btime,
+		WindowsAttributes: a.WindowsAttributes,
+	}
 }
 
 // persistSessionAttributes records a session's attributes in its sidecar, so

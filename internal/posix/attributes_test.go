@@ -215,3 +215,74 @@ func TestStatAndListingExposeAttributes(t *testing.T) {
 		t.Fatalf("listing reused stale attributes for a changed object: uid %d", a.UID)
 	}
 }
+
+func TestCreationTimeAndWindowsAttributesRoundTrip(t *testing.T) {
+	btime := time.Date(2025, 3, 4, 5, 6, 7, 123456789, time.UTC)
+	const directoryFlag = 0x10 // derived from the key, never stored
+	attrs := &types.POSIXAttributes{
+		Mode:              0644,
+		Btime:             btime,
+		WindowsAttributes: WindowsAttributeHidden | WindowsAttributeReadOnly | directoryFlag,
+	}
+
+	encoded := EncodePOSIXAttributes(attrs)
+	if encoded[MetaKeyBtime] != "2025-03-04T05:06:07.123456789Z" || encoded[MetaKeyWindowsAttributes] != "3" {
+		t.Fatalf("encoded = %v, want nanosecond btime and flags 3", encoded)
+	}
+
+	decoded := DecodePOSIXAttributes(encoded, false)
+	if !decoded.Btime.Equal(btime) || decoded.WindowsAttributes != 3 {
+		t.Fatalf("decoded btime %v flags %d, want %v and 3", decoded.Btime, decoded.WindowsAttributes, btime)
+	}
+
+	// Decoding fills default times, so compare against what those attributes
+	// encode to: the other spellings must be gone, not merely overwritten.
+	merged := MergePOSIXMetadata(map[string]string{"Btime": "2000-01-01T00:00:00Z", "Windows-Attributes": "2"}, decoded)
+	if want := EncodePOSIXAttributes(decoded); !reflect.DeepEqual(merged, want) {
+		t.Fatalf("merged = %v, want only the current spellings %v", merged, want)
+	}
+}
+
+func TestCreationTimeFallsBackToModificationTimeWithoutBeingStored(t *testing.T) {
+	ctx := context.Background()
+	store := newFakeObjectStore()
+	store.put("plain.txt", []byte("data"), time.Unix(100, 0))
+	store.put("stamped.txt", []byte("data"), time.Unix(100, 0))
+	stored := time.Unix(50, 0).UTC()
+	setObjectMetadata(store, "stamped.txt", EncodePOSIXAttributes(&types.POSIXAttributes{Mode: 0644, Btime: stored}))
+	ops := newAttributeTestOps(store)
+
+	plain, err := ops.Stat(ctx, "/plain.txt")
+	if err != nil {
+		t.Fatalf("Stat(plain) error = %v", err)
+	}
+	if got := plain.Attributes().Btime; !got.Equal(time.Unix(100, 0)) {
+		t.Fatalf("plain btime = %v, want the modification time", got)
+	}
+	stamped, err := ops.Stat(ctx, "/stamped.txt")
+	if err != nil {
+		t.Fatalf("Stat(stamped) error = %v", err)
+	}
+	if got := stamped.Attributes().Btime; !got.Equal(stored) {
+		t.Fatalf("stamped btime = %v, want stored %v", got, stored)
+	}
+
+	// An unrelated change must not store the reported fallback.
+	mode := os.FileMode(0600)
+	if err := ops.UpdateAttributes(ctx, "/plain.txt", AttributeUpdate{Mode: &mode}); err != nil {
+		t.Fatalf("UpdateAttributes(mode) error = %v", err)
+	}
+	if metadata, _ := objectMetadata(store, "plain.txt"); metadata[MetaKeyBtime] != "" {
+		t.Fatalf("fallback creation time was stored: %v", metadata)
+	}
+
+	btime := time.Unix(10, 0).UTC()
+	flags := WindowsAttributeHidden
+	if err := ops.UpdateAttributes(ctx, "/plain.txt", AttributeUpdate{Btime: &btime, WindowsAttributes: &flags}); err != nil {
+		t.Fatalf("UpdateAttributes(btime, flags) error = %v", err)
+	}
+	metadata, _ := objectMetadata(store, "plain.txt")
+	if decoded := DecodePOSIXAttributes(metadata, false); !decoded.Btime.Equal(btime) || decoded.WindowsAttributes != flags || decoded.Mode != 0600 {
+		t.Fatalf("stored attributes = %+v, want btime %v, hidden, mode 600", decoded, btime)
+	}
+}

@@ -204,6 +204,11 @@ change.
 - COS listings do not return object metadata. Directory listings reuse
   attributes cached from a recent stat when the listed size and modification
   time still match, and report defaults otherwise.
+- Creation time (`btime`) and Windows attribute flags (`windows-attributes`:
+  read-only, hidden, system, archive) are stored and preserved the same way,
+  including through sync uploads. Files the gateway creates record their
+  creation time when created; objects without a stored creation time report
+  their modification time instead.
 
 ### Object-Side Refresh Path
 

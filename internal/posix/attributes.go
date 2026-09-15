@@ -19,6 +19,23 @@ const (
 	MetaKeyAtime = "atime"
 	MetaKeyMtime = "mtime"
 	MetaKeyCtime = "ctime"
+	// MetaKeyBtime stores the creation time with nanosecond precision.
+	MetaKeyBtime = "btime"
+	// MetaKeyWindowsAttributes stores Windows attribute flags as a decimal.
+	MetaKeyWindowsAttributes = "windows-attributes"
+)
+
+// Windows file attribute flags kept in WindowsAttributes. Only flags that
+// describe settable state are stored; directory-ness comes from the key.
+const (
+	WindowsAttributeReadOnly uint32 = 0x1
+	WindowsAttributeHidden   uint32 = 0x2
+	WindowsAttributeSystem   uint32 = 0x4
+	WindowsAttributeArchive  uint32 = 0x20
+
+	// WindowsAttributesStored masks the flags that are stored.
+	WindowsAttributesStored = WindowsAttributeReadOnly | WindowsAttributeHidden |
+		WindowsAttributeSystem | WindowsAttributeArchive
 )
 
 // legacyMetaKeyPrefix marks keys written before the SDK's own prefix was
@@ -26,7 +43,10 @@ const (
 // object carries header x-amz-meta-x-amz-meta-mode. Such keys still decode.
 const legacyMetaKeyPrefix = "x-amz-meta-"
 
-var posixMetaKeys = []string{MetaKeyMode, MetaKeyUID, MetaKeyGID, MetaKeyAtime, MetaKeyMtime, MetaKeyCtime}
+var posixMetaKeys = []string{
+	MetaKeyMode, MetaKeyUID, MetaKeyGID, MetaKeyAtime, MetaKeyMtime, MetaKeyCtime,
+	MetaKeyBtime, MetaKeyWindowsAttributes,
+}
 
 // Default POSIX attributes
 const (
@@ -56,6 +76,12 @@ func EncodePOSIXAttributes(attrs *types.POSIXAttributes) map[string]string {
 		if !t.IsZero() {
 			metadata[key] = t.Format(time.RFC3339)
 		}
+	}
+	if !attrs.Btime.IsZero() {
+		metadata[MetaKeyBtime] = attrs.Btime.UTC().Format(time.RFC3339Nano)
+	}
+	if flags := attrs.WindowsAttributes & WindowsAttributesStored; flags != 0 {
+		metadata[MetaKeyWindowsAttributes] = strconv.FormatUint(uint64(flags), 10)
 	}
 	return metadata
 }
@@ -89,6 +115,16 @@ func DecodePOSIXAttributes(metadata map[string]string, isDir bool) *types.POSIXA
 			if t, err := time.Parse(time.RFC3339, value); err == nil {
 				*target = t
 			}
+		}
+	}
+	if value, ok := metaValue(metadata, MetaKeyBtime); ok {
+		if t, err := time.Parse(time.RFC3339Nano, value); err == nil {
+			attrs.Btime = t
+		}
+	}
+	if value, ok := metaValue(metadata, MetaKeyWindowsAttributes); ok {
+		if flags, err := strconv.ParseUint(value, 10, 32); err == nil {
+			attrs.WindowsAttributes = uint32(flags) & WindowsAttributesStored
 		}
 	}
 
@@ -141,9 +177,11 @@ func MergePOSIXMetadata(existing map[string]string, attrs *types.POSIXAttributes
 // AttributeUpdate is a metadata-only attribute change. Nil fields keep the
 // current value.
 type AttributeUpdate struct {
-	Mode         *os.FileMode
-	UID, GID     *int
-	Atime, Mtime *time.Time
+	Mode              *os.FileMode
+	UID, GID          *int
+	Atime, Mtime      *time.Time
+	Btime             *time.Time
+	WindowsAttributes *uint32
 }
 
 // Apply writes the update over attrs, stamping Ctime with now when anything
@@ -168,6 +206,14 @@ func (u AttributeUpdate) Apply(attrs *types.POSIXAttributes, now time.Time) {
 	}
 	if u.Mtime != nil {
 		attrs.Mtime = *u.Mtime
+		changed = true
+	}
+	if u.Btime != nil {
+		attrs.Btime = *u.Btime
+		changed = true
+	}
+	if u.WindowsAttributes != nil {
+		attrs.WindowsAttributes = *u.WindowsAttributes & WindowsAttributesStored
 		changed = true
 	}
 	if changed {
