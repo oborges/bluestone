@@ -24,6 +24,7 @@ import (
 	"github.com/oborges/bluestone/internal/metrics"
 	"github.com/oborges/bluestone/internal/nfs"
 	"github.com/oborges/bluestone/internal/posix"
+	"github.com/oborges/bluestone/internal/smb"
 	"github.com/oborges/bluestone/internal/staging"
 	"github.com/oborges/bluestone/internal/vfs"
 	nfshelper "github.com/willscott/go-nfs/helpers"
@@ -311,9 +312,41 @@ func main() {
 	}
 	defer nfsServer.Stop()
 
+	// The SMB server serves its own view with Windows naming, labelled
+	// protocol="smb" in metrics, over the same operations and staging.
+	var smbServer *smb.Server
+	if cfg.SMB.Enabled {
+		smbFilesystem := vfs.NewFilesystem(operations, logging.NewKVLogger(zapLogger), "/", &cfg.Performance, stagingManager, syncWorker, featureFlags).
+			WithWindowsNames().
+			ForProtocol(metrics.ProtocolSMB)
+		users := make([]smb.User, 0, len(cfg.SMB.Users))
+		for _, user := range cfg.SMB.Users {
+			users = append(users, smb.User{Name: user.Username, Password: user.Password})
+		}
+		smbServer, err = smb.NewServer(smbFilesystem, smb.ServerOptions{
+			Address:            fmt.Sprintf(":%d", cfg.SMB.Port),
+			ShareName:          cfg.SMB.ShareName,
+			Domain:             cfg.SMB.Domain,
+			Users:              users,
+			AllowedClients:     cfg.Server.AllowedClients,
+			EncryptionRequired: cfg.SMB.EncryptionRequired,
+			Logger:             zapLogger,
+		})
+		if err != nil {
+			logging.Fatal("Failed to create SMB server", zap.Error(err))
+		}
+		if err := smbServer.Start(); err != nil {
+			logging.Fatal("Failed to start SMB server", zap.Error(err))
+		}
+		defer smbServer.Stop()
+	} else {
+		logging.Info("SMB server disabled by configuration")
+	}
+
 	logging.Info("Bluestone started successfully",
 		zap.Int("nfs_port", cfg.Server.NFSPort),
 		zap.String("nfs_version", cfg.Server.NFSVersion),
+		zap.Bool("smb_enabled", cfg.SMB.Enabled),
 		zap.Int("metrics_port", cfg.Server.MetricsPort),
 		zap.Int("health_port", cfg.Server.HealthPort),
 	)
@@ -465,6 +498,11 @@ func main() {
 	// Shutdown NFS server
 	if err := nfsServer.Stop(); err != nil {
 		logging.Error("Error stopping NFS server", zap.Error(err))
+	}
+	if smbServer != nil {
+		if err := smbServer.Stop(); err != nil {
+			logging.Error("Error stopping SMB server", zap.Error(err))
+		}
 	}
 
 	// Clear caches

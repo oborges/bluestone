@@ -228,6 +228,18 @@ SMB server; NFS views keep exact names) follows Windows naming:
   that exist only in staging resolve too. Keys that already contain the
   private-use characters are ambiguous under this mapping.
 
+### SMB Server
+
+`internal/smb` serves a Windows-naming view of the shared filesystem through
+the vendored go-smb-server library (`third_party/go-smb-server`, see its
+`VENDOR.md`). The adapter maps SMB create dispositions onto filesystem opens.
+Existing files are opened read-only and switch to a writable open on the
+first write, truncate, or attribute change, because a writable open of an
+existing object downloads it into staging and SMB clients open files with
+write access they often never use. Set-info requests map to truncate and
+`SetAttributes` (creation, write, and access times, Windows attributes).
+Connections outside `server.allowed_clients` are dropped at accept.
+
 ### Object-Side Refresh Path
 
 Direct changes made in COS by tools outside the gateway are discovered in two

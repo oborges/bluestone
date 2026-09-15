@@ -12,6 +12,9 @@ proposed upstream.
 
 - `go.mod`: `go 1.25.0` instead of `go 1.26`, to match Bluestone. The library
   builds and vets unchanged at 1.25.
+- `smb/server/server.go`: `ListenAndServe` is split so `Serve(ctx, listener)`
+  accepts on a caller-provided listener. Bluestone uses it to enforce
+  `allowed_clients` at accept time and to bind test servers to port 0.
 - Not vendored: `encryption.test` (a compiled test binary tracked upstream) and
   `examples/`.
 
