@@ -38,6 +38,9 @@ type Filesystem struct {
 	featureFlags   *feature.FeatureFlags
 	// protocol attributes this view's requests in metrics.
 	protocol string
+	// windowsNames makes the view follow Windows naming (see
+	// WithWindowsNames).
+	windowsNames bool
 }
 
 // NewFilesystem creates a new COS filesystem with configuration
@@ -96,6 +99,19 @@ func (fs *Filesystem) requestContext() context.Context {
 	return metrics.WithProtocol(context.Background(), fs.protocol)
 }
 
+// WithWindowsNames returns a view that follows Windows naming, for protocols
+// whose clients expect it (SMB). Names match case-insensitively: an exact
+// match wins, otherwise the first matching key in byte order, and a name with
+// no match is used as given, so creating a name that matches an existing key
+// opens that key. Characters Windows cannot use in names are presented as
+// Unicode private-use characters that map back to the stored key. Views share
+// all state; other views keep exact, case-sensitive names.
+func (fs *Filesystem) WithWindowsNames() *Filesystem {
+	view := *fs
+	view.windowsNames = true
+	return &view
+}
+
 // Create creates a new file
 func (fs *Filesystem) Create(filename string) (billy.File, error) {
 	return fs.OpenFile(filename, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0666)
@@ -151,7 +167,7 @@ func (fs *Filesystem) Open(filename string) (billy.File, error) {
 
 // OpenFile opens a file with specified flags and permissions
 func (fs *Filesystem) OpenFile(filename string, flag int, perm os.FileMode) (billy.File, error) {
-	fullPath := fs.Join(fs.root, filename)
+	fullPath := fs.keyPath(filename)
 	if isReservedPath(fullPath) {
 		return nil, &os.PathError{Op: "open", Path: filename, Err: os.ErrPermission}
 	}
@@ -474,7 +490,15 @@ func isReservedPath(fullPath string) bool {
 
 // Stat returns file information
 func (fs *Filesystem) Stat(filename string) (os.FileInfo, error) {
-	fullPath := fs.Join(fs.root, filename)
+	info, err := fs.statPath(fs.keyPath(filename), filename)
+	if err != nil {
+		return nil, err
+	}
+	return fs.presentEntry(info), nil
+}
+
+// statPath answers Stat for a resolved key path.
+func (fs *Filesystem) statPath(fullPath, filename string) (os.FileInfo, error) {
 	if isReservedPath(fullPath) {
 		return nil, &os.PathError{Op: "stat", Path: filename, Err: os.ErrNotExist}
 	}
@@ -531,8 +555,8 @@ func (fs *Filesystem) statFromStaging(fullPath string) os.FileInfo {
 
 // Rename renames a file
 func (fs *Filesystem) Rename(oldpath, newpath string) error {
-	oldFull := fs.Join(fs.root, oldpath)
-	newFull := fs.Join(fs.root, newpath)
+	oldFull := fs.keyPath(oldpath)
+	newFull := fs.renameTargetPath(oldFull, newpath)
 	if isReservedPath(oldFull) || isReservedPath(newFull) {
 		return &os.PathError{Op: "rename", Path: oldpath, Err: os.ErrPermission}
 	}
@@ -650,7 +674,7 @@ func (fs *Filesystem) discardStagedDestination(path string) error {
 
 // Remove removes a file or directory
 func (fs *Filesystem) Remove(filename string) error {
-	fullPath := fs.Join(fs.root, filename)
+	fullPath := fs.keyPath(filename)
 	if isReservedPath(fullPath) {
 		return &os.PathError{Op: "remove", Path: filename, Err: os.ErrPermission}
 	}
@@ -916,7 +940,7 @@ func (fs *Filesystem) TempFile(dir, prefix string) (billy.File, error) {
 func (fs *Filesystem) ReadDir(path string) ([]os.FileInfo, error) {
 	start := time.Now()
 
-	fullPath := fs.Join(fs.root, path)
+	fullPath := fs.keyPath(path)
 
 	// Track per-path calls
 	metrics.GetGlobalCounters().RecordPathCall(fullPath)
@@ -943,7 +967,7 @@ func (fs *Filesystem) ReadDir(path string) ([]os.FileInfo, error) {
 				duration := time.Since(start)
 				RecordReaddirCall(fullPath, len(result), duration, nil)
 				metrics.RecordReadDir(duration)
-				return result, nil
+				return fs.presentEntries(result), nil
 			}
 		}
 		// Record trace even on error
@@ -1029,12 +1053,12 @@ func (fs *Filesystem) ReadDir(path string) ([]os.FileInfo, error) {
 			"entries", len(entries))
 	}
 
-	return result, nil
+	return fs.presentEntries(result), nil
 }
 
 // MkdirAll creates a directory and all parent directories
 func (fs *Filesystem) MkdirAll(filename string, perm os.FileMode) error {
-	fullPath := fs.Join(fs.root, filename)
+	fullPath := fs.keyPath(filename)
 	now := time.Now()
 	attrs := &types.POSIXAttributes{
 		Mode:  perm | os.ModeDir,
@@ -1063,7 +1087,7 @@ func (fs *Filesystem) Readlink(link string) (string, error) {
 
 // Chroot creates a chrooted filesystem
 func (fs *Filesystem) Chroot(path string) (billy.Filesystem, error) {
-	newRoot := fs.Join(fs.root, path)
+	newRoot := fs.keyPath(path)
 	return &Filesystem{
 		ops:            fs.ops,
 		logger:         fs.logger,
@@ -1074,6 +1098,7 @@ func (fs *Filesystem) Chroot(path string) (billy.Filesystem, error) {
 		syncWorker:     fs.syncWorker,
 		featureFlags:   fs.featureFlags,
 		protocol:       fs.protocol,
+		windowsNames:   fs.windowsNames,
 	}, nil
 }
 
@@ -1092,7 +1117,7 @@ func (fs *Filesystem) Chmod(name string, mode os.FileMode) error {
 // times are not staged); anything else gets a metadata-only update in COS
 // that does not rewrite the object's bytes.
 func (fs *Filesystem) SetAttributes(name string, update posix.AttributeUpdate) error {
-	fullPath := fs.Join(fs.root, name)
+	fullPath := fs.keyPath(name)
 
 	if fs.featureFlags != nil && fs.featureFlags.IsStagingEnabled() && fs.stagingManager != nil {
 		if session, exists := fs.stagingManager.GetSession(fullPath); exists {
@@ -1141,7 +1166,7 @@ func (fs *Filesystem) Chown(name string, uid, gid int) error {
 
 // Chtimes changes the access and modification times
 func (fs *Filesystem) Chtimes(name string, atime time.Time, mtime time.Time) error {
-	fullPath := fs.Join(fs.root, name)
+	fullPath := fs.keyPath(name)
 
 	if fs.isStagingDirty(fullPath) {
 		return nil // Staged files bypass COS metadata swaps

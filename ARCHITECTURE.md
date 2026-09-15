@@ -210,6 +210,24 @@ change.
   creation time when created; objects without a stored creation time report
   their modification time instead.
 
+### Windows Naming
+
+Object keys are case-sensitive and may contain characters Windows cannot use
+in names. A filesystem view created with `WithWindowsNames` (intended for the
+SMB server; NFS views keep exact names) follows Windows naming:
+
+- Names match case-insensitively. An exact match wins; otherwise the first
+  matching key in byte order. Listings still show every key, so keys that
+  differ only by case stay visible. Creating a name that matches an existing
+  key opens that key, and a rename that changes only case renames the key.
+- Characters Windows cannot use (`" * : < > ? \ |`, control characters, and
+  trailing spaces or periods) are presented as Unicode private-use characters
+  (the Services for Macintosh mapping used by macOS, the Linux CIFS client,
+  and Samba) and map back to the stored key.
+- Lookups consult the directory listing (cached) plus staged files, so files
+  that exist only in staging resolve too. Keys that already contain the
+  private-use characters are ambiguous under this mapping.
+
 ### Object-Side Refresh Path
 
 Direct changes made in COS by tools outside the gateway are discovered in two
