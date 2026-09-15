@@ -25,6 +25,7 @@ import (
 	"github.com/oborges/bluestone/internal/nfs"
 	"github.com/oborges/bluestone/internal/posix"
 	"github.com/oborges/bluestone/internal/staging"
+	"github.com/oborges/bluestone/internal/vfs"
 	nfshelper "github.com/willscott/go-nfs/helpers"
 	"go.uber.org/zap"
 )
@@ -268,10 +269,10 @@ func main() {
 
 	// Initialize NFS filesystem and server
 	zapLogger := logging.GetLogger()
-	nfsLogger := nfs.NewLogger(zapLogger)
+	nfsLogger := logging.NewKVLogger(zapLogger)
 
 	// Create billy.Filesystem implementation with config
-	cosFilesystem := nfs.NewCOSFilesystemWithConfig(operations, nfsLogger, "/", &cfg.Performance, stagingManager, syncWorker, featureFlags)
+	cosFilesystem := vfs.NewFilesystem(operations, nfsLogger, "/", &cfg.Performance, stagingManager, syncWorker, featureFlags)
 
 	// Wrap with directory caching to work around go-nfs library limitation
 	// The go-nfs library doesn't use CachingHandler for READDIR, so we cache at filesystem level
@@ -389,7 +390,7 @@ func main() {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		nfs.EnableTracing()
+		vfs.EnableTracing()
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("READDIR tracing enabled\n"))
 	})
@@ -399,13 +400,13 @@ func main() {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		nfs.DisableTracing()
+		vfs.DisableTracing()
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("READDIR tracing disabled\n"))
 	})
 
 	http.HandleFunc("/debug/readdir/traces", func(w http.ResponseWriter, r *http.Request) {
-		traces := nfs.GetAllTraces()
+		traces := vfs.GetAllTraces()
 
 		// Analyze each trace
 		result := make(map[string]interface{})
@@ -424,7 +425,7 @@ func main() {
 			return
 		}
 
-		trace := nfs.GetTrace(path)
+		trace := vfs.GetTrace(path)
 		if trace == nil {
 			http.Error(w, "No trace found for path", http.StatusNotFound)
 			return
@@ -440,7 +441,7 @@ func main() {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		nfs.ClearTraces()
+		vfs.ClearTraces()
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("READDIR traces cleared\n"))
 	})

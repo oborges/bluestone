@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/oborges/bluestone/internal/logging"
 	"go.uber.org/zap"
 )
 
@@ -73,7 +74,7 @@ func TestFilteredListenerRejectsAndKeepsServing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClientFilter() error = %v", err)
 	}
-	listener := newFilteredListener(inner, denyFilter, NewLogger(zap.NewNop()))
+	listener := newFilteredListener(inner, denyFilter, logging.NewKVLogger(zap.NewNop()))
 
 	accepted := make(chan net.Conn, 1)
 	acceptErr := make(chan error, 1)
@@ -120,7 +121,7 @@ func TestFilteredListenerAllowsMatchingClient(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClientFilter() error = %v", err)
 	}
-	listener := newFilteredListener(inner, allowFilter, NewLogger(zap.NewNop()))
+	listener := newFilteredListener(inner, allowFilter, logging.NewKVLogger(zap.NewNop()))
 
 	accepted := make(chan net.Conn, 1)
 	go func() {

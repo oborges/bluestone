@@ -31,7 +31,7 @@ flowchart TB
 
     subgraph gateway["Bluestone"]
         nfs --> wrappers["NFS wrappers: auth, cache, instrumentation, stable verifier"]
-        wrappers --> fs["COSFilesystem"]
+        wrappers --> fs["Shared filesystem layer (vfs.Filesystem)"]
         fs --> ops["POSIX operations handler"]
         fs --> staging["Staging manager"]
         staging --> sync["Async sync workers"]
@@ -87,7 +87,7 @@ The request path is:
 2. `go-nfs` decodes the request.
 3. wrapper handlers apply caching, instrumentation, and stable directory
    verifier behavior.
-4. `COSFilesystem` handles filesystem semantics.
+4. the shared filesystem layer (`vfs.Filesystem`) handles filesystem semantics.
 5. operations are routed to staging, cache, or COS depending on file state.
 
 ### Write Path
@@ -97,7 +97,7 @@ Writes use local staging when `staging.enabled` is true.
 ```mermaid
 sequenceDiagram
     participant C as NFS client
-    participant F as COSFilesystem
+    participant F as vfs.Filesystem
     participant B as Backpressure
     participant S as Staging manager
     participant W as Sync worker
@@ -228,18 +228,34 @@ sync workers, health endpoints, metrics, debug endpoints, and the NFS server.
 Configuration can be provided by YAML and overridden with environment variables
 using the `BLUESTONE_` prefix.
 
-### `internal/nfs`
+### `internal/vfs`
 
-This package adapts NFS requests to the internal filesystem implementation.
+The shared, protocol-neutral filesystem layer. Every file protocol server
+(NFS today) serves the bucket through `vfs.Filesystem`, a `billy.Filesystem`,
+so write-back and outage semantics are identical across protocols.
 
 Responsibilities include:
 
-- NFS server startup.
-- NFS operation handling through `COSFilesystem`.
-- stable verifier handling for directory pagination.
-- instrumentation wrappers.
-- filesystem statistics forwarding so clients can see staging-aware capacity.
+- open, read, write, and close routing between staging, cache, and COS.
 - dirty-file read routing through staged state.
+- POSIX write-back rename and delete of dirty staged files via tombstones.
+- outage fallbacks: staged `Stat` and `ReadDir` answers, tombstone-accepted
+  deletes.
+- hiding gateway-internal objects (the HA lease) from the namespace.
+- staging-aware capacity reporting (`Capacity`) for protocols to translate.
+- directory listing traces for the debug endpoints.
+
+### `internal/nfs`
+
+This package adapts NFS requests to the shared filesystem layer.
+
+Responsibilities include:
+
+- NFS server startup and the client allowlist.
+- stable verifier handling for directory pagination.
+- directory-listing cache and instrumentation wrappers.
+- translating `vfs.Capacity` into NFS filesystem statistics so clients can
+  see staging-aware capacity.
 
 ### `internal/posix`
 
@@ -253,7 +269,7 @@ This package implements object-backed POSIX-style operations:
 - singleflight deduplication for concurrent COS range fetches.
 - object-side refresh scans and clean-cache invalidation.
 
-When staging is enabled, the primary write path is handled by `internal/nfs` and
+When staging is enabled, the primary write path is handled by `internal/vfs` and
 `internal/staging`; the POSIX handler remains responsible for COS-backed reads,
 metadata, legacy paths, and object operations.
 

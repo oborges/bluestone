@@ -6,6 +6,7 @@ import (
 	"net"
 	"sync"
 
+	"github.com/oborges/bluestone/internal/logging"
 	nfs "github.com/willscott/go-nfs"
 )
 
@@ -13,7 +14,7 @@ import (
 type Server struct {
 	handler            nfs.Handler
 	listener           net.Listener
-	logger             *Logger
+	logger             *logging.KVLogger
 	nfsVersions        []uint32
 	concurrentHandlers int
 	wg                 sync.WaitGroup
@@ -32,7 +33,7 @@ type ServerOptions struct {
 }
 
 // NewServer creates a new NFS server
-func NewServer(handler nfs.Handler, address string, logger *Logger, nfsVersions []uint32, opts ServerOptions) (*Server, error) {
+func NewServer(handler nfs.Handler, address string, logger *logging.KVLogger, nfsVersions []uint32, opts ServerOptions) (*Server, error) {
 	filter, err := NewClientFilter(opts.AllowedClients)
 	if err != nil {
 		return nil, fmt.Errorf("invalid allowed_clients: %w", err)

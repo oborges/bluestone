@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/go-git/go-billy/v5"
+	"github.com/oborges/bluestone/internal/logging"
 	"github.com/oborges/bluestone/internal/metrics"
 	gonfs "github.com/willscott/go-nfs"
 )
@@ -15,7 +16,7 @@ import (
 // InstrumentedFilesystem wraps a billy.Filesystem to track NFS-level operations
 type InstrumentedFilesystem struct {
 	billy.Filesystem
-	logger *Logger
+	logger *logging.KVLogger
 
 	// Per-path tracking for detecting loops
 	pathCalls sync.Map // map[string]*PathCallTracker
@@ -34,7 +35,7 @@ type PathCallTracker struct {
 }
 
 // NewInstrumentedFilesystem wraps a filesystem with instrumentation
-func NewInstrumentedFilesystem(fs billy.Filesystem, logger *Logger) *InstrumentedFilesystem {
+func NewInstrumentedFilesystem(fs billy.Filesystem, logger *logging.KVLogger) *InstrumentedFilesystem {
 	return &InstrumentedFilesystem{
 		Filesystem: fs,
 		logger:     logger,
@@ -205,12 +206,7 @@ func (ifs *InstrumentedFilesystem) GetAllPathStats() map[string]interface{} {
 
 // FSStat forwards dynamic filesystem capacity data through instrumentation.
 func (ifs *InstrumentedFilesystem) FSStat(ctx context.Context, stat *gonfs.FSStat) error {
-	if provider, ok := ifs.Filesystem.(interface {
-		FSStat(context.Context, *gonfs.FSStat) error
-	}); ok {
-		return provider.FSStat(ctx, stat)
-	}
-	return nil
+	return fsStatFrom(ctx, ifs.Filesystem, stat)
 }
 
 // Chmod changes the mode of the named file (implements billy.Change)

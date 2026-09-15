@@ -1,4 +1,4 @@
-package nfs
+package vfs
 
 import (
 	"bytes"
@@ -8,12 +8,14 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 
 	"github.com/oborges/bluestone/internal/cache"
 	"github.com/oborges/bluestone/internal/config"
 	"github.com/oborges/bluestone/internal/feature"
+	"github.com/oborges/bluestone/internal/logging"
 	"github.com/oborges/bluestone/internal/posix"
 	"github.com/oborges/bluestone/internal/staging"
 	"github.com/oborges/bluestone/pkg/types"
@@ -42,7 +44,7 @@ func testStagingConfig(t *testing.T) *config.StagingConfig {
 	}
 }
 
-func TestCOSFilesystemChrootPreservesRecoveredStagingSessions(t *testing.T) {
+func TestFilesystemChrootPreservesRecoveredStagingSessions(t *testing.T) {
 	cfg := testStagingConfig(t)
 	manager, err := staging.NewStagingManager(cfg)
 	if err != nil {
@@ -91,9 +93,9 @@ func TestCOSFilesystemChrootPreservesRecoveredStagingSessions(t *testing.T) {
 	})
 	metadataCache.SetDirEntries("/", []os.FileInfo{})
 	ops := posix.NewOperationsHandler(nil, metadataCache, nil, perfConfig)
-	fs := NewCOSFilesystemWithConfig(
+	fs := NewFilesystem(
 		ops,
-		NewLogger(zap.NewNop()),
+		logging.NewKVLogger(zap.NewNop()),
 		"/",
 		perfConfig,
 		recoveredManager,
@@ -106,9 +108,9 @@ func TestCOSFilesystemChrootPreservesRecoveredStagingSessions(t *testing.T) {
 		t.Fatalf("Chroot() error = %v", err)
 	}
 
-	chrootedFS, ok := chrooted.(*COSFilesystem)
+	chrootedFS, ok := chrooted.(*Filesystem)
 	if !ok {
-		t.Fatalf("Chroot() returned %T, want *COSFilesystem", chrooted)
+		t.Fatalf("Chroot() returned %T, want *Filesystem", chrooted)
 	}
 	if chrootedFS.stagingManager != recoveredManager {
 		t.Fatal("Chroot() dropped staging manager")
@@ -154,7 +156,7 @@ func TestCOSFilesystemChrootPreservesRecoveredStagingSessions(t *testing.T) {
 	}
 }
 
-func TestCOSFileCloseReleasesStagingSessionOnce(t *testing.T) {
+func TestFileCloseReleasesStagingSessionOnce(t *testing.T) {
 	cfg := testStagingConfig(t)
 	manager, err := staging.NewStagingManager(cfg)
 	if err != nil {
@@ -169,8 +171,8 @@ func TestCOSFileCloseReleasesStagingSessionOnce(t *testing.T) {
 	}
 	session.IncrementRefCount()
 
-	file := &COSFile{
-		logger:         NewLogger(zap.NewNop()),
+	file := &File{
+		logger:         logging.NewKVLogger(zap.NewNop()),
 		path:           path,
 		stagingManager: manager,
 		stagingSession: session,
@@ -188,7 +190,7 @@ func TestCOSFileCloseReleasesStagingSessionOnce(t *testing.T) {
 	}
 }
 
-func TestCOSFilesystemRenameDirtyStagedFileSucceeds(t *testing.T) {
+func TestFilesystemRenameDirtyStagedFileSucceeds(t *testing.T) {
 	cfg := testStagingConfig(t)
 	manager, err := staging.NewStagingManager(cfg)
 	if err != nil {
@@ -214,7 +216,7 @@ func TestCOSFilesystemRenameDirtyStagedFileSucceeds(t *testing.T) {
 
 	store := newFakeObjectStore()
 	// Simulate a previously synced source object that must not survive.
-	store.objects["dirty.txt"] = []byte("stale synced data")
+	store.put("dirty.txt", []byte("stale synced data"))
 	fs := newDirtyStagingTestFilesystemWithStore(t, manager, store)
 
 	if err := fs.Rename("dirty.txt", "renamed.txt"); err != nil {
@@ -247,7 +249,7 @@ func TestCOSFilesystemRenameDirtyStagedFileSucceeds(t *testing.T) {
 
 	// The source object was deleted inline (no sync in flight) and its
 	// tombstone resolved.
-	if !store.deleted["dirty.txt"] {
+	if !store.wasDeleted("dirty.txt") {
 		t.Fatal("source COS object should have been deleted")
 	}
 	if manager.HasPendingDelete(path) {
@@ -267,7 +269,7 @@ func TestCOSFilesystemRenameDirtyStagedFileSucceeds(t *testing.T) {
 	}
 }
 
-func TestCOSFilesystemRenameCleanSourceOverDirtyDestination(t *testing.T) {
+func TestFilesystemRenameCleanSourceOverDirtyDestination(t *testing.T) {
 	cfg := testStagingConfig(t)
 	manager, err := staging.NewStagingManager(cfg)
 	if err != nil {
@@ -287,7 +289,7 @@ func TestCOSFilesystemRenameCleanSourceOverDirtyDestination(t *testing.T) {
 	manager.ReleaseSession(destPath)
 
 	store := newFakeObjectStore()
-	store.objects["source.txt"] = []byte("source content")
+	store.put("source.txt", []byte("source content"))
 	fs := newDirtyStagingTestFilesystemWithStore(t, manager, store)
 
 	if err := fs.Rename("source.txt", "dest.txt"); err != nil {
@@ -299,15 +301,15 @@ func TestCOSFilesystemRenameCleanSourceOverDirtyDestination(t *testing.T) {
 	if _, exists := manager.GetSession(destPath); exists {
 		t.Fatal("destination staging session should be discarded by rename-over")
 	}
-	if got := string(store.objects["dest.txt"]); got != "source content" {
+	if got := string(store.get("dest.txt")); got != "source content" {
 		t.Fatalf("destination object = %q, want %q", got, "source content")
 	}
-	if !store.deleted["source.txt"] {
+	if !store.wasDeleted("source.txt") {
 		t.Fatal("source object should be deleted by object-store rename")
 	}
 }
 
-func TestCOSFilesystemRenameCleanSourceOverSyncingDestinationStaysBusy(t *testing.T) {
+func TestFilesystemRenameCleanSourceOverSyncingDestinationStaysBusy(t *testing.T) {
 	cfg := testStagingConfig(t)
 	manager, err := staging.NewStagingManager(cfg)
 	if err != nil {
@@ -333,7 +335,7 @@ func TestCOSFilesystemRenameCleanSourceOverSyncingDestinationStaysBusy(t *testin
 	defer manager.UnlockSync(destPath)
 
 	store := newFakeObjectStore()
-	store.objects["source.txt"] = []byte("source content")
+	store.put("source.txt", []byte("source content"))
 	fs := newDirtyStagingTestFilesystemWithStore(t, manager, store)
 
 	err = fs.Rename("source.txt", "dest-syncing.txt")
@@ -345,7 +347,7 @@ func TestCOSFilesystemRenameCleanSourceOverSyncingDestinationStaysBusy(t *testin
 	}
 }
 
-func TestCOSFilesystemRenameDirectoryWithDirtyChildIsBlocked(t *testing.T) {
+func TestFilesystemRenameDirectoryWithDirtyChildIsBlocked(t *testing.T) {
 	cfg := testStagingConfig(t)
 	manager, err := staging.NewStagingManager(cfg)
 	if err != nil {
@@ -373,7 +375,7 @@ func TestCOSFilesystemRenameDirectoryWithDirtyChildIsBlocked(t *testing.T) {
 	}
 }
 
-func TestCOSFilesystemRemoveDirtyStagedFileSucceeds(t *testing.T) {
+func TestFilesystemRemoveDirtyStagedFileSucceeds(t *testing.T) {
 	cfg := testStagingConfig(t)
 	manager, err := staging.NewStagingManager(cfg)
 	if err != nil {
@@ -410,7 +412,7 @@ func TestCOSFilesystemRemoveDirtyStagedFileSucceeds(t *testing.T) {
 	if _, err := os.Stat(stagingPath); !os.IsNotExist(err) {
 		t.Fatalf("staged data should be removed after accepted delete, stat err = %v", err)
 	}
-	if !store.deleted["dirty-delete.txt"] {
+	if !store.wasDeleted("dirty-delete.txt") {
 		t.Fatal("COS object should have been deleted")
 	}
 	if _, err := fs.Stat("dirty-delete.txt"); !os.IsNotExist(err) {
@@ -418,7 +420,7 @@ func TestCOSFilesystemRemoveDirtyStagedFileSucceeds(t *testing.T) {
 	}
 }
 
-func TestCOSFilesystemRemoveCleanFileFallsBackToTombstoneOnBackendError(t *testing.T) {
+func TestFilesystemRemoveCleanFileFallsBackToTombstoneOnBackendError(t *testing.T) {
 	cfg := testStagingConfig(t)
 	manager, err := staging.NewStagingManager(cfg)
 	if err != nil {
@@ -427,11 +429,11 @@ func TestCOSFilesystemRemoveCleanFileFallsBackToTombstoneOnBackendError(t *testi
 	defer manager.Shutdown()
 
 	store := newFakeObjectStore()
-	store.objects["clean.txt"] = []byte("clean synced data")
+	store.put("clean.txt", []byte("clean synced data"))
 	fs := newDirtyStagingTestFilesystemWithStore(t, manager, store)
 
 	// Backend cannot perform deletes (outage).
-	store.deleteErr = errors.New("dial tcp: connection refused")
+	store.setDeleteErr(errors.New("dial tcp: connection refused"))
 
 	if err := fs.Remove("clean.txt"); err != nil {
 		t.Fatalf("Remove(clean file, backend down) error = %v, want tombstone-accepted delete", err)
@@ -450,7 +452,7 @@ func TestCOSFilesystemRemoveCleanFileFallsBackToTombstoneOnBackendError(t *testi
 	}
 }
 
-func TestCOSFilesystemHidesPendingDeletePaths(t *testing.T) {
+func TestFilesystemHidesPendingDeletePaths(t *testing.T) {
 	cfg := testStagingConfig(t)
 	manager, err := staging.NewStagingManager(cfg)
 	if err != nil {
@@ -480,8 +482,8 @@ func TestCOSFilesystemHidesPendingDeletePaths(t *testing.T) {
 
 	store := newFakeObjectStore()
 	// The object is still visible in COS until the deferred delete completes.
-	store.objects["doomed.txt"] = []byte("doomed data")
-	store.objects["survivor.txt"] = []byte("survivor")
+	store.put("doomed.txt", []byte("doomed data"))
+	store.put("survivor.txt", []byte("survivor"))
 	fs := newDirtyStagingTestFilesystemWithStore(t, manager, store)
 
 	if _, err := fs.Stat("doomed.txt"); !os.IsNotExist(err) {
@@ -511,7 +513,7 @@ func TestCOSFilesystemHidesPendingDeletePaths(t *testing.T) {
 	}
 }
 
-func TestCOSFilesystemRecreateCancelsPendingDelete(t *testing.T) {
+func TestFilesystemRecreateCancelsPendingDelete(t *testing.T) {
 	cfg := testStagingConfig(t)
 	manager, err := staging.NewStagingManager(cfg)
 	if err != nil {
@@ -551,7 +553,7 @@ func TestCOSFilesystemRecreateCancelsPendingDelete(t *testing.T) {
 	}
 }
 
-func TestCOSFilesystemRemoveDirectoryWithDirtyChildIsBlocked(t *testing.T) {
+func TestFilesystemRemoveDirectoryWithDirtyChildIsBlocked(t *testing.T) {
 	cfg := testStagingConfig(t)
 	manager, err := staging.NewStagingManager(cfg)
 	if err != nil {
@@ -579,8 +581,11 @@ func TestCOSFilesystemRemoveDirectoryWithDirtyChildIsBlocked(t *testing.T) {
 	}
 }
 
-// fakeObjectStore is an in-memory posix.ObjectStore for handler tests.
+// fakeObjectStore is an in-memory posix.ObjectStore for filesystem tests. It
+// is safe for concurrent use: the operations handler issues object calls from
+// its own goroutines (e.g. Stat's parallel lookups).
 type fakeObjectStore struct {
+	mu        sync.Mutex
 	objects   map[string][]byte
 	deleted   map[string]bool
 	deleteErr error
@@ -593,7 +598,33 @@ func newFakeObjectStore() *fakeObjectStore {
 	}
 }
 
+func (s *fakeObjectStore) put(key string, data []byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.objects[key] = data
+}
+
+func (s *fakeObjectStore) get(key string) []byte {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.objects[key]
+}
+
+func (s *fakeObjectStore) wasDeleted(key string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.deleted[key]
+}
+
+func (s *fakeObjectStore) setDeleteErr(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.deleteErr = err
+}
+
 func (s *fakeObjectStore) GetObject(ctx context.Context, key string) ([]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	data, ok := s.objects[key]
 	if !ok {
 		return nil, os.ErrNotExist
@@ -625,11 +656,15 @@ func (s *fakeObjectStore) GetObjectStream(ctx context.Context, key string) (io.R
 }
 
 func (s *fakeObjectStore) PutObject(ctx context.Context, key string, data []byte, metadata map[string]string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.objects[key] = append([]byte(nil), data...)
 	return nil
 }
 
 func (s *fakeObjectStore) DeleteObject(ctx context.Context, key string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.deleteErr != nil {
 		return s.deleteErr
 	}
@@ -639,6 +674,8 @@ func (s *fakeObjectStore) DeleteObject(ctx context.Context, key string) error {
 }
 
 func (s *fakeObjectStore) HeadObject(ctx context.Context, key string) (*types.ObjectMetadata, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	data, ok := s.objects[key]
 	if !ok {
 		return nil, os.ErrNotExist
@@ -647,6 +684,8 @@ func (s *fakeObjectStore) HeadObject(ctx context.Context, key string) (*types.Ob
 }
 
 func (s *fakeObjectStore) ListObjects(ctx context.Context, prefix string, maxKeys int) ([]*types.ObjectMetadata, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	var result []*types.ObjectMetadata
 	for key, data := range s.objects {
 		if strings.HasPrefix(key, prefix) {
@@ -660,6 +699,8 @@ func (s *fakeObjectStore) ListObjects(ctx context.Context, prefix string, maxKey
 }
 
 func (s *fakeObjectStore) CopyObject(ctx context.Context, sourceKey, destKey string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	data, ok := s.objects[sourceKey]
 	if !ok {
 		return os.ErrNotExist
@@ -672,12 +713,12 @@ func (s *fakeObjectStore) UpdateObjectMetadata(ctx context.Context, key string, 
 	return nil
 }
 
-func newDirtyStagingTestFilesystem(t *testing.T, manager *staging.StagingManager) *COSFilesystem {
+func newDirtyStagingTestFilesystem(t *testing.T, manager *staging.StagingManager) *Filesystem {
 	t.Helper()
 	return newDirtyStagingTestFilesystemWithStore(t, manager, nil)
 }
 
-func newDirtyStagingTestFilesystemWithStore(t *testing.T, manager *staging.StagingManager, store *fakeObjectStore) *COSFilesystem {
+func newDirtyStagingTestFilesystemWithStore(t *testing.T, manager *staging.StagingManager, store *fakeObjectStore) *Filesystem {
 	t.Helper()
 
 	perfConfig := &config.PerformanceConfig{
@@ -695,9 +736,9 @@ func newDirtyStagingTestFilesystemWithStore(t *testing.T, manager *staging.Stagi
 		objectStore = store
 	}
 	ops := posix.NewOperationsHandler(objectStore, metadataCache, nil, perfConfig)
-	return NewCOSFilesystemWithConfig(
+	return NewFilesystem(
 		ops,
-		NewLogger(zap.NewNop()),
+		logging.NewKVLogger(zap.NewNop()),
 		"/",
 		perfConfig,
 		manager,
