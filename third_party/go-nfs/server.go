@@ -26,8 +26,13 @@ type Server struct {
 	ConcurrentHandlers int
 	context.Context
 
-	// NFSv4 advisory byte-range lock state, created on first LOCK-family
-	// operation.
+	// Locker holds the byte ranges behind NFSv4 LOCK, LOCKT and LOCKU.
+	// Supply a table shared with other protocol servers so locks conflict
+	// across protocols. Nil disables NFSv4 locking (NFS4ERR_NOTSUPP).
+	Locker ByteRangeLocker
+
+	// NFSv4 lock protocol state (stateids, seqids, client leases), created
+	// on first LOCK-family or RENEW operation.
 	lockMgr     *nfs4LockManager
 	lockMgrOnce sync.Once
 }

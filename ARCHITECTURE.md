@@ -75,11 +75,14 @@ RELEASE_LOCKOWNER) with POSIX semantics: same-owner overlaps replace,
 different-owner conflicts return DENIED with the conflicting lock described,
 `fcntl` and `flock` both work from Linux clients. Locks are advisory only —
 never enforced against READ or WRITE — matching the managed-cloud file
-gateway model. Lock state is in-memory in the single gateway that owns the
-export, capped at 512 locks per file and 8,192 per client, and expires when a
-client stops renewing its lease (90s lease, 3 lease periods of grace). Lock
-state does not survive a gateway restart; reclaim attempts after restart
-return NFS4ERR_NO_GRACE and applications must re-acquire.
+gateway model. Held ranges live in the shared lock table (`internal/lock`)
+that every protocol server uses, so locks will conflict across protocols;
+NFSv4 stateids and client leases stay in the NFS layer. Lock state is
+in-memory in the single gateway that owns the export, capped at 512 locks per
+file and 8,192 per client, and expires when a client stops renewing its lease
+(90s lease, 3 lease periods of grace). Lock state does not survive a gateway
+restart; reclaim attempts after restart return NFS4ERR_NO_GRACE and
+applications must re-acquire.
 
 The request path is:
 
@@ -248,6 +251,15 @@ Responsibilities include:
 - hiding gateway-internal objects (the HA lease) from the namespace.
 - staging-aware capacity reporting (`Capacity`) for protocols to translate.
 - directory listing traces for the debug endpoints.
+
+### `internal/lock`
+
+The protocol-neutral byte-range lock table every protocol server shares, so a
+lock taken over one protocol conflicts with locks taken over another. Locks
+are advisory and in-memory, with POSIX range semantics and per-file and
+per-client caps. Protocol layers keep their own state around locks (NFSv4
+stateids and client leases stay in the NFS layer) and map holders onto lock
+owners.
 
 ### `internal/nfs`
 

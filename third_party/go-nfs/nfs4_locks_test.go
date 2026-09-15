@@ -6,6 +6,48 @@ import (
 	"time"
 )
 
+// fakeLocker records calls and returns scripted results, so these tests
+// cover the NFSv4 protocol layer; range semantics belong to the locker.
+type fakeLocker struct {
+	conflict *LockConflict
+	err      error
+
+	locks           []fakeLockCall
+	unlocks         []fakeLockCall
+	tests           []fakeLockCall
+	releasedOwners  []LockOwner
+	releasedClients []string
+}
+
+type fakeLockCall struct {
+	owner LockOwner
+	path  string
+	r     LockRange
+}
+
+func (f *fakeLocker) Lock(owner LockOwner, path string, r LockRange) (*LockConflict, error) {
+	f.locks = append(f.locks, fakeLockCall{owner, path, r})
+	return f.conflict, f.err
+}
+
+func (f *fakeLocker) Unlock(owner LockOwner, path string, r LockRange) error {
+	f.unlocks = append(f.unlocks, fakeLockCall{owner, path, r})
+	return f.err
+}
+
+func (f *fakeLocker) Test(owner LockOwner, path string, r LockRange) (*LockConflict, error) {
+	f.tests = append(f.tests, fakeLockCall{owner, path, r})
+	return f.conflict, f.err
+}
+
+func (f *fakeLocker) ReleaseOwner(owner LockOwner) {
+	f.releasedOwners = append(f.releasedOwners, owner)
+}
+
+func (f *fakeLocker) ReleaseClient(client string) {
+	f.releasedClients = append(f.releasedClients, client)
+}
+
 func mustRange(t *testing.T, offset, length uint64, lockType uint32) lockRange {
 	t.Helper()
 	r, status := makeRange(offset, length, lockType)
@@ -31,215 +73,239 @@ func TestMakeRangeValidation(t *testing.T) {
 	}
 }
 
-func TestLockConflictsBetweenOwners(t *testing.T) {
-	lm := newNFS4LockManager()
-	alice := lockOwnerID{clientID: 1, owner: "alice"}
-	bob := lockOwnerID{clientID: 2, owner: "bob"}
+func TestLockDelegatesToLockerWithNFS4Owner(t *testing.T) {
+	locker := &fakeLocker{}
+	lm := newNFS4LockManager(locker)
+	owner := lockOwnerID{clientID: 0xab, owner: "o"}
 
-	if _, denied, status := lm.lock(alice, "/f", mustRange(t, 0, 100, writeLT)); status != nfs4OK || denied != nil {
-		t.Fatalf("alice write lock: status = %d", status)
+	if _, _, status := lm.lock(owner, "/f", mustRange(t, 10, 20, writeLT)); status != nfs4OK {
+		t.Fatalf("lock: status = %d", status)
+	}
+	want := fakeLockCall{
+		owner: LockOwner{Client: "nfs4/ab", Owner: "o"},
+		path:  "/f",
+		r:     LockRange{Start: 10, End: 30, Exclusive: true},
+	}
+	if len(locker.locks) != 1 || locker.locks[0] != want {
+		t.Fatalf("locker calls = %+v, want %+v", locker.locks, want)
 	}
 
-	// Overlapping write from another owner is denied with conflict info.
-	_, denied, status := lm.lock(bob, "/f", mustRange(t, 50, 100, writeLT))
-	if status != nfs4ErrDenied || denied == nil {
-		t.Fatalf("bob overlapping write: status = %d denied = %v, want DENIED", status, denied)
+	if _, status := lm.test(owner, "/f", mustRange(t, 0, nfs4LengthEOF, readLT)); status != nfs4OK {
+		t.Fatalf("test: status = %d", status)
 	}
-	if denied.owner != alice || denied.offset != 0 || denied.length != 100 || denied.lockType != writeLT {
-		t.Fatalf("denied = %+v, want alice's 0-100 write lock", denied)
-	}
-
-	// Read vs write conflicts; read vs read does not.
-	if _, _, status := lm.lock(bob, "/f", mustRange(t, 0, 10, readLT)); status != nfs4ErrDenied {
-		t.Fatalf("bob read over alice write: status = %d, want DENIED", status)
-	}
-	if _, _, status := lm.lock(bob, "/f", mustRange(t, 200, 100, writeLT)); status != nfs4OK {
-		t.Fatalf("bob disjoint write: status = %d, want OK", status)
-	}
-	if _, _, status := lm.lock(alice, "/g", mustRange(t, 0, 10, readLT)); status != nfs4OK {
-		t.Fatalf("alice read on /g: status = %d", status)
-	}
-	if _, _, status := lm.lock(bob, "/g", mustRange(t, 0, 10, readLT)); status != nfs4OK {
-		t.Fatalf("bob shared read on /g: status = %d, want OK (read locks share)", status)
+	if got := locker.tests[0].r; got != (LockRange{Start: 0, End: nfs4LengthEOF}) {
+		t.Fatalf("test range = %+v, want shared [0, EOF)", got)
 	}
 }
 
-func TestSameOwnerReplaceAndUnlockSplit(t *testing.T) {
-	lm := newNFS4LockManager()
+func TestLockDeniedDescribesConflictingHolder(t *testing.T) {
+	locker := &fakeLocker{}
+	lm := newNFS4LockManager(locker)
+	requester := lockOwnerID{clientID: 2, owner: "bob"}
+
+	// Held by another NFSv4 client: its client ID round-trips.
+	locker.conflict = &LockConflict{
+		LockRange: LockRange{Start: 0, End: 100, Exclusive: true},
+		Owner:     LockOwner{Client: "nfs4/1", Owner: "alice"},
+	}
+	st, denied, status := lm.lock(requester, "/f", mustRange(t, 50, 10, readLT))
+	if status != nfs4ErrDenied || st != nil {
+		t.Fatalf("lock over conflict: status = %d, state = %v; want DENIED, no state", status, st)
+	}
+	want := lockDenied{offset: 0, length: 100, lockType: writeLT, owner: lockOwnerID{clientID: 1, owner: "alice"}}
+	if *denied != want {
+		t.Fatalf("denied = %+v, want %+v", *denied, want)
+	}
+	if len(lm.states) != 0 {
+		t.Fatal("a denied lock must not create lock state")
+	}
+
+	// Held by another protocol's client, to end of file, shared.
+	locker.conflict = &LockConflict{
+		LockRange: LockRange{Start: 5, End: nfs4LengthEOF},
+		Owner:     LockOwner{Client: "smb/session-9", Owner: "handle-3"},
+	}
+	denied, status = lm.test(requester, "/f", mustRange(t, 0, 10, writeLT))
+	if status != nfs4ErrDenied {
+		t.Fatalf("test over foreign conflict: status = %d, want DENIED", status)
+	}
+	want = lockDenied{offset: 5, length: nfs4LengthEOF, lockType: readLT, owner: lockOwnerID{owner: "smb/session-9/handle-3"}}
+	if *denied != want {
+		t.Fatalf("denied = %+v, want %+v", *denied, want)
+	}
+}
+
+func TestLockStateReuseAndSeqid(t *testing.T) {
+	locker := &fakeLocker{}
+	lm := newNFS4LockManager(locker)
 	owner := lockOwnerID{clientID: 1, owner: "o"}
 
-	st, _, status := lm.lock(owner, "/f", mustRange(t, 0, 100, writeLT))
+	st, _, status := lm.lock(owner, "/f", mustRange(t, 0, 10, writeLT))
 	if status != nfs4OK {
-		t.Fatalf("initial lock: status = %d", status)
+		t.Fatalf("lock: status = %d", status)
 	}
-	// Same owner downgrades the middle to a read lock: replaces the overlap.
-	st2, _, status := lm.lock(owner, "/f", mustRange(t, 25, 50, readLT))
-	if status != nfs4OK {
-		t.Fatalf("downgrade middle: status = %d", status)
-	}
-	if st2 != st {
-		t.Fatal("same owner+file should reuse the lock state")
-	}
-	if len(st.ranges) != 3 {
-		t.Fatalf("ranges = %+v, want write/read/write split into 3", st.ranges)
-	}
-
-	// Unlock the middle: the read range disappears, writes remain.
-	if _, status := lm.unlock(st.other, "/f", mustRange(t, 25, 50, writeLT)); status != nfs4OK {
-		t.Fatalf("unlock middle: status = %d", status)
-	}
-	if len(st.ranges) != 2 {
-		t.Fatalf("ranges after unlock = %+v, want 2", st.ranges)
-	}
-
-	// Another owner can now lock the freed middle.
-	other := lockOwnerID{clientID: 2, owner: "p"}
-	if _, _, status := lm.lock(other, "/f", mustRange(t, 30, 10, writeLT)); status != nfs4OK {
-		t.Fatalf("other owner locking freed middle: status = %d, want OK", status)
-	}
-}
-
-func TestUnlockBadStateID(t *testing.T) {
-	lm := newNFS4LockManager()
-	var bogus [nfs4OtherSize]byte
-	if _, status := lm.unlock(bogus, "/f", lockRange{start: 0, end: 10, lockType: writeLT}); status != nfs4ErrBadStateID {
-		t.Fatalf("unlock with unknown stateid: status = %d, want BAD_STATEID", status)
-	}
-
-	owner := lockOwnerID{clientID: 1, owner: "o"}
-	st, _, _ := lm.lock(owner, "/f", lockRange{start: 0, end: 10, lockType: writeLT})
-	if _, status := lm.unlock(st.other, "/WRONG", lockRange{start: 0, end: 10, lockType: writeLT}); status != nfs4ErrBadStateID {
-		t.Fatalf("unlock with wrong path: status = %d, want BAD_STATEID", status)
-	}
-}
-
-func TestLockByStateID(t *testing.T) {
-	lm := newNFS4LockManager()
-	owner := lockOwnerID{clientID: 1, owner: "o"}
-	st, _, _ := lm.lock(owner, "/f", lockRange{start: 0, end: 10, lockType: writeLT})
 	seqBefore := st.seqid
 
-	st2, _, status := lm.lockByStateID(st.other, "/f", lockRange{start: 20, end: 30, lockType: writeLT})
+	st2, _, status := lm.lockByStateID(st.other, "/f", mustRange(t, 20, 10, writeLT))
 	if status != nfs4OK || st2 != st {
-		t.Fatalf("lockByStateID: status = %d", status)
+		t.Fatalf("lockByStateID: status = %d, same state = %v", status, st2 == st)
 	}
 	if st.seqid != seqBefore+1 {
 		t.Fatalf("stateid seqid = %d, want %d (must advance)", st.seqid, seqBefore+1)
 	}
-	if len(st.ranges) != 2 {
-		t.Fatalf("ranges = %+v, want 2 disjoint", st.ranges)
+	if got := locker.locks[1].owner; got != owner.lockerOwner() {
+		t.Fatalf("lockByStateID owner = %+v, want the stateid's owner", got)
+	}
+
+	if _, status := lm.unlock(st.other, "/f", mustRange(t, 0, 10, writeLT)); status != nfs4OK {
+		t.Fatalf("unlock: status = %d", status)
+	}
+	if st.seqid != seqBefore+2 {
+		t.Fatalf("seqid after unlock = %d, want %d", st.seqid, seqBefore+2)
+	}
+	if len(locker.unlocks) != 1 || locker.unlocks[0].path != "/f" {
+		t.Fatalf("locker unlock calls = %+v", locker.unlocks)
+	}
+
+	if _, _, status := lm.lock(owner, "/g", mustRange(t, 0, 10, writeLT)); status != nfs4OK {
+		t.Fatalf("lock /g: status = %d", status)
+	}
+	if len(lm.states) != 2 {
+		t.Fatalf("states = %d, want one per (owner, file)", len(lm.states))
 	}
 }
 
-func TestLockTExcludesRequestingOwner(t *testing.T) {
-	lm := newNFS4LockManager()
-	owner := lockOwnerID{clientID: 1, owner: "o"}
-	if _, _, status := lm.lock(owner, "/f", mustRange(t, 0, 100, writeLT)); status != nfs4OK {
-		t.Fatal("setup lock failed")
+func TestUnlockBadStateID(t *testing.T) {
+	locker := &fakeLocker{}
+	lm := newNFS4LockManager(locker)
+	var bogus [nfs4OtherSize]byte
+	if _, status := lm.unlock(bogus, "/f", mustRange(t, 0, 10, writeLT)); status != nfs4ErrBadStateID {
+		t.Fatalf("unlock with unknown stateid: status = %d, want BAD_STATEID", status)
 	}
 
-	// The holding owner's own test must not conflict.
-	if denied, status := lm.test(owner, "/f", mustRange(t, 0, 100, writeLT)); status != nfs4OK || denied != nil {
-		t.Fatalf("self test: status = %d, want OK", status)
+	st, _, _ := lm.lock(lockOwnerID{clientID: 1, owner: "o"}, "/f", mustRange(t, 0, 10, writeLT))
+	if _, status := lm.unlock(st.other, "/WRONG", mustRange(t, 0, 10, writeLT)); status != nfs4ErrBadStateID {
+		t.Fatalf("unlock with wrong path: status = %d, want BAD_STATEID", status)
 	}
-	// Another owner sees the conflict.
-	if _, status := lm.test(lockOwnerID{clientID: 2, owner: "p"}, "/f", mustRange(t, 0, 100, writeLT)); status != nfs4ErrDenied {
-		t.Fatalf("foreign test: status = %d, want DENIED", status)
+	if _, _, status := lm.lockByStateID(st.other, "/WRONG", mustRange(t, 0, 10, writeLT)); status != nfs4ErrBadStateID {
+		t.Fatalf("lockByStateID with wrong path: status = %d, want BAD_STATEID", status)
+	}
+	if len(locker.unlocks) != 0 {
+		t.Fatal("bad stateids must not reach the locker")
 	}
 }
 
-func TestReleaseOwnerFreesLocks(t *testing.T) {
-	lm := newNFS4LockManager()
+func TestLockLimitMapsToResource(t *testing.T) {
+	locker := &fakeLocker{err: ErrLockLimit}
+	lm := newNFS4LockManager(locker)
+
+	if _, _, status := lm.lock(lockOwnerID{clientID: 1, owner: "o"}, "/f", mustRange(t, 0, 10, writeLT)); status != nfs4ErrResource {
+		t.Fatalf("lock over limit: status = %d, want RESOURCE", status)
+	}
+	if len(lm.states) != 0 {
+		t.Fatal("a refused lock must not create lock state")
+	}
+}
+
+func TestNilLockerDisablesLocking(t *testing.T) {
+	lm := newNFS4LockManager(nil)
 	owner := lockOwnerID{clientID: 1, owner: "o"}
-	lm.lock(owner, "/f", lockRange{start: 0, end: 100, lockType: writeLT})
-	lm.lock(owner, "/g", lockRange{start: 0, end: 100, lockType: writeLT})
+
+	if _, _, status := lm.lock(owner, "/f", mustRange(t, 0, 10, writeLT)); status != nfs4ErrNotSupp {
+		t.Fatalf("lock: status = %d, want NOTSUPP", status)
+	}
+	if _, status := lm.test(owner, "/f", mustRange(t, 0, 10, writeLT)); status != nfs4ErrNotSupp {
+		t.Fatalf("test: status = %d, want NOTSUPP", status)
+	}
+	var other [nfs4OtherSize]byte
+	if _, status := lm.unlock(other, "/f", mustRange(t, 0, 10, writeLT)); status != nfs4ErrNotSupp {
+		t.Fatalf("unlock: status = %d, want NOTSUPP", status)
+	}
+	lm.releaseOwner(owner)
+	lm.renewClient(owner.clientID)
+}
+
+func TestReleaseOwnerDropsStateAndRanges(t *testing.T) {
+	locker := &fakeLocker{}
+	lm := newNFS4LockManager(locker)
+	owner := lockOwnerID{clientID: 1, owner: "o"}
+	other := lockOwnerID{clientID: 1, owner: "p"}
+	st, _, _ := lm.lock(owner, "/f", mustRange(t, 0, 100, writeLT))
+	lm.lock(owner, "/g", mustRange(t, 0, 100, writeLT))
+	lm.lock(other, "/f", mustRange(t, 200, 100, writeLT))
 
 	lm.releaseOwner(owner)
 
-	other := lockOwnerID{clientID: 2, owner: "p"}
-	if _, _, status := lm.lock(other, "/f", lockRange{start: 0, end: 100, lockType: writeLT}); status != nfs4OK {
-		t.Fatalf("lock after release: status = %d, want OK", status)
+	if len(lm.states) != 1 {
+		t.Fatalf("states = %d, want only the other owner's", len(lm.states))
 	}
-	if _, _, status := lm.lock(other, "/g", lockRange{start: 0, end: 100, lockType: writeLT}); status != nfs4OK {
-		t.Fatalf("lock after release on /g: status = %d, want OK", status)
+	if _, status := lm.unlock(st.other, "/f", mustRange(t, 0, 100, writeLT)); status != nfs4ErrBadStateID {
+		t.Fatalf("released stateid: status = %d, want BAD_STATEID", status)
 	}
-	if len(lm.states) != 2 {
-		t.Fatalf("states = %d, want only the new owner's 2", len(lm.states))
-	}
-}
-
-func TestPerFileLockCap(t *testing.T) {
-	lm := newNFS4LockManager()
-	owner := lockOwnerID{clientID: 1, owner: "o"}
-
-	// Disjoint 1-byte locks with gaps cannot coalesce.
-	for i := 0; i < maxLocksPerFile; i++ {
-		if _, _, status := lm.lock(owner, "/f", lockRange{start: uint64(i * 2), end: uint64(i*2 + 1), lockType: writeLT}); status != nfs4OK {
-			t.Fatalf("lock %d: status = %d", i, status)
-		}
-	}
-	if _, _, status := lm.lock(owner, "/f", lockRange{start: 100000, end: 100001, lockType: writeLT}); status != nfs4ErrResource {
-		t.Fatalf("lock beyond per-file cap: status = %d, want RESOURCE", status)
-	}
-	// Another file is unaffected.
-	if _, _, status := lm.lock(owner, "/g", lockRange{start: 0, end: 1, lockType: writeLT}); status != nfs4OK {
-		t.Fatalf("lock on other file: status = %d, want OK", status)
+	if len(locker.releasedOwners) != 1 || locker.releasedOwners[0] != owner.lockerOwner() {
+		t.Fatalf("locker released owners = %+v, want %+v", locker.releasedOwners, owner.lockerOwner())
 	}
 }
 
-func TestLeaseExpiryDropsAbandonedLocks(t *testing.T) {
-	lm := newNFS4LockManager()
+func TestLeaseExpiryReleasesClientLocks(t *testing.T) {
+	locker := &fakeLocker{}
+	lm := newNFS4LockManager(locker)
 	current := time.Unix(1000, 0)
 	lm.now = func() time.Time { return current }
 
 	dead := lockOwnerID{clientID: 1, owner: "dead"}
-	if _, _, status := lm.lock(dead, "/f", lockRange{start: 0, end: 100, lockType: writeLT}); status != nfs4OK {
+	deadState, _, status := lm.lock(dead, "/f", mustRange(t, 0, 100, writeLT))
+	if status != nfs4OK {
 		t.Fatal("setup lock failed")
 	}
 
 	// A live client's activity after the grace window expires the dead one.
 	current = current.Add(lockLeaseGracePeriods*nfs4LeaseTimeSecs*time.Second + time.Second)
 	live := lockOwnerID{clientID: 2, owner: "live"}
-	if _, _, status := lm.lock(live, "/f", lockRange{start: 0, end: 100, lockType: writeLT}); status != nfs4OK {
+	if _, _, status := lm.lock(live, "/f", mustRange(t, 0, 100, writeLT)); status != nfs4OK {
 		t.Fatalf("live lock after dead lease expiry: status = %d, want OK", status)
 	}
 	if _, seen := lm.clientSeen[dead.clientID]; seen {
 		t.Fatal("dead client lease record should be gone")
 	}
+	if len(locker.releasedClients) != 1 || locker.releasedClients[0] != "nfs4/1" {
+		t.Fatalf("locker released clients = %v, want [nfs4/1]", locker.releasedClients)
+	}
+	if _, ok := lm.states[deadState.other]; ok {
+		t.Fatal("dead client's lock state should be dropped")
+	}
 }
 
 func TestRenewKeepsLeaseAlive(t *testing.T) {
-	lm := newNFS4LockManager()
+	locker := &fakeLocker{}
+	lm := newNFS4LockManager(locker)
 	current := time.Unix(1000, 0)
 	lm.now = func() time.Time { return current }
 
 	holder := lockOwnerID{clientID: 1, owner: "holder"}
-	if _, _, status := lm.lock(holder, "/f", lockRange{start: 0, end: 100, lockType: writeLT}); status != nfs4OK {
+	if _, _, status := lm.lock(holder, "/f", mustRange(t, 0, 100, writeLT)); status != nfs4OK {
 		t.Fatal("setup lock failed")
 	}
 
-	// Renew inside the window repeatedly; the lock must survive well past
-	// the original grace deadline.
+	// Renew inside the window repeatedly; nothing may expire even though a
+	// second client stays active well past the original grace deadline.
+	other := lockOwnerID{clientID: 2, owner: "other"}
 	for i := 0; i < 10; i++ {
 		current = current.Add(nfs4LeaseTimeSecs * time.Second)
 		lm.renewClient(holder.clientID)
+		lm.test(other, "/f", mustRange(t, 0, 100, writeLT))
 	}
-	other := lockOwnerID{clientID: 2, owner: "other"}
-	if _, status := lm.test(other, "/f", lockRange{start: 0, end: 100, lockType: writeLT}); status != nfs4ErrDenied {
-		t.Fatalf("test after renewals: status = %d, want DENIED (lock still held)", status)
+	if len(locker.releasedClients) != 0 {
+		t.Fatalf("renewed client was expired: released %v", locker.releasedClients)
 	}
 }
 
-func TestCoalesceMergesSameTypeRanges(t *testing.T) {
-	lm := newNFS4LockManager()
-	owner := lockOwnerID{clientID: 1, owner: "o"}
-
-	// Adjacent same-type locks merge into one range.
-	lm.lock(owner, "/f", lockRange{start: 0, end: 10, lockType: writeLT})
-	lm.lock(owner, "/f", lockRange{start: 10, end: 20, lockType: writeLT})
-	st, _, _ := lm.lock(owner, "/f", lockRange{start: 20, end: 30, lockType: writeLT})
-	if len(st.ranges) != 1 || st.ranges[0].start != 0 || st.ranges[0].end != 30 {
-		t.Fatalf("ranges = %+v, want single [0,30)", st.ranges)
+func TestDeniedOwnerMapping(t *testing.T) {
+	if got := deniedOwner(lockOwnerID{clientID: 0xdeadbeef, owner: "o"}.lockerOwner()); got != (lockOwnerID{clientID: 0xdeadbeef, owner: "o"}) {
+		t.Fatalf("NFSv4 owner round trip = %+v", got)
+	}
+	if got := deniedOwner(LockOwner{Client: "nfs4/not-hex", Owner: "o"}); got != (lockOwnerID{owner: "nfs4/not-hex/o"}) {
+		t.Fatalf("malformed NFSv4 client = %+v, want descriptive owner", got)
 	}
 }
 
