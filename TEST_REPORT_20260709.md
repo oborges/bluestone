@@ -1,5 +1,9 @@
 # COS NFS Gateway Test Report - 2026-07-09
 
+> Benchmark artifact directories referenced below (`remote-test-results-*`)
+> are no longer tracked in the repository; they remain available in git
+> history at commit `07a3352`.
+
 Remote host: `vpc-backup-cos-demo` / RHEL 9.8  
 Bucket: `backupvideofiles` on `s3.br-sao.cloud-object-storage.appdomain.cloud`  
 Service: `nfs-gateway` active via systemd  
