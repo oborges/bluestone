@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/IBM/ibm-cos-sdk-go/service/s3"
-	"github.com/oborges/cos-nfs-gateway/internal/config"
+	"github.com/oborges/bluestone/internal/config"
 )
 
 const mib = int64(1024 * 1024)

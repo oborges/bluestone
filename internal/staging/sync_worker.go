@@ -12,11 +12,11 @@ import (
 	"time"
 
 	"github.com/IBM/ibm-cos-sdk-go/service/s3"
-	"github.com/oborges/cos-nfs-gateway/internal/config"
-	"github.com/oborges/cos-nfs-gateway/internal/logging"
-	"github.com/oborges/cos-nfs-gateway/internal/metrics"
-	"github.com/oborges/cos-nfs-gateway/internal/posix"
-	"github.com/oborges/cos-nfs-gateway/pkg/types"
+	"github.com/oborges/bluestone/internal/config"
+	"github.com/oborges/bluestone/internal/logging"
+	"github.com/oborges/bluestone/internal/metrics"
+	"github.com/oborges/bluestone/internal/posix"
+	"github.com/oborges/bluestone/pkg/types"
 	"go.uber.org/zap"
 )
 

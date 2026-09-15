@@ -2,14 +2,33 @@ package config
 
 import (
 	"fmt"
+	"os"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/spf13/viper"
 )
 
+// EnvPrefix is the prefix for environment variable overrides.
+const EnvPrefix = "BLUESTONE"
+
+// LegacyEnvPrefix is the pre-rename prefix. It is still honored, with a
+// deprecation notice, so existing deployments keep their overrides.
+const LegacyEnvPrefix = "NFS_GATEWAY"
+
+// Default and pre-rename staging roots; variables so tests can redirect them.
+var (
+	defaultStagingRootDir = "/var/staging/bluestone"
+	legacyStagingRootDir  = "/var/staging/nfs-gateway"
+)
+
 // Config represents the application configuration
 type Config struct {
+	// Notices are deprecation warnings found while loading, for the caller
+	// to log once logging is initialized.
+	Notices []string `mapstructure:"-"`
+
 	Server        ServerConfig        `mapstructure:"server"`
 	COS           COSConfig           `mapstructure:"cos"`
 	Cache         CacheConfig         `mapstructure:"cache"`
@@ -27,7 +46,7 @@ type HAConfig struct {
 	HeartbeatInterval string `mapstructure:"heartbeat_interval"`
 	LeaseTimeout      string `mapstructure:"lease_timeout"`
 	// ForceTakeover steals a fresh foreign lease at startup. Break-glass
-	// only (set NFS_GATEWAY_HA_FORCE_TAKEOVER=true); never leave enabled in
+	// only (set BLUESTONE_HA_FORCE_TAKEOVER=true); never leave enabled in
 	// a config file.
 	ForceTakeover bool `mapstructure:"force_takeover"`
 }
@@ -181,6 +200,8 @@ func Load(configPath string) (*Config, error) {
 	} else {
 		v.SetConfigName("config")
 		v.SetConfigType("yaml")
+		v.AddConfigPath("/etc/bluestone/")
+		v.AddConfigPath("$HOME/.bluestone")
 		v.AddConfigPath("/etc/nfs-gateway/")
 		v.AddConfigPath("$HOME/.nfs-gateway")
 		v.AddConfigPath("./configs")
@@ -188,8 +209,9 @@ func Load(configPath string) (*Config, error) {
 	}
 
 	// Enable environment variable overrides for nested config keys, e.g.
-	// cos.api_key -> NFS_GATEWAY_COS_API_KEY.
-	v.SetEnvPrefix("NFS_GATEWAY")
+	// cos.api_key -> BLUESTONE_COS_API_KEY. The pre-rename NFS_GATEWAY_*
+	// names are still honored; the new name wins when both are set.
+	v.SetEnvPrefix(EnvPrefix)
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 	v.AutomaticEnv()
 	if err := bindEnvOverrides(v); err != nil {
@@ -208,6 +230,13 @@ func Load(configPath string) (*Config, error) {
 	var config Config
 	if err := v.Unmarshal(&config); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal config: %w", err)
+	}
+	config.Notices = legacyEnvNotices()
+	if dir, ok := legacyStagingRootFallback(v); ok {
+		config.Staging.RootDir = dir
+		config.Notices = append(config.Notices, fmt.Sprintf(
+			"staging.root_dir is not set and %s does not exist; using pre-rename staging directory %s so unsynced writes are recovered. Set staging.root_dir explicitly to silence this.",
+			defaultStagingRootDir, dir))
 	}
 
 	// Validate configuration
@@ -296,12 +325,58 @@ func bindEnvOverrides(v *viper.Viper) error {
 	}
 
 	for _, key := range keys {
-		if err := v.BindEnv(key); err != nil {
+		// Viper takes the first bound name that is set, so the new name wins.
+		if err := v.BindEnv(key, envName(EnvPrefix, key), envName(LegacyEnvPrefix, key)); err != nil {
 			return fmt.Errorf("failed to bind environment variable for %s: %w", key, err)
 		}
 	}
 
 	return nil
+}
+
+// envName maps a config key to its environment variable, e.g.
+// cos.api_key -> BLUESTONE_COS_API_KEY.
+func envName(prefix, key string) string {
+	return prefix + "_" + strings.ToUpper(strings.ReplaceAll(key, ".", "_"))
+}
+
+// legacyEnvNotices reports set pre-rename environment variables by name only;
+// values may be secrets.
+func legacyEnvNotices() []string {
+	var notices []string
+	for _, kv := range os.Environ() {
+		name, _, _ := strings.Cut(kv, "=")
+		if rest, ok := strings.CutPrefix(name, LegacyEnvPrefix+"_"); ok {
+			notices = append(notices, fmt.Sprintf(
+				"environment variable %s is deprecated; rename it to %s_%s", name, EnvPrefix, rest))
+		}
+	}
+	sort.Strings(notices)
+	return notices
+}
+
+// legacyStagingRootFallback keeps an installation that relied on the
+// pre-rename default staging root pointed at its existing staged data.
+// Moving the default silently would strand unsynced writes, tombstones, and
+// the HA holder marker.
+func legacyStagingRootFallback(v *viper.Viper) (string, bool) {
+	if v.InConfig("staging.root_dir") {
+		return "", false
+	}
+	for _, prefix := range []string{EnvPrefix, LegacyEnvPrefix} {
+		if _, set := os.LookupEnv(envName(prefix, "staging.root_dir")); set {
+			return "", false
+		}
+	}
+	if dirExists(defaultStagingRootDir) || !dirExists(legacyStagingRootDir) {
+		return "", false
+	}
+	return legacyStagingRootDir, true
+}
+
+func dirExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.IsDir()
 }
 
 // setDefaults sets default configuration values
@@ -336,7 +411,7 @@ func setDefaults(v *viper.Viper) {
 	// Data cache defaults
 	v.SetDefault("cache.data.enabled", true)
 	v.SetDefault("cache.data.size_gb", 10)
-	v.SetDefault("cache.data.path", "/var/cache/nfs-gateway")
+	v.SetDefault("cache.data.path", "/var/cache/bluestone")
 	v.SetDefault("cache.data.chunk_size_kb", 1024)
 
 	// Performance defaults
@@ -363,7 +438,7 @@ func setDefaults(v *viper.Viper) {
 
 	// Staging defaults (disabled by default for safety)
 	v.SetDefault("staging.enabled", false)
-	v.SetDefault("staging.root_dir", "/var/staging/nfs-gateway")
+	v.SetDefault("staging.root_dir", defaultStagingRootDir)
 	v.SetDefault("staging.sync_interval", "30s")
 	v.SetDefault("staging.sync_threshold_mb", 10)
 	v.SetDefault("staging.max_dirty_age", "5m")

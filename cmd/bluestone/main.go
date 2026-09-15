@@ -12,19 +12,19 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/oborges/cos-nfs-gateway/internal/cache"
-	"github.com/oborges/cos-nfs-gateway/internal/config"
-	"github.com/oborges/cos-nfs-gateway/internal/cos"
-	"github.com/oborges/cos-nfs-gateway/internal/ha"
-	"github.com/oborges/cos-nfs-gateway/internal/dashboard"
-	"github.com/oborges/cos-nfs-gateway/internal/feature"
-	"github.com/oborges/cos-nfs-gateway/internal/health"
-	"github.com/oborges/cos-nfs-gateway/internal/lock"
-	"github.com/oborges/cos-nfs-gateway/internal/logging"
-	"github.com/oborges/cos-nfs-gateway/internal/metrics"
-	"github.com/oborges/cos-nfs-gateway/internal/nfs"
-	"github.com/oborges/cos-nfs-gateway/internal/posix"
-	"github.com/oborges/cos-nfs-gateway/internal/staging"
+	"github.com/oborges/bluestone/internal/cache"
+	"github.com/oborges/bluestone/internal/config"
+	"github.com/oborges/bluestone/internal/cos"
+	"github.com/oborges/bluestone/internal/ha"
+	"github.com/oborges/bluestone/internal/dashboard"
+	"github.com/oborges/bluestone/internal/feature"
+	"github.com/oborges/bluestone/internal/health"
+	"github.com/oborges/bluestone/internal/lock"
+	"github.com/oborges/bluestone/internal/logging"
+	"github.com/oborges/bluestone/internal/metrics"
+	"github.com/oborges/bluestone/internal/nfs"
+	"github.com/oborges/bluestone/internal/posix"
+	"github.com/oborges/bluestone/internal/staging"
 	nfshelper "github.com/willscott/go-nfs/helpers"
 	"go.uber.org/zap"
 )
@@ -43,7 +43,7 @@ func main() {
 
 	// Print version and exit
 	if *version {
-		fmt.Printf("IBM Cloud COS NFS Gateway v%s\n", Version)
+		fmt.Printf("Bluestone v%s\n", Version)
 		os.Exit(0)
 	}
 
@@ -66,9 +66,12 @@ func main() {
 	}
 	defer logging.Sync()
 
-	logging.Info("Starting IBM Cloud COS NFS Gateway",
+	logging.Info("Starting Bluestone",
 		zap.String("version", Version),
 	)
+	for _, notice := range cfg.Notices {
+		logging.Warn(notice)
+	}
 
 	// Log effective configuration
 	logging.Info("Configuration loaded",
@@ -304,7 +307,7 @@ func main() {
 	}
 	defer nfsServer.Stop()
 
-	logging.Info("NFS Gateway started successfully",
+	logging.Info("Bluestone started successfully",
 		zap.Int("nfs_port", cfg.Server.NFSPort),
 		zap.String("nfs_version", cfg.Server.NFSVersion),
 		zap.Int("metrics_port", cfg.Server.MetricsPort),

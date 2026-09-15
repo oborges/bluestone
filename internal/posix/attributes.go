@@ -6,7 +6,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/oborges/cos-nfs-gateway/pkg/types"
+	"github.com/oborges/bluestone/pkg/types"
 )
 
 // AttributeKey constants for COS metadata

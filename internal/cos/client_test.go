@@ -3,7 +3,7 @@ package cos
 import (
 	"testing"
 
-	"github.com/oborges/cos-nfs-gateway/internal/config"
+	"github.com/oborges/bluestone/internal/config"
 )
 
 func TestNewClientStartsDegradedWhenCOSUnreachable(t *testing.T) {

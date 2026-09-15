@@ -12,12 +12,16 @@ import (
 	"sync"
 	"time"
 
-	"github.com/oborges/cos-nfs-gateway/internal/logging"
+	"github.com/oborges/bluestone/internal/logging"
 	"go.uber.org/zap"
 )
 
 // LeaseObjectKey is the bucket object used for active/passive fencing. It is
 // hidden from the NFS namespace by the handler's reserved-name filter.
+//
+// The key keeps its pre-rename name on purpose: every gateway version must
+// contend for the same object, or a mixed-version HA pair could both believe
+// they hold the bucket.
 const LeaseObjectKey = ".nfs-gateway.lease"
 
 // ObjectStore is the minimal object API the lease manager needs.
