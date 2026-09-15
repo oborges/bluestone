@@ -1,287 +1,327 @@
+// Package lock is the protocol-neutral byte-range lock table shared by the
+// file protocol servers, so a lock taken over one protocol conflicts with
+// locks taken over another.
+//
+// Locks are advisory and in-memory: this package never enforces them against
+// reads or writes, and they do not survive a restart. Protocol layers keep
+// their own state around locks (NFSv4 stateids and client leases, SMB
+// handles) and map their holders onto Owners.
 package lock
 
 import (
-	"fmt"
+	"errors"
+	"math"
+	"sort"
 	"sync"
-	"time"
-
-	"github.com/oborges/bluestone/internal/logging"
-	"github.com/oborges/bluestone/pkg/types"
-	"go.uber.org/zap"
 )
 
-// Manager manages file locks
-type Manager struct {
-	locks         map[string]*types.Lock
-	mu            sync.RWMutex
-	defaultTTL    time.Duration
-	cleanupTicker *time.Ticker
-	stopCleanup   chan struct{}
-	closed        bool
-	closeMu       sync.Mutex
+// EOF as a range end means "to end of file".
+const EOF = math.MaxUint64
+
+// Default caps bound lock state per file and per client, so a misbehaving or
+// leaky client cannot grow server memory without bound.
+const (
+	DefaultMaxLocksPerFile   = 512
+	DefaultMaxLocksPerClient = 8192
+)
+
+var (
+	// ErrLimit reports that granting a lock would exceed a per-file or
+	// per-client cap. Nothing is granted.
+	ErrLimit = errors.New("lock: limit exceeded")
+	// ErrInvalid reports an empty or inverted range, or an unknown mode.
+	ErrInvalid = errors.New("lock: invalid range or mode")
+)
+
+// Mode is a lock's sharing mode.
+type Mode uint8
+
+const (
+	// Shared locks coexist with other owners' shared locks (POSIX read locks).
+	Shared Mode = iota + 1
+	// Exclusive locks conflict with every other owner's lock on overlapping
+	// bytes (POSIX write locks).
+	Exclusive
+)
+
+// Owner identifies a lock holder. Requests with equal Owners come from the
+// same holder and never conflict with each other.
+type Owner struct {
+	// Client is the protocol client holding the lock, such as an NFSv4 client
+	// ID. Per-client caps and ReleaseClient apply to it.
+	Client string
+	// ID distinguishes holders within a client, such as an NFSv4 lock_owner.
+	ID string
 }
 
-// NewManager creates a new lock manager
-func NewManager(defaultTTL time.Duration) *Manager {
+// Range is the byte range [Start, End); End == EOF extends to end of file.
+type Range struct {
+	Start, End uint64
+}
+
+func (r Range) overlaps(o Range) bool {
+	return r.Start < o.End && o.Start < r.End
+}
+
+// Lock is a held range.
+type Lock struct {
+	Range
+	Mode  Mode
+	Owner Owner
+}
+
+// Options configures a Manager. Zero values select the defaults.
+type Options struct {
+	MaxLocksPerFile   int
+	MaxLocksPerClient int
+}
+
+type held struct {
+	Range
+	mode Mode
+}
+
+// Manager is the lock table. It is safe for concurrent use.
+type Manager struct {
+	mu                sync.Mutex
+	maxLocksPerFile   int
+	maxLocksPerClient int
+
+	// files maps a path to each owner's held ranges on it, sorted by start.
+	files map[string]map[Owner][]held
+	// owned indexes the paths each owner holds ranges on.
+	owned map[Owner]map[string]struct{}
+	// clientLocks counts held ranges per client for the client cap.
+	clientLocks map[string]int
+}
+
+// NewManager returns an empty lock table.
+func NewManager(opts Options) *Manager {
 	m := &Manager{
-		locks:       make(map[string]*types.Lock),
-		defaultTTL:  defaultTTL,
-		stopCleanup: make(chan struct{}),
+		maxLocksPerFile:   opts.MaxLocksPerFile,
+		maxLocksPerClient: opts.MaxLocksPerClient,
+		files:             make(map[string]map[Owner][]held),
+		owned:             make(map[Owner]map[string]struct{}),
+		clientLocks:       make(map[string]int),
 	}
-
-	// Start cleanup goroutine
-	m.cleanupTicker = time.NewTicker(defaultTTL / 2)
-	go m.cleanupExpired()
-
-	logging.Info("Lock manager initialized", zap.Duration("defaultTTL", defaultTTL))
+	if m.maxLocksPerFile <= 0 {
+		m.maxLocksPerFile = DefaultMaxLocksPerFile
+	}
+	if m.maxLocksPerClient <= 0 {
+		m.maxLocksPerClient = DefaultMaxLocksPerClient
+	}
 	return m
 }
 
-// AcquireLock attempts to acquire a lock on a path
-func (m *Manager) AcquireLock(path string, lockType types.LockType, owner string, timeout time.Duration) error {
+// Lock grants mode on r to owner. The owner's own overlapping ranges on path
+// are replaced, so a holder can upgrade, downgrade, or split its locks. If
+// another owner holds a conflicting range, Lock returns that lock and grants
+// nothing. Granting is atomic: on ErrLimit the owner's ranges are unchanged.
+func (m *Manager) Lock(owner Owner, path string, r Range, mode Mode) (*Lock, error) {
+	if err := validate(r, mode); err != nil {
+		return nil, err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	log := logging.WithOperation("AcquireLock").With(
-		zap.String("path", path),
-		zap.String("owner", owner),
-		zap.Int("lockType", int(lockType)),
-	)
-
-	// Check if lock exists
-	if existingLock, exists := m.locks[path]; exists {
-		// Check if expired
-		if time.Now().After(existingLock.ExpiresAt) {
-			// Lock expired, remove it
-			delete(m.locks, path)
-			log.Debug("Expired lock removed")
-		} else {
-			// Lock still valid
-			if existingLock.Owner == owner {
-				// Same owner, renew the lock
-				existingLock.ExpiresAt = time.Now().Add(timeout)
-				log.Debug("Lock renewed")
-				return nil
-			}
-
-			// Different owner
-			if lockType == types.LockTypeExclusive || existingLock.Type == types.LockTypeExclusive {
-				log.Debug("Lock conflict",
-					zap.String("existingOwner", existingLock.Owner),
-					zap.Int("existingType", int(existingLock.Type)),
-				)
-				return fmt.Errorf("lock held by another owner")
-			}
-
-			// Both are shared locks, allow
-			log.Debug("Shared lock granted")
-		}
+	if conflict := m.conflictLocked(owner, path, r, mode); conflict != nil {
+		return conflict, nil
 	}
-
-	// Create new lock
-	lock := &types.Lock{
-		Type:      lockType,
-		Owner:     owner,
-		ExpiresAt: time.Now().Add(timeout),
+	before := m.files[path][owner]
+	after := coalesce(append(subtract(before, r), held{Range: r, mode: mode}))
+	delta := len(after) - len(before)
+	if delta > 0 && (m.fileLockCountLocked(path)+delta > m.maxLocksPerFile ||
+		m.clientLocks[owner.Client]+delta > m.maxLocksPerClient) {
+		return nil, ErrLimit
 	}
-	m.locks[path] = lock
+	m.setLocked(owner, path, after, delta)
+	return nil, nil
+}
 
-	log.Info("Lock acquired")
+// Unlock releases r from owner's ranges on path, splitting ranges that
+// straddle it. Releasing bytes the owner does not hold is not an error.
+func (m *Manager) Unlock(owner Owner, path string, r Range) error {
+	if r.Start >= r.End {
+		return ErrInvalid
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	before := m.files[path][owner]
+	after := subtract(before, r)
+	m.setLocked(owner, path, after, len(after)-len(before))
 	return nil
 }
 
-// ReleaseLock releases a lock
-func (m *Manager) ReleaseLock(path string, owner string) error {
+// Test returns the lock another owner holds that would conflict with owner
+// locking r in mode, or nil. It grants nothing.
+func (m *Manager) Test(owner Owner, path string, r Range, mode Mode) (*Lock, error) {
+	if err := validate(r, mode); err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.conflictLocked(owner, path, r, mode), nil
+}
+
+// ReleaseOwner drops every range owner holds, on any path.
+func (m *Manager) ReleaseOwner(owner Owner) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.releaseOwnerLocked(owner)
+}
+
+// ReleaseClient drops every range held by any owner of client, as when a
+// client's lease expires or its connection is gone.
+func (m *Manager) ReleaseClient(client string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for owner := range m.owned {
+		if owner.Client == client {
+			m.releaseOwnerLocked(owner)
+		}
+	}
+}
+
+// Locks returns the locks held on path, ordered by start offset.
+func (m *Manager) Locks(path string) []Lock {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	log := logging.WithOperation("ReleaseLock").With(
-		zap.String("path", path),
-		zap.String("owner", owner),
-	)
-
-	lock, exists := m.locks[path]
-	if !exists {
-		log.Debug("Lock not found")
-		return fmt.Errorf("lock not found")
+	var out []Lock
+	for owner, ranges := range m.files[path] {
+		for _, h := range ranges {
+			out = append(out, Lock{Range: h.Range, Mode: h.mode, Owner: owner})
+		}
 	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Start != out[j].Start {
+			return out[i].Start < out[j].Start
+		}
+		return lessOwner(out[i].Owner, out[j].Owner)
+	})
+	return out
+}
 
-	if lock.Owner != owner {
-		log.Warn("Lock owner mismatch", zap.String("lockOwner", lock.Owner))
-		return fmt.Errorf("not lock owner")
+func validate(r Range, mode Mode) error {
+	if r.Start >= r.End || (mode != Shared && mode != Exclusive) {
+		return ErrInvalid
 	}
-
-	delete(m.locks, path)
-	log.Info("Lock released")
 	return nil
 }
 
-// RenewLock renews a lock's expiration time
-func (m *Manager) RenewLock(path string, owner string, timeout time.Duration) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	log := logging.WithOperation("RenewLock").With(
-		zap.String("path", path),
-		zap.String("owner", owner),
-	)
-
-	lock, exists := m.locks[path]
-	if !exists {
-		log.Debug("Lock not found")
-		return fmt.Errorf("lock not found")
-	}
-
-	if lock.Owner != owner {
-		log.Warn("Lock owner mismatch", zap.String("lockOwner", lock.Owner))
-		return fmt.Errorf("not lock owner")
-	}
-
-	lock.ExpiresAt = time.Now().Add(timeout)
-	log.Debug("Lock renewed", zap.Time("expiresAt", lock.ExpiresAt))
-	return nil
-}
-
-// CheckLock checks if a path is locked
-func (m *Manager) CheckLock(path string) (*types.Lock, bool) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	lock, exists := m.locks[path]
-	if !exists {
-		return nil, false
-	}
-
-	// Check if expired
-	if time.Now().After(lock.ExpiresAt) {
-		return nil, false
-	}
-
-	return lock, true
-}
-
-// IsLocked checks if a path is currently locked
-func (m *Manager) IsLocked(path string) bool {
-	_, locked := m.CheckLock(path)
-	return locked
-}
-
-// GetLockOwner returns the owner of a lock
-func (m *Manager) GetLockOwner(path string) (string, bool) {
-	lock, exists := m.CheckLock(path)
-	if !exists {
-		return "", false
-	}
-	return lock.Owner, true
-}
-
-// ListLocks returns all active locks
-func (m *Manager) ListLocks() map[string]*types.Lock {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	locks := make(map[string]*types.Lock)
-	now := time.Now()
-
-	for path, lock := range m.locks {
-		if now.Before(lock.ExpiresAt) {
-			locks[path] = &types.Lock{
-				Type:      lock.Type,
-				Owner:     lock.Owner,
-				ExpiresAt: lock.ExpiresAt,
+// conflictLocked returns the conflicting lock with the lowest start held by
+// another owner, so denials describe the same lock every time.
+func (m *Manager) conflictLocked(owner Owner, path string, r Range, mode Mode) *Lock {
+	var found *Lock
+	for other, ranges := range m.files[path] {
+		if other == owner {
+			continue
+		}
+		for _, h := range ranges {
+			if !h.overlaps(r) || (h.mode == Shared && mode == Shared) {
+				continue
+			}
+			if found == nil || h.Start < found.Start ||
+				(h.Start == found.Start && lessOwner(other, found.Owner)) {
+				found = &Lock{Range: h.Range, Mode: h.mode, Owner: other}
 			}
 		}
 	}
-
-	return locks
+	return found
 }
 
-// Stats returns lock statistics
-func (m *Manager) Stats() LockStats {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	stats := LockStats{
-		TotalLocks: len(m.locks),
-	}
-
-	now := time.Now()
-	for _, lock := range m.locks {
-		if now.Before(lock.ExpiresAt) {
-			stats.ActiveLocks++
-			if lock.Type == types.LockTypeShared {
-				stats.SharedLocks++
-			} else {
-				stats.ExclusiveLocks++
-			}
-		} else {
-			stats.ExpiredLocks++
-		}
-	}
-
-	return stats
-}
-
-// cleanupExpired removes expired locks periodically
-func (m *Manager) cleanupExpired() {
-	for {
-		select {
-		case <-m.cleanupTicker.C:
-			m.removeExpiredLocks()
-		case <-m.stopCleanup:
-			m.cleanupTicker.Stop()
-			return
-		}
-	}
-}
-
-// removeExpiredLocks removes all expired locks
-func (m *Manager) removeExpiredLocks() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	now := time.Now()
+func (m *Manager) fileLockCountLocked(path string) int {
 	count := 0
+	for _, ranges := range m.files[path] {
+		count += len(ranges)
+	}
+	return count
+}
 
-	for path, lock := range m.locks {
-		if now.After(lock.ExpiresAt) {
-			delete(m.locks, path)
-			count++
+// setLocked stores owner's ranges on path and keeps the indexes and client
+// count in step; delta is the change in the owner's range count.
+func (m *Manager) setLocked(owner Owner, path string, ranges []held, delta int) {
+	owners := m.files[path]
+	if len(ranges) == 0 {
+		delete(owners, owner)
+		if len(owners) == 0 {
+			delete(m.files, path)
+		}
+		if paths := m.owned[owner]; paths != nil {
+			delete(paths, path)
+			if len(paths) == 0 {
+				delete(m.owned, owner)
+			}
+		}
+	} else {
+		if owners == nil {
+			owners = make(map[Owner][]held)
+			m.files[path] = owners
+		}
+		owners[owner] = ranges
+		if m.owned[owner] == nil {
+			m.owned[owner] = make(map[string]struct{})
+		}
+		m.owned[owner][path] = struct{}{}
+	}
+
+	if n := m.clientLocks[owner.Client] + delta; n > 0 {
+		m.clientLocks[owner.Client] = n
+	} else {
+		delete(m.clientLocks, owner.Client)
+	}
+}
+
+func (m *Manager) releaseOwnerLocked(owner Owner) {
+	for path := range m.owned[owner] {
+		m.setLocked(owner, path, nil, -len(m.files[path][owner]))
+	}
+}
+
+// subtract returns ranges with sub removed, splitting ranges that straddle
+// it. It never modifies its input, which keeps a refused Lock atomic.
+func subtract(ranges []held, sub Range) []held {
+	out := make([]held, 0, len(ranges)+1)
+	for _, h := range ranges {
+		if !h.overlaps(sub) {
+			out = append(out, h)
+			continue
+		}
+		if h.Start < sub.Start {
+			out = append(out, held{Range: Range{Start: h.Start, End: sub.Start}, mode: h.mode})
+		}
+		if sub.End < h.End {
+			out = append(out, held{Range: Range{Start: sub.End, End: h.End}, mode: h.mode})
 		}
 	}
-
-	if count > 0 {
-		logging.Debug("Expired locks cleaned", zap.Int("count", count))
-	}
+	return out
 }
 
-// Close stops the lock manager
-func (m *Manager) Close() error {
-	m.closeMu.Lock()
-	defer m.closeMu.Unlock()
-	
-	if m.closed {
-		return nil // Already closed
+// coalesce sorts ranges by start and merges adjacent or overlapping ranges of
+// the same mode, bounding growth from repeated small locks.
+func coalesce(ranges []held) []held {
+	if len(ranges) < 2 {
+		return ranges
 	}
-	
-	m.closed = true
-	close(m.stopCleanup)
-	
-	if m.cleanupTicker != nil {
-		m.cleanupTicker.Stop()
+	sort.Slice(ranges, func(i, j int) bool { return ranges[i].Start < ranges[j].Start })
+	out := ranges[:1]
+	for _, h := range ranges[1:] {
+		last := &out[len(out)-1]
+		if h.mode == last.mode && h.Start <= last.End {
+			if h.End > last.End {
+				last.End = h.End
+			}
+			continue
+		}
+		out = append(out, h)
 	}
-	
-	logging.Info("Lock manager closed")
-	return nil
+	return out
 }
 
-// LockStats represents lock statistics
-type LockStats struct {
-	TotalLocks     int
-	ActiveLocks    int
-	ExpiredLocks   int
-	SharedLocks    int
-	ExclusiveLocks int
+func lessOwner(a, b Owner) bool {
+	if a.Client != b.Client {
+		return a.Client < b.Client
+	}
+	return a.ID < b.ID
 }
-
-// Made with Bob

@@ -138,9 +138,8 @@ func main() {
 	// Initialize POSIX operations handler
 	operations := posix.NewOperationsHandler(cosClient, metadataCache, dataCache, &cfg.Performance)
 
-	// Initialize lock manager
-	lockManager := lock.NewManager(5 * time.Minute)
-	defer lockManager.Close()
+	// Byte-range lock table shared by every file protocol server
+	locks := lock.NewManager(lock.Options{})
 
 	// Initialize metrics
 	metrics.Initialize()
@@ -298,6 +297,7 @@ func main() {
 	nfsServer, err := nfs.NewServer(stableHandler, nfsAddress, nfsLogger, nfsVersions, nfs.ServerOptions{
 		AllowedClients:     cfg.Server.AllowedClients,
 		ConcurrentHandlers: cfg.Server.NFSConcurrentHandlers,
+		Locker:             nfs.NewLocker(locks),
 	})
 	if err != nil {
 		logging.Fatal("Failed to create NFS server", zap.Error(err))
@@ -462,11 +462,6 @@ func main() {
 	// Shutdown NFS server
 	if err := nfsServer.Stop(); err != nil {
 		logging.Error("Error stopping NFS server", zap.Error(err))
-	}
-
-	// Close lock manager
-	if err := lockManager.Close(); err != nil {
-		logging.Error("Error closing lock manager", zap.Error(err))
 	}
 
 	// Clear caches

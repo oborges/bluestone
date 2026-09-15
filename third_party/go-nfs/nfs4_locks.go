@@ -2,7 +2,10 @@ package nfs
 
 import (
 	"encoding/binary"
+	"errors"
 	"math"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -10,12 +13,12 @@ import (
 // NFSv4.0 advisory byte-range locking (RFC 7530 sections 9 and 16.10-16.12).
 //
 // Locks are advisory only: they are never enforced against READ or WRITE,
-// matching the common cloud file-gateway model. All state is in-memory and
-// owned by this single server instance, which is sufficient because one
-// server owns one export.
+// matching the common cloud file-gateway model. Which ranges are held is
+// decided by the server's ByteRangeLocker, which an embedder can share with
+// other protocol servers. This file owns the NFSv4 protocol state around it.
 //
-// Lock state uses real bookkeeping (owners, ranges, stateids with
-// incrementing seqids) even though the rest of this v4.0 implementation is
+// Lock state uses real bookkeeping (owners, stateids with incrementing
+// seqids, client leases) even though the rest of this v4.0 implementation is
 // intentionally stateless: the Linux client round-trips lock stateids and
 // expects POSIX range semantics (same-owner overlap replaces, different-owner
 // conflicts are denied with the conflicting lock described).
@@ -31,16 +34,13 @@ const (
 	// nfs4LengthEOF as a lock length means "to end of file".
 	nfs4LengthEOF = math.MaxUint64
 
-	// Caps mirror the managed-service model (Amazon S3 Files quotas):
-	// bounded state per file and per client keeps a misbehaving or leaky
-	// client from growing server memory without bound.
-	maxLocksPerFile   = 512
-	maxLocksPerClient = 8192
-
 	// Lock state whose client has not renewed within this many lease
 	// periods is expired lazily. RFC allows reclaiming after one lease
 	// period; being generous costs little and forgives slow clients.
 	lockLeaseGracePeriods = 3
+
+	// nfs4LockClientPrefix marks locker clients that are NFSv4 client IDs.
+	nfs4LockClientPrefix = "nfs4/"
 )
 
 // lockOwnerID identifies a lock owner: the client's short-form id plus the
@@ -50,37 +50,55 @@ type lockOwnerID struct {
 	owner    string
 }
 
-// lockRange is a held byte range: [start, end) with end == nfs4LengthEOF
+// lockerOwner maps an NFSv4 lock owner onto the locker's holder identity.
+func (o lockOwnerID) lockerOwner() LockOwner {
+	return LockOwner{Client: nfs4LockClient(o.clientID), Owner: o.owner}
+}
+
+func nfs4LockClient(clientID uint64) string {
+	return nfs4LockClientPrefix + strconv.FormatUint(clientID, 16)
+}
+
+// deniedOwner renders a conflicting holder for LOCK4denied. NFSv4 holders
+// round-trip their client ID; holders from other protocols report client 0
+// and an owner naming the protocol client.
+func deniedOwner(o LockOwner) lockOwnerID {
+	if strings.HasPrefix(o.Client, nfs4LockClientPrefix) {
+		if id, err := strconv.ParseUint(strings.TrimPrefix(o.Client, nfs4LockClientPrefix), 16, 64); err == nil {
+			return lockOwnerID{clientID: id, owner: o.Owner}
+		}
+	}
+	return lockOwnerID{owner: o.Client + "/" + o.Owner}
+}
+
+// lockRange is a requested byte range: [start, end) with end == nfs4LengthEOF
 // meaning to end of file. Advisory READ/WRITE type per POSIX.
 type lockRange struct {
 	start, end uint64
 	lockType   uint32
 }
 
-func (r lockRange) overlaps(o lockRange) bool {
-	return r.start < o.end && o.start < r.end
+func (r lockRange) lockerRange() LockRange {
+	return LockRange{Start: r.start, End: r.end, Exclusive: r.lockType == writeLT}
 }
 
-// lockState is the per-(owner, file) locking state behind one lock stateid.
+// lockState is the per-(owner, file) protocol state behind one lock stateid.
 type lockState struct {
-	owner  lockOwnerID
-	path   string
-	other  [nfs4OtherSize]byte
-	seqid  uint32
-	ranges []lockRange
+	owner lockOwnerID
+	path  string
+	other [nfs4OtherSize]byte
+	seqid uint32
 }
 
 type nfs4LockManager struct {
 	mu sync.Mutex
+	// locker holds the ranges; nil disables locking.
+	locker ByteRangeLocker
 	// states indexes every lock stateid by its "other" field.
 	states map[[nfs4OtherSize]byte]*lockState
-	// byFile indexes lock states holding ranges on a path.
-	byFile map[string]map[*lockState]struct{}
 	// byOwner finds the existing state for (owner, path) on repeat LOCKs
 	// that present the open stateid again.
 	byOwner map[lockOwnerID]map[string]*lockState
-	// clientLocks counts held ranges per client for the client cap.
-	clientLocks map[uint64]int
 	// clientSeen tracks lease renewal for lazy expiry.
 	clientSeen map[uint64]time.Time
 	// counter feeds unique stateid "other" values.
@@ -89,14 +107,13 @@ type nfs4LockManager struct {
 	now func() time.Time
 }
 
-func newNFS4LockManager() *nfs4LockManager {
+func newNFS4LockManager(locker ByteRangeLocker) *nfs4LockManager {
 	return &nfs4LockManager{
-		states:      make(map[[nfs4OtherSize]byte]*lockState),
-		byFile:      make(map[string]map[*lockState]struct{}),
-		byOwner:     make(map[lockOwnerID]map[string]*lockState),
-		clientLocks: make(map[uint64]int),
-		clientSeen:  make(map[uint64]time.Time),
-		now:         time.Now,
+		locker:     locker,
+		states:     make(map[[nfs4OtherSize]byte]*lockState),
+		byOwner:    make(map[lockOwnerID]map[string]*lockState),
+		clientSeen: make(map[uint64]time.Time),
+		now:        time.Now,
 	}
 }
 
@@ -108,12 +125,16 @@ type lockDenied struct {
 	owner    lockOwnerID
 }
 
-func rangeToDenied(r lockRange, owner lockOwnerID) *lockDenied {
+func conflictToDenied(c *LockConflict) *lockDenied {
 	length := uint64(nfs4LengthEOF)
-	if r.end != nfs4LengthEOF {
-		length = r.end - r.start
+	if c.End != nfs4LengthEOF {
+		length = c.End - c.Start
 	}
-	return &lockDenied{offset: r.start, length: length, lockType: r.lockType, owner: owner}
+	lockType := readLT
+	if c.Exclusive {
+		lockType = writeLT
+	}
+	return &lockDenied{offset: c.Start, length: length, lockType: lockType, owner: deniedOwner(c.Owner)}
 }
 
 // makeRange validates RFC 7530 offset/length rules.
@@ -141,8 +162,12 @@ func makeRange(offset, length uint64, lockType uint32) (lockRange, nfs4Status) {
 	return lockRange{start: offset, end: end, lockType: normalized}, nfs4OK
 }
 
-func rangesConflict(a, b lockRange) bool {
-	return a.overlaps(b) && (a.lockType == writeLT || b.lockType == writeLT)
+// lockerStatus maps a locker error to an NFSv4 status.
+func lockerStatus(err error) nfs4Status {
+	if errors.Is(err, ErrLockLimit) {
+		return nfs4ErrResource
+	}
+	return nfs4ErrIO
 }
 
 // touchClient records lease activity and lazily expires state from clients
@@ -171,31 +196,22 @@ func (lm *nfs4LockManager) renewClient(clientID uint64) {
 
 func (lm *nfs4LockManager) expireClientLocked(clientID uint64) {
 	for other, st := range lm.states {
-		if st.owner.clientID != clientID {
-			continue
+		if st.owner.clientID == clientID {
+			lm.dropStateLocked(other, st)
 		}
-		lm.dropStateLocked(other, st)
 	}
 	delete(lm.clientSeen, clientID)
-	delete(lm.clientLocks, clientID)
+	if lm.locker != nil {
+		lm.locker.ReleaseClient(nfs4LockClient(clientID))
+	}
 }
 
 func (lm *nfs4LockManager) dropStateLocked(other [nfs4OtherSize]byte, st *lockState) {
-	lm.clientLocks[st.owner.clientID] -= len(st.ranges)
-	if lm.clientLocks[st.owner.clientID] <= 0 {
-		delete(lm.clientLocks, st.owner.clientID)
-	}
 	delete(lm.states, other)
 	if files, ok := lm.byOwner[st.owner]; ok {
 		delete(files, st.path)
 		if len(files) == 0 {
 			delete(lm.byOwner, st.owner)
-		}
-	}
-	if states, ok := lm.byFile[st.path]; ok {
-		delete(states, st)
-		if len(states) == 0 {
-			delete(lm.byFile, st.path)
 		}
 	}
 }
@@ -210,71 +226,7 @@ func (lm *nfs4LockManager) newStateLocked(owner lockOwnerID, path string) *lockS
 		lm.byOwner[owner] = make(map[string]*lockState)
 	}
 	lm.byOwner[owner][path] = st
-	if lm.byFile[path] == nil {
-		lm.byFile[path] = make(map[*lockState]struct{})
-	}
-	lm.byFile[path][st] = struct{}{}
 	return st
-}
-
-// findConflictLocked returns the first lock on path held by another owner
-// that conflicts with the requested range.
-func (lm *nfs4LockManager) findConflictLocked(path string, owner lockOwnerID, req lockRange) *lockDenied {
-	for st := range lm.byFile[path] {
-		if st.owner == owner {
-			continue
-		}
-		for _, held := range st.ranges {
-			if rangesConflict(held, req) {
-				return rangeToDenied(held, st.owner)
-			}
-		}
-	}
-	return nil
-}
-
-// subtractRange removes [sub.start, sub.end) from the owner's ranges,
-// splitting as needed (POSIX unlock/replace semantics).
-func subtractRange(ranges []lockRange, sub lockRange) []lockRange {
-	out := ranges[:0]
-	for _, held := range ranges {
-		if !held.overlaps(sub) {
-			out = append(out, held)
-			continue
-		}
-		if held.start < sub.start {
-			out = append(out, lockRange{start: held.start, end: sub.start, lockType: held.lockType})
-		}
-		if sub.end < held.end {
-			out = append(out, lockRange{start: sub.end, end: held.end, lockType: held.lockType})
-		}
-	}
-	return out
-}
-
-// coalesce merges adjacent/overlapping same-type ranges to bound growth.
-func coalesce(ranges []lockRange) []lockRange {
-	if len(ranges) < 2 {
-		return ranges
-	}
-	// Insertion sort: range lists are small (capped) and mostly sorted.
-	for i := 1; i < len(ranges); i++ {
-		for j := i; j > 0 && ranges[j].start < ranges[j-1].start; j-- {
-			ranges[j], ranges[j-1] = ranges[j-1], ranges[j]
-		}
-	}
-	out := ranges[:1]
-	for _, r := range ranges[1:] {
-		last := &out[len(out)-1]
-		if r.lockType == last.lockType && r.start <= last.end {
-			if r.end > last.end {
-				last.end = r.end
-			}
-			continue
-		}
-		out = append(out, r)
-	}
-	return out
 }
 
 // lock acquires or upgrades a range for (owner, path). On success it returns
@@ -299,40 +251,26 @@ func (lm *nfs4LockManager) lockByStateID(other [nfs4OtherSize]byte, path string,
 }
 
 func (lm *nfs4LockManager) lockLocked(owner lockOwnerID, path string, req lockRange) (*lockState, *lockDenied, nfs4Status) {
+	if lm.locker == nil {
+		return nil, nil, nfs4ErrNotSupp
+	}
 	lm.touchClient(owner.clientID)
 
-	Log.Debugf("nfs4 LOCK owner={client:%x owner:%x} path=%q range=[%d,%d) type=%d states_on_file=%d",
-		owner.clientID, owner.owner, path, req.start, req.end, req.lockType, len(lm.byFile[path]))
+	Log.Debugf("nfs4 LOCK owner={client:%x owner:%x} path=%q range=[%d,%d) type=%d",
+		owner.clientID, owner.owner, path, req.start, req.end, req.lockType)
 
-	if denied := lm.findConflictLocked(path, owner, req); denied != nil {
-		return nil, denied, nfs4ErrDenied
+	conflict, err := lm.locker.Lock(owner.lockerOwner(), path, req.lockerRange())
+	if err != nil {
+		return nil, nil, lockerStatus(err)
+	}
+	if conflict != nil {
+		return nil, conflictToDenied(conflict), nfs4ErrDenied
 	}
 
 	st := lm.byOwner[owner][path]
 	if st == nil {
 		st = lm.newStateLocked(owner, path)
 	}
-
-	before := len(st.ranges)
-	st.ranges = coalesce(append(subtractRange(st.ranges, req), req))
-	delta := len(st.ranges) - before
-
-	fileLocks := 0
-	for other := range lm.byFile[path] {
-		fileLocks += len(other.ranges)
-	}
-	if fileLocks > maxLocksPerFile || lm.clientLocks[owner.clientID]+delta > maxLocksPerClient {
-		// Roll back: remove what we added, restore is not exact (the
-		// replaced same-owner ranges are gone) but the owner asked to
-		// overwrite them anyway; dropping the new range is safe.
-		st.ranges = subtractRange(st.ranges, req)
-		if len(st.ranges) == 0 {
-			lm.dropStateLocked(st.other, st)
-		}
-		return nil, nil, nfs4ErrResource
-	}
-	lm.clientLocks[owner.clientID] += delta
-
 	st.seqid++
 	return st, nil, nfs4OK
 }
@@ -342,17 +280,17 @@ func (lm *nfs4LockManager) unlock(other [nfs4OtherSize]byte, path string, req lo
 	lm.mu.Lock()
 	defer lm.mu.Unlock()
 
+	if lm.locker == nil {
+		return nil, nfs4ErrNotSupp
+	}
 	st, ok := lm.states[other]
 	if !ok || st.path != path {
 		return nil, nfs4ErrBadStateID
 	}
 	lm.touchClient(st.owner.clientID)
 
-	before := len(st.ranges)
-	st.ranges = subtractRange(st.ranges, req)
-	lm.clientLocks[st.owner.clientID] += len(st.ranges) - before
-	if lm.clientLocks[st.owner.clientID] <= 0 {
-		delete(lm.clientLocks, st.owner.clientID)
+	if err := lm.locker.Unlock(st.owner.lockerOwner(), path, req.lockerRange()); err != nil {
+		return nil, lockerStatus(err)
 	}
 	st.seqid++
 	return st, nfs4OK
@@ -362,10 +300,18 @@ func (lm *nfs4LockManager) unlock(other [nfs4OtherSize]byte, path string, req lo
 func (lm *nfs4LockManager) test(owner lockOwnerID, path string, req lockRange) (*lockDenied, nfs4Status) {
 	lm.mu.Lock()
 	defer lm.mu.Unlock()
+
+	if lm.locker == nil {
+		return nil, nfs4ErrNotSupp
+	}
 	lm.touchClient(owner.clientID)
 
-	if denied := lm.findConflictLocked(path, owner, req); denied != nil {
-		return denied, nfs4ErrDenied
+	conflict, err := lm.locker.Test(owner.lockerOwner(), path, req.lockerRange())
+	if err != nil {
+		return nil, lockerStatus(err)
+	}
+	if conflict != nil {
+		return conflictToDenied(conflict), nfs4ErrDenied
 	}
 	return nil, nfs4OK
 }
@@ -376,9 +322,11 @@ func (lm *nfs4LockManager) releaseOwner(owner lockOwnerID) {
 	defer lm.mu.Unlock()
 	lm.touchClient(owner.clientID)
 
-	files := lm.byOwner[owner]
-	for _, st := range files {
+	for _, st := range lm.byOwner[owner] {
 		lm.dropStateLocked(st.other, st)
+	}
+	if lm.locker != nil {
+		lm.locker.ReleaseOwner(owner.lockerOwner())
 	}
 }
 
@@ -392,10 +340,11 @@ func lockStateID(seqid uint32, other [nfs4OtherSize]byte) []byte {
 
 // --- Server plumbing ---
 
-// lockManager returns the per-server lock manager, creating it on first use.
+// lockManager returns the per-server lock manager, creating it on first use
+// around the server's Locker.
 func (s *Server) lockManager() *nfs4LockManager {
 	s.lockMgrOnce.Do(func() {
-		s.lockMgr = newNFS4LockManager()
+		s.lockMgr = newNFS4LockManager(s.Locker)
 	})
 	return s.lockMgr
 }

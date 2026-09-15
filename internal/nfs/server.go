@@ -17,6 +17,7 @@ type Server struct {
 	logger             *logging.KVLogger
 	nfsVersions        []uint32
 	concurrentHandlers int
+	locker             nfs.ByteRangeLocker
 	wg                 sync.WaitGroup
 	ctx                context.Context
 	cancel             context.CancelFunc
@@ -30,6 +31,10 @@ type ServerOptions struct {
 	// ConcurrentHandlers bounds per-connection request parallelism.
 	// 0 selects the built-in default; 1 restores serial handling.
 	ConcurrentHandlers int
+	// Locker backs NFSv4 byte-range locks. Pass NewLocker with the shared
+	// lock table so locks conflict across protocols; nil disables NFSv4
+	// locking.
+	Locker nfs.ByteRangeLocker
 }
 
 // NewServer creates a new NFS server
@@ -57,6 +62,7 @@ func NewServer(handler nfs.Handler, address string, logger *logging.KVLogger, nf
 		logger:             logger,
 		nfsVersions:        nfsVersions,
 		concurrentHandlers: opts.ConcurrentHandlers,
+		locker:             opts.Locker,
 		ctx:                ctx,
 		cancel:             cancel,
 	}, nil
@@ -81,6 +87,7 @@ func (s *Server) Start() error {
 			Handler:            s.handler,
 			EnabledNFSVersions: s.nfsVersions,
 			ConcurrentHandlers: s.concurrentHandlers,
+			Locker:             s.locker,
 		}
 		if err := srv.Serve(s.listener); err != nil {
 			s.logger.Error("NFS server error", "error", err)

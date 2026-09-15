@@ -57,21 +57,6 @@ type POSIXAttributes struct {
 	Ctime time.Time
 }
 
-// LockType represents the type of file lock
-type LockType int
-
-const (
-	LockTypeShared LockType = iota
-	LockTypeExclusive
-)
-
-// Lock represents a file lock
-type Lock struct {
-	Type      LockType
-	Owner     string
-	ExpiresAt time.Time
-}
-
 // CacheEntry represents a cached item
 type CacheEntry struct {
 	Key       string
