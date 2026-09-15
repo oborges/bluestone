@@ -283,9 +283,9 @@ func (fs *Filesystem) OpenFile(filename string, flag int, perm os.FileMode) (bil
 
 	if useStagingPath && file.stagingSession != nil && flag&(os.O_WRONLY|os.O_RDWR|os.O_CREATE) != 0 {
 		// The staged bytes replace the object on sync, so they carry the
-		// object's mode and owner, even when this open truncates it.
+		// object's attributes, even when this open truncates it.
 		if existingAttrs != nil {
-			file.stagingSession.SeedAttributes(existingAttrs.Mode, uint32(existingAttrs.UID), uint32(existingAttrs.GID))
+			file.stagingSession.SeedAttributes(staging.StagedAttributesFrom(*existingAttrs))
 		}
 
 		// Automatically pre-fetch existing COS objects if modifying without truncating
@@ -318,6 +318,9 @@ func (fs *Filesystem) OpenFile(filename string, flag int, perm os.FileMode) (bil
 	if flag&os.O_CREATE != 0 && !fileExists {
 		// File will be created on first write
 		file.isNew = true
+		if useStagingPath && file.stagingSession != nil {
+			file.stagingSession.SetBirthTimeIfUnset(time.Now())
+		}
 	}
 
 	// If truncating, clear the file
@@ -380,18 +383,37 @@ type stagingFileInfo struct {
 	name    string
 	size    int64
 	modTime time.Time
-	mode    os.FileMode
-	uid     uint32
-	gid     uint32
+	attrs   staging.StagedAttributes
+}
+
+// stagedFileInfo describes a file from its staging session.
+func stagedFileInfo(name string, session *staging.WriteSession) *stagingFileInfo {
+	return &stagingFileInfo{
+		name:    name,
+		size:    session.GetSize(),
+		modTime: session.LastWrite,
+		attrs:   session.Attributes(),
+	}
 }
 
 func (s *stagingFileInfo) Name() string       { return s.name }
 func (s *stagingFileInfo) Size() int64        { return s.size }
-func (s *stagingFileInfo) Mode() os.FileMode  { return s.mode }
+func (s *stagingFileInfo) Mode() os.FileMode  { return s.attrs.Mode }
 func (s *stagingFileInfo) ModTime() time.Time { return s.modTime }
 func (s *stagingFileInfo) IsDir() bool        { return false }
 func (s *stagingFileInfo) Sys() interface{} {
 	return nil
+}
+
+// Attributes reports the staged file's attributes, with its last write as the
+// modification time and, when no creation time is recorded, the creation time.
+func (s *stagingFileInfo) Attributes() types.POSIXAttributes {
+	attrs := *s.attrs.POSIX()
+	attrs.Mtime = s.modTime
+	if attrs.Btime.IsZero() {
+		attrs.Btime = s.modTime
+	}
+	return attrs
 }
 
 // stagingDirInfo is a synthetic directory answer derived from staged state:
@@ -409,6 +431,30 @@ func (s *stagingDirInfo) Mode() os.FileMode  { return s.mode }
 func (s *stagingDirInfo) ModTime() time.Time { return s.modTime }
 func (s *stagingDirInfo) IsDir() bool        { return true }
 func (s *stagingDirInfo) Sys() interface{}   { return nil }
+
+// Attributes reports default directory attributes for a synthetic directory.
+func (s *stagingDirInfo) Attributes() types.POSIXAttributes {
+	attrs := *posix.DefaultAttributes(true)
+	attrs.Mode = s.mode
+	attrs.Mtime = s.modTime
+	attrs.Btime = s.modTime
+	return attrs
+}
+
+// FileAttributes returns the attributes the filesystem reports for an entry
+// from Stat or ReadDir: mode, owner, times, creation time, and Windows
+// attribute flags. Entries without stored attributes report defaults, with
+// their modification time as the creation time.
+func FileAttributes(info os.FileInfo) types.POSIXAttributes {
+	if attributed, ok := info.(interface{ Attributes() types.POSIXAttributes }); ok {
+		return attributed.Attributes()
+	}
+	attrs := *posix.DefaultAttributes(info.IsDir())
+	attrs.Mode = info.Mode()
+	attrs.Mtime = info.ModTime()
+	attrs.Btime = info.ModTime()
+	return attrs
+}
 
 func (fs *Filesystem) isStagingDirty(fullPath string) bool {
 	if fs.featureFlags != nil && fs.featureFlags.IsStagingEnabled() && fs.stagingManager != nil {
@@ -439,14 +485,7 @@ func (fs *Filesystem) Stat(filename string) (os.FileInfo, error) {
 		}
 		if session, exists := fs.stagingManager.GetSession(fullPath); exists && (session.Dirty || session.Size == 0 || session.Prefetched) {
 			fs.logger.Debug("Stat intercepted by dirty staging session", zap.String("path", fullPath))
-			return &stagingFileInfo{
-				name:    filepath.Base(fullPath),
-				size:    session.Size,
-				modTime: session.LastWrite,
-				mode:    session.Mode,
-				uid:     session.UID,
-				gid:     session.GID,
-			}, nil
+			return stagedFileInfo(filepath.Base(fullPath), session), nil
 		}
 	}
 
@@ -475,14 +514,7 @@ func (fs *Filesystem) statFromStaging(fullPath string) os.FileInfo {
 	}
 
 	if session, exists := fs.stagingManager.GetSession(fullPath); exists {
-		return &stagingFileInfo{
-			name:    filepath.Base(fullPath),
-			size:    session.Size,
-			modTime: session.LastWrite,
-			mode:    session.Mode,
-			uid:     session.UID,
-			gid:     session.GID,
-		}
+		return stagedFileInfo(filepath.Base(fullPath), session)
 	}
 
 	if len(fs.stagingManager.GetSessionsInDirectory(fullPath)) > 0 ||
@@ -906,14 +938,7 @@ func (fs *Filesystem) ReadDir(path string) ([]os.FileInfo, error) {
 					if fs.stagingManager.HasPendingDelete(session.Path) {
 						continue
 					}
-					result = append(result, &stagingFileInfo{
-						name:    filepath.Base(session.Path),
-						size:    session.Size,
-						modTime: session.LastWrite,
-						mode:    session.Mode,
-						uid:     session.UID,
-						gid:     session.GID,
-					})
+					result = append(result, stagedFileInfo(filepath.Base(session.Path), session))
 				}
 				duration := time.Since(start)
 				RecordReaddirCall(fullPath, len(result), duration, nil)
@@ -968,14 +993,7 @@ func (fs *Filesystem) ReadDir(path string) ([]os.FileInfo, error) {
 				}
 			}
 			if !exists && (session.Dirty || session.Size == 0 || session.Prefetched) {
-				result = append(result, &stagingFileInfo{
-					name:    sessionName,
-					size:    session.Size,
-					modTime: session.LastWrite,
-					mode:    session.Mode,
-					uid:     session.UID,
-					gid:     session.GID,
-				})
+				result = append(result, stagedFileInfo(sessionName, session))
 			}
 		}
 	}
@@ -1017,11 +1035,13 @@ func (fs *Filesystem) ReadDir(path string) ([]os.FileInfo, error) {
 // MkdirAll creates a directory and all parent directories
 func (fs *Filesystem) MkdirAll(filename string, perm os.FileMode) error {
 	fullPath := fs.Join(fs.root, filename)
+	now := time.Now()
 	attrs := &types.POSIXAttributes{
 		Mode:  perm | os.ModeDir,
 		UID:   1000,
 		GID:   1000,
-		Mtime: time.Now(),
+		Mtime: now,
+		Btime: now,
 	}
 	return fs.ops.CreateDirectory(fs.requestContext(), fullPath, attrs)
 }
@@ -1064,18 +1084,48 @@ func (fs *Filesystem) Root() string {
 
 // Chmod changes the mode of the named file
 func (fs *Filesystem) Chmod(name string, mode os.FileMode) error {
+	return fs.SetAttributes(name, posix.AttributeUpdate{Mode: &mode})
+}
+
+// SetAttributes applies an attribute change to the named file or directory. A
+// staged file records the change for its next sync (access and modification
+// times are not staged); anything else gets a metadata-only update in COS
+// that does not rewrite the object's bytes.
+func (fs *Filesystem) SetAttributes(name string, update posix.AttributeUpdate) error {
 	fullPath := fs.Join(fs.root, name)
 
 	if fs.featureFlags != nil && fs.featureFlags.IsStagingEnabled() && fs.stagingManager != nil {
 		if session, exists := fs.stagingManager.GetSession(fullPath); exists {
-			// Staged files carry their mode to COS on the next sync.
-			session.SetMode(mode)
+			applyStagedUpdate(session, update)
 			return nil
 		}
 	}
 
-	// A metadata-only update: the object's bytes are not rewritten.
-	return fs.ops.UpdateAttributes(fs.requestContext(), fullPath, posix.AttributeUpdate{Mode: &mode})
+	return fs.ops.UpdateAttributes(fs.requestContext(), fullPath, update)
+}
+
+// applyStagedUpdate records an attribute change on a staged file.
+func applyStagedUpdate(session *staging.WriteSession, update posix.AttributeUpdate) {
+	if update.Mode != nil {
+		session.SetMode(*update.Mode)
+	}
+	if update.UID != nil || update.GID != nil {
+		current := session.Attributes()
+		uid, gid := current.UID, current.GID
+		if update.UID != nil {
+			uid = uint32(*update.UID)
+		}
+		if update.GID != nil {
+			gid = uint32(*update.GID)
+		}
+		session.SetOwner(uid, gid)
+	}
+	if update.Btime != nil {
+		session.SetBirthTime(*update.Btime)
+	}
+	if update.WindowsAttributes != nil {
+		session.SetWindowsAttributes(*update.WindowsAttributes & posix.WindowsAttributesStored)
+	}
 }
 
 // Lchown changes the uid and gid of the named file (link itself)
@@ -1086,18 +1136,7 @@ func (fs *Filesystem) Lchown(name string, uid, gid int) error {
 
 // Chown changes the uid and gid of the named file
 func (fs *Filesystem) Chown(name string, uid, gid int) error {
-	fullPath := fs.Join(fs.root, name)
-
-	if fs.featureFlags != nil && fs.featureFlags.IsStagingEnabled() && fs.stagingManager != nil {
-		if session, exists := fs.stagingManager.GetSession(fullPath); exists {
-			// Staged files carry their owner to COS on the next sync.
-			session.SetOwner(uint32(uid), uint32(gid))
-			return nil
-		}
-	}
-
-	// A metadata-only update: the object's bytes are not rewritten.
-	return fs.ops.UpdateAttributes(fs.requestContext(), fullPath, posix.AttributeUpdate{UID: &uid, GID: &gid})
+	return fs.SetAttributes(name, posix.AttributeUpdate{UID: &uid, GID: &gid})
 }
 
 // Chtimes changes the access and modification times

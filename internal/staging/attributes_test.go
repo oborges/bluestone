@@ -3,6 +3,7 @@ package staging
 import (
 	"os"
 	"testing"
+	"time"
 )
 
 func readSidecarAttributes(t *testing.T, manager *StagingManager, path string) *StagedAttributes {
@@ -32,8 +33,8 @@ func TestSessionAttributesPersistThroughDirtyRenameAndRecovery(t *testing.T) {
 		t.Fatalf("Sync() error = %v", err)
 	}
 
-	session.SeedAttributes(0755, 42, 7)
-	session.SeedAttributes(0600, 1, 1) // later seeds must not override
+	session.SeedAttributes(StagedAttributes{Mode: 0755, UID: 42, GID: 7})
+	session.SeedAttributes(StagedAttributes{Mode: 0600, UID: 1, GID: 1}) // later seeds must not override
 	manager.MarkDirty("/a.txt", 4)
 	if got := readSidecarAttributes(t, manager, "/a.txt"); got == nil || *got != (StagedAttributes{Mode: 0755, UID: 42, GID: 7}) {
 		t.Fatalf("sidecar attributes after MarkDirty = %+v, want seeded 755/42/7", got)
@@ -91,5 +92,66 @@ func TestUnseededSessionKeepsDefaultsWithoutPersisting(t *testing.T) {
 	_, _, mode, _, _, _, _, _ := session.Snapshot()
 	if mode != os.FileMode(0600) {
 		t.Fatalf("new session mode = %o, want default 600", mode)
+	}
+}
+
+func TestCreationTimeAndWindowsAttributesPersist(t *testing.T) {
+	cfg := createTestConfig(t)
+	manager, err := NewStagingManager(cfg)
+	if err != nil {
+		t.Fatalf("NewStagingManager() error = %v", err)
+	}
+
+	created := time.Date(2026, 9, 15, 10, 30, 0, 123456789, time.UTC)
+	session, err := manager.GetOrCreateSession("/new.txt")
+	if err != nil {
+		t.Fatalf("GetOrCreateSession() error = %v", err)
+	}
+	session.SetBirthTimeIfUnset(created)
+	session.SetBirthTimeIfUnset(created.Add(time.Hour)) // a second call keeps the first
+	if _, err := session.Write([]byte("x"), 0); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	manager.MarkDirty("/new.txt", 1)
+	session.SetWindowsAttributes(0x2)
+
+	got := readSidecarAttributes(t, manager, "/new.txt")
+	if got == nil || !got.Btime.Equal(created) || got.WindowsAttributes != 0x2 {
+		t.Fatalf("sidecar attributes = %+v, want btime %v and flags 0x2", got, created)
+	}
+	if err := manager.Shutdown(); err != nil {
+		t.Fatalf("Shutdown() error = %v", err)
+	}
+
+	recovered, err := NewStagingManager(cfg)
+	if err != nil {
+		t.Fatalf("NewStagingManager() after restart error = %v", err)
+	}
+	defer recovered.Shutdown()
+	restored, ok := recovered.GetSession("/new.txt")
+	if !ok {
+		t.Fatal("dirty session not recovered")
+	}
+	if attrs := restored.Attributes(); !attrs.Btime.Equal(created) || attrs.WindowsAttributes != 0x2 {
+		t.Fatalf("recovered attributes = %+v, want btime %v and flags 0x2", attrs, created)
+	}
+}
+
+func TestSetBirthTimeIfUnsetKeepsSeededAttributes(t *testing.T) {
+	manager, err := NewStagingManager(createTestConfig(t))
+	if err != nil {
+		t.Fatalf("NewStagingManager() error = %v", err)
+	}
+	defer manager.Shutdown()
+
+	seeded := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	session, err := manager.GetOrCreateSession("/existing.txt")
+	if err != nil {
+		t.Fatalf("GetOrCreateSession() error = %v", err)
+	}
+	session.SeedAttributes(StagedAttributes{Mode: 0644, UID: 42, GID: 7, Btime: seeded})
+	session.SetBirthTimeIfUnset(time.Now())
+	if got := session.Attributes().Btime; !got.Equal(seeded) {
+		t.Fatalf("btime = %v, want the seeded %v", got, seeded)
 	}
 }

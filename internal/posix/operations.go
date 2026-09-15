@@ -1264,13 +1264,18 @@ func (f *FileInfo) ModTime() time.Time { return f.modTime }
 func (f *FileInfo) IsDir() bool        { return f.isDir }
 func (f *FileInfo) Sys() interface{}   { return nil }
 
-// Attributes returns the entry's POSIX attributes: decoded from object
-// metadata, or defaults when its source (such as a listing) carried none.
+// Attributes returns the entry's attributes: decoded from object metadata, or
+// defaults when its source (such as a listing) carried none. Without a stored
+// creation time, the modification time is reported as the best estimate.
 func (f *FileInfo) Attributes() types.POSIXAttributes {
-	if f.attrs == nil {
-		return *DefaultAttributes(f.isDir)
+	attrs := *DefaultAttributes(f.isDir)
+	if f.attrs != nil {
+		attrs = *f.attrs
 	}
-	return *f.attrs
+	if attrs.Btime.IsZero() {
+		attrs.Btime = f.modTime
+	}
+	return attrs
 }
 
 var _ os.FileInfo = (*FileInfo)(nil)

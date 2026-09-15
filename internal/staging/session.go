@@ -27,8 +27,12 @@ type WriteSession struct {
 	UID         uint32
 	GID         uint32
 	mu          sync.Mutex
-	// attributesSet records that Mode, UID, and GID came from the staged
-	// object or a client rather than the new-session defaults.
+	// btime and windowsAttributes complete the attributes the staged file
+	// syncs with; read them through Attributes.
+	btime             time.Time
+	windowsAttributes uint32
+	// attributesSet records that the attributes came from the staged object
+	// or a client rather than the new-session defaults.
 	attributesSet bool
 }
 
@@ -73,45 +77,94 @@ func NewWriteSession(manager *StagingManager, path string, stagingPath string) (
 	}, nil
 }
 
-// SeedAttributes adopts the mode and owner of the object this session stages,
-// so the staged bytes sync with them. It applies once: attributes already
-// seeded or set by a client are kept.
-func (ws *WriteSession) SeedAttributes(mode os.FileMode, uid, gid uint32) {
+// SeedAttributes adopts the attributes of the object this session stages, so
+// the staged bytes sync with them. It applies once: attributes already seeded
+// or set by a client are kept.
+func (ws *WriteSession) SeedAttributes(attrs StagedAttributes) {
 	ws.mu.Lock()
 	if ws.attributesSet {
 		ws.mu.Unlock()
 		return
 	}
-	ws.Mode, ws.UID, ws.GID = mode, uid, gid
-	ws.attributesSet = true
+	ws.setAttributesLocked(attrs)
 	ws.mu.Unlock()
 	ws.persistAttributes()
 }
 
 // SetMode changes the mode the staged file syncs with.
 func (ws *WriteSession) SetMode(mode os.FileMode) {
+	ws.updateAttributes(func() { ws.Mode = mode })
+}
+
+// SetOwner changes the owner the staged file syncs with.
+func (ws *WriteSession) SetOwner(uid, gid uint32) {
+	ws.updateAttributes(func() { ws.UID, ws.GID = uid, gid })
+}
+
+// SetBirthTime changes the creation time the staged file syncs with.
+func (ws *WriteSession) SetBirthTime(btime time.Time) {
+	ws.updateAttributes(func() { ws.btime = btime })
+}
+
+// SetWindowsAttributes changes the Windows attribute flags the staged file
+// syncs with.
+func (ws *WriteSession) SetWindowsAttributes(flags uint32) {
+	ws.updateAttributes(func() { ws.windowsAttributes = flags })
+}
+
+// SetBirthTimeIfUnset records the creation time of a file the gateway is
+// creating. Sessions that already have attributes, seeded from an existing
+// object or set by a client, keep theirs.
+func (ws *WriteSession) SetBirthTimeIfUnset(btime time.Time) {
 	ws.mu.Lock()
-	ws.Mode = mode
+	if ws.attributesSet {
+		ws.mu.Unlock()
+		return
+	}
+	ws.btime = btime
 	ws.attributesSet = true
 	ws.mu.Unlock()
 	ws.persistAttributes()
 }
 
-// SetOwner changes the owner the staged file syncs with.
-func (ws *WriteSession) SetOwner(uid, gid uint32) {
+// Attributes returns the attributes the staged file syncs with.
+func (ws *WriteSession) Attributes() StagedAttributes {
 	ws.mu.Lock()
-	ws.UID, ws.GID = uid, gid
+	defer ws.mu.Unlock()
+	return ws.attributesLocked()
+}
+
+// updateAttributes applies change under the session lock, marks the
+// attributes as set, and persists them.
+func (ws *WriteSession) updateAttributes(change func()) {
+	ws.mu.Lock()
+	change()
 	ws.attributesSet = true
 	ws.mu.Unlock()
 	ws.persistAttributes()
+}
+
+func (ws *WriteSession) attributesLocked() StagedAttributes {
+	return StagedAttributes{
+		Mode:              ws.Mode,
+		UID:               ws.UID,
+		GID:               ws.GID,
+		Btime:             ws.btime,
+		WindowsAttributes: ws.windowsAttributes,
+	}
+}
+
+func (ws *WriteSession) setAttributesLocked(attrs StagedAttributes) {
+	ws.Mode, ws.UID, ws.GID = attrs.Mode, attrs.UID, attrs.GID
+	ws.btime, ws.windowsAttributes = attrs.Btime, attrs.WindowsAttributes
+	ws.attributesSet = true
 }
 
 // restoreAttributes applies attributes recovered from the sidecar.
 func (ws *WriteSession) restoreAttributes(attrs StagedAttributes) {
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
-	ws.Mode, ws.UID, ws.GID = attrs.Mode, attrs.UID, attrs.GID
-	ws.attributesSet = true
+	ws.setAttributesLocked(attrs)
 }
 
 // stagedAttributes returns the session's attributes, its staging path, and
@@ -119,7 +172,7 @@ func (ws *WriteSession) restoreAttributes(attrs StagedAttributes) {
 func (ws *WriteSession) stagedAttributes() (StagedAttributes, string, bool) {
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
-	return StagedAttributes{Mode: ws.Mode, UID: ws.UID, GID: ws.GID}, ws.StagingPath, ws.attributesSet
+	return ws.attributesLocked(), ws.StagingPath, ws.attributesSet
 }
 
 func (ws *WriteSession) persistAttributes() {

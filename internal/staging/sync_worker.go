@@ -16,7 +16,6 @@ import (
 	"github.com/oborges/bluestone/internal/logging"
 	"github.com/oborges/bluestone/internal/metrics"
 	"github.com/oborges/bluestone/internal/posix"
-	"github.com/oborges/bluestone/pkg/types"
 	"go.uber.org/zap"
 )
 
@@ -402,7 +401,7 @@ func (sw *SyncWorker) syncFileLocked(path string, workerID int) error {
 	if err := session.Sync(); err != nil {
 		return fmt.Errorf("failed to sync session: %w", err)
 	}
-	stagingPath, size, mode, uid, gid, _, lastWrite, multipartPartSize := session.Snapshot()
+	stagingPath, size, _, _, _, _, lastWrite, multipartPartSize := session.Snapshot()
 	if multipartPartSize <= 0 {
 		multipartPartSize = 20 * 1024 * 1024
 	}
@@ -415,12 +414,9 @@ func (sw *SyncWorker) syncFileLocked(path string, workerID int) error {
 	defer file.Close()
 
 	if size >= multipartPartSize {
-		posixAttrs := &types.POSIXAttributes{
-			Mode: mode,
-			UID:  int(uid),
-			GID:  int(gid),
-		}
-		cosMetadata := posix.EncodePOSIXAttributes(posixAttrs)
+		// Upload with every attribute the staged file carries, not just mode
+		// and owner: the upload replaces the object's metadata.
+		cosMetadata := posix.EncodePOSIXAttributes(session.Attributes().POSIX())
 		if session.Multipart != nil {
 			session.Multipart.Reset()
 		}
@@ -452,12 +448,9 @@ func (sw *SyncWorker) syncFileLocked(path string, workerID int) error {
 			monolithicReader = mmapReader
 		}
 
-		posixAttrs := &types.POSIXAttributes{
-			Mode: mode,
-			UID:  int(uid),
-			GID:  int(gid),
-		}
-		cosMetadata := posix.EncodePOSIXAttributes(posixAttrs)
+		// Upload with every attribute the staged file carries, not just mode
+		// and owner: the upload replaces the object's metadata.
+		cosMetadata := posix.EncodePOSIXAttributes(session.Attributes().POSIX())
 
 		// Upload to COS with retry (monolithic loop)
 		if err := sw.uploadWithRetryStream(path, monolithicReader, cosMetadata); err != nil {

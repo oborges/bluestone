@@ -55,6 +55,11 @@ type POSIXAttributes struct {
 	Atime time.Time
 	Mtime time.Time
 	Ctime time.Time
+	// Btime is the file creation (birth) time; zero when none is stored.
+	Btime time.Time
+	// WindowsAttributes holds Windows file attribute flags (read-only,
+	// hidden, system, archive) for protocols that expose them.
+	WindowsAttributes uint32
 }
 
 // CacheEntry represents a cached item

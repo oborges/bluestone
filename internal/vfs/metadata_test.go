@@ -130,3 +130,108 @@ func TestStagedAttributesSurviveRestart(t *testing.T) {
 	defer recovered.Shutdown()
 	assertSessionAttributes(t, recovered, "/file.txt", 0640, 9, 8)
 }
+
+func TestNewFileRecordsCreationTimeThroughRestart(t *testing.T) {
+	cfg := testStagingConfig(t)
+	manager, err := staging.NewStagingManager(cfg)
+	if err != nil {
+		t.Fatalf("NewStagingManager() error = %v", err)
+	}
+	fs := newDirtyStagingTestFilesystemWithStore(t, manager, newFakeObjectStore())
+
+	before := time.Now()
+	writeTestFile(t, fs, "new.txt", "x")
+	after := time.Now()
+
+	info, err := fs.Stat("new.txt")
+	if err != nil {
+		t.Fatalf("Stat() error = %v", err)
+	}
+	btime := FileAttributes(info).Btime
+	if btime.Before(before) || btime.After(after) {
+		t.Fatalf("creation time %v not within the create call [%v, %v]", btime, before, after)
+	}
+	if err := manager.Shutdown(); err != nil {
+		t.Fatalf("Shutdown() error = %v", err)
+	}
+
+	recovered, err := staging.NewStagingManager(cfg)
+	if err != nil {
+		t.Fatalf("NewStagingManager() after restart error = %v", err)
+	}
+	defer recovered.Shutdown()
+	session, ok := recovered.GetSession("/new.txt")
+	if !ok {
+		t.Fatal("dirty session not recovered")
+	}
+	if got := session.Attributes().Btime; !got.Equal(btime) {
+		t.Fatalf("recovered creation time = %v, want %v", got, btime)
+	}
+}
+
+func TestEditingExistingObjectKeepsCreationTimeAndWindowsAttributes(t *testing.T) {
+	manager := newTestStagingManager(t)
+	store := newFakeObjectStore()
+	btime := time.Date(2024, 5, 6, 7, 8, 9, 0, time.UTC)
+	store.putWithMetadata("file.txt", []byte("original"), posix.EncodePOSIXAttributes(&types.POSIXAttributes{
+		Mode: 0644, UID: 42, GID: 7, Btime: btime, WindowsAttributes: posix.WindowsAttributeHidden,
+	}))
+	fs := newDirtyStagingTestFilesystemWithStore(t, manager, store)
+
+	f, err := fs.OpenFile("file.txt", os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("OpenFile() error = %v", err)
+	}
+	if _, err := f.Write([]byte("edited")); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	info, err := fs.Stat("file.txt")
+	if err != nil {
+		t.Fatalf("Stat() error = %v", err)
+	}
+	attrs := FileAttributes(info)
+	if !attrs.Btime.Equal(btime) || attrs.WindowsAttributes != posix.WindowsAttributeHidden || attrs.UID != 42 {
+		t.Fatalf("staged file attributes = %+v, want btime %v, hidden, uid 42", attrs, btime)
+	}
+}
+
+func TestSetAttributesOnSyncedAndStagedFiles(t *testing.T) {
+	manager := newTestStagingManager(t)
+	store := newFakeObjectStore()
+	store.putWithMetadata("synced.txt", []byte("content"), existingObjectMetadata(0644, 42, 7))
+	fs := newDirtyStagingTestFilesystemWithStore(t, manager, store)
+	writesBefore := store.putCount()
+
+	btime := time.Date(2023, 1, 2, 3, 4, 5, 0, time.UTC)
+	const directoryFlag = 0x10
+	flags := posix.WindowsAttributeReadOnly | directoryFlag
+	if err := fs.SetAttributes("synced.txt", posix.AttributeUpdate{Btime: &btime, WindowsAttributes: &flags}); err != nil {
+		t.Fatalf("SetAttributes(synced) error = %v", err)
+	}
+	stored := posix.DecodePOSIXAttributes(store.metadataOf("synced.txt"), false)
+	if !stored.Btime.Equal(btime) || stored.WindowsAttributes != posix.WindowsAttributeReadOnly || stored.UID != 42 {
+		t.Fatalf("synced attributes = %+v, want btime %v, read-only only, uid 42", stored, btime)
+	}
+	if store.putCount() != writesBefore {
+		t.Fatal("SetAttributes rewrote a synced object")
+	}
+
+	writeTestFile(t, fs, "staged.txt", "x")
+	hiddenSystem := posix.WindowsAttributeHidden | posix.WindowsAttributeSystem
+	uid := 77
+	if err := fs.SetAttributes("staged.txt", posix.AttributeUpdate{Btime: &btime, WindowsAttributes: &hiddenSystem, UID: &uid}); err != nil {
+		t.Fatalf("SetAttributes(staged) error = %v", err)
+	}
+	info, err := fs.Stat("staged.txt")
+	if err != nil {
+		t.Fatalf("Stat(staged) error = %v", err)
+	}
+	attrs := FileAttributes(info)
+	if !attrs.Btime.Equal(btime) || attrs.WindowsAttributes != hiddenSystem || attrs.UID != 77 || attrs.GID != 1000 {
+		t.Fatalf("staged attributes = %+v, want btime %v, hidden|system, uid 77, gid unchanged 1000", attrs, btime)
+	}
+}
