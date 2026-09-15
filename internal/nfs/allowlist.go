@@ -4,6 +4,7 @@ import (
 	"net"
 
 	"github.com/oborges/bluestone/internal/config"
+	"github.com/oborges/bluestone/internal/logging"
 )
 
 // ClientFilter decides whether a client address may connect to the NFS
@@ -50,12 +51,12 @@ func (f *ClientFilter) Allowed(addr net.Addr) bool {
 type filteredListener struct {
 	net.Listener
 	filter *ClientFilter
-	logger *Logger
+	logger *logging.KVLogger
 }
 
 // newFilteredListener wraps a listener with a client allowlist. A nil filter
 // returns the listener unchanged.
-func newFilteredListener(inner net.Listener, filter *ClientFilter, logger *Logger) net.Listener {
+func newFilteredListener(inner net.Listener, filter *ClientFilter, logger *logging.KVLogger) net.Listener {
 	if filter == nil {
 		return inner
 	}

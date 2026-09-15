@@ -1,16 +1,12 @@
-package nfs
+package vfs
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -19,219 +15,18 @@ import (
 	"github.com/oborges/bluestone/internal/config"
 	"github.com/oborges/bluestone/internal/feature"
 	"github.com/oborges/bluestone/internal/ha"
+	"github.com/oborges/bluestone/internal/logging"
 	"github.com/oborges/bluestone/internal/metrics"
 	"github.com/oborges/bluestone/internal/posix"
 	"github.com/oborges/bluestone/internal/staging"
 	"github.com/oborges/bluestone/pkg/types"
-	nfs "github.com/willscott/go-nfs"
 	"go.uber.org/zap"
 )
 
-// Logger wraps zap.Logger for NFS operations
-type Logger struct {
-	zap *zap.Logger
-}
-
-// NewLogger creates a new logger wrapper
-func NewLogger(zapLogger *zap.Logger) *Logger {
-	return &Logger{zap: zapLogger}
-}
-
-// Info logs an info message
-func (l *Logger) Info(msg string, keysAndValues ...interface{}) {
-	fields := make([]zap.Field, 0, len(keysAndValues)/2)
-	for i := 0; i < len(keysAndValues); i += 2 {
-		if i+1 < len(keysAndValues) {
-			key := fmt.Sprint(keysAndValues[i])
-			value := keysAndValues[i+1]
-			fields = append(fields, zap.Any(key, value))
-		}
-	}
-	l.zap.Info(msg, fields...)
-}
-
-// Error logs an error message
-func (l *Logger) Error(msg string, keysAndValues ...interface{}) {
-	fields := make([]zap.Field, 0, len(keysAndValues)/2)
-	for i := 0; i < len(keysAndValues); i += 2 {
-		if i+1 < len(keysAndValues) {
-			key := fmt.Sprint(keysAndValues[i])
-			value := keysAndValues[i+1]
-			fields = append(fields, zap.Any(key, value))
-		}
-	}
-	l.zap.Error(msg, fields...)
-}
-
-// Debug logs a debug message
-func (l *Logger) Debug(msg string, keysAndValues ...interface{}) {
-	fields := make([]zap.Field, 0, len(keysAndValues)/2)
-	for i := 0; i < len(keysAndValues); i += 2 {
-		if i+1 < len(keysAndValues) {
-			key := fmt.Sprint(keysAndValues[i])
-			value := keysAndValues[i+1]
-			fields = append(fields, zap.Any(key, value))
-		}
-	}
-	l.zap.Debug(msg, fields...)
-}
-
-// COSHandler implements nfs.Handler interface for IBM Cloud COS
-type COSHandler struct {
-	ops        *posix.OperationsHandler
-	logger     *Logger
-	handleMap  map[string]*handleEntry
-	handleLock sync.RWMutex
-	maxHandles int
-}
-
-type handleEntry struct {
-	path []string
-	hash string
-}
-
-// NewCOSHandler creates a new NFS handler for COS
-func NewCOSHandler(ops *posix.OperationsHandler, logger *Logger) *COSHandler {
-	return &COSHandler{
-		ops:        ops,
-		logger:     logger,
-		handleMap:  make(map[string]*handleEntry),
-		maxHandles: 10000,
-	}
-}
-
-// Mount handles NFS mount requests
-func (h *COSHandler) Mount(ctx context.Context, conn net.Conn, req nfs.MountRequest) (nfs.MountStatus, billy.Filesystem, []nfs.AuthFlavor) {
-	h.logger.Info("NFS mount request",
-		"path", string(req.Dirpath),
-		"remote", conn.RemoteAddr().String())
-
-	// Create a billy filesystem wrapper
-	fs := &COSFilesystem{
-		ops:    h.ops,
-		logger: h.logger,
-		root:   string(req.Dirpath),
-	}
-
-	// Return success with null auth
-	return nfs.MountStatusOk, fs, []nfs.AuthFlavor{nfs.AuthFlavorNull}
-}
-
-// Change returns a billy.Change interface for write operations
-func (h *COSHandler) Change(fs billy.Filesystem) billy.Change {
-	if c, ok := fs.(billy.Change); ok {
-		return c
-	}
-	return nil
-}
-
-// FSStat fills in filesystem statistics
-func (h *COSHandler) FSStat(ctx context.Context, fs billy.Filesystem, stat *nfs.FSStat) error {
-	// Set reasonable defaults for COS
-	stat.TotalSize = 1 << 50      // 1 PB
-	stat.FreeSize = 1 << 50       // 1 PB
-	stat.AvailableSize = 1 << 50  // 1 PB
-	stat.TotalFiles = 1 << 32     // 4 billion
-	stat.FreeFiles = 1 << 32      // 4 billion
-	stat.AvailableFiles = 1 << 32 // 4 billion
-	stat.CacheHint = 0
-
-	return nil
-}
-
-// ToHandle converts a filesystem path to an opaque file handle
-// Uses SHA256 hash for deterministic, fixed-size handles (32 bytes)
-func (h *COSHandler) ToHandle(fs billy.Filesystem, path []string) []byte {
-	pathStr := strings.Join(path, "/")
-
-	// Create deterministic hash (32 bytes, well within NFS 64-byte limit)
-	hash := sha256.Sum256([]byte(pathStr))
-	hashStr := hex.EncodeToString(hash[:])
-
-	// Store mapping in memory
-	h.handleLock.Lock()
-	h.handleMap[hashStr] = &handleEntry{
-		path: path,
-		hash: hashStr,
-	}
-	h.handleLock.Unlock()
-
-	// Return raw hash bytes (not hex string)
-	return hash[:]
-}
-
-// FromHandle converts an opaque file handle back to a filesystem and path
-func (h *COSHandler) FromHandle(fh []byte) (billy.Filesystem, []string, error) {
-	if len(fh) == 0 {
-		return nil, []string{}, nil // Root directory
-	}
-
-	// Convert handle bytes to hex string for lookup
-	hashStr := hex.EncodeToString(fh)
-
-	// Look up path in memory
-	h.handleLock.RLock()
-	entry, ok := h.handleMap[hashStr]
-	h.handleLock.RUnlock()
-
-	if !ok {
-		return nil, nil, fmt.Errorf("invalid file handle: %s", hashStr[:16])
-	}
-
-	// Return filesystem instance with decoded path
-	fs := &COSFilesystem{
-		ops:    h.ops,
-		logger: h.logger,
-		root:   "/",
-	}
-
-	return fs, entry.path, nil
-}
-
-// InvalidateHandle removes a file handle from the cache
-func (h *COSHandler) InvalidateHandle(fs billy.Filesystem, fh []byte) error {
-	h.handleLock.Lock()
-	defer h.handleLock.Unlock()
-
-	hashStr := hex.EncodeToString(fh)
-	delete(h.handleMap, hashStr)
-	return nil
-}
-
-// HandleLimit returns the maximum number of handles that can be cached
-func (h *COSHandler) HandleLimit() int {
-	return h.maxHandles
-}
-
-// EnableTracing enables READDIR tracing
-func (h *COSHandler) EnableTracing() {
-	EnableTracing()
-}
-
-// DisableTracing disables READDIR tracing
-func (h *COSHandler) DisableTracing() {
-	DisableTracing()
-}
-
-// GetTrace returns the trace for a specific path
-func (h *COSHandler) GetTrace(path string) *PathTrace {
-	return GetTrace(path)
-}
-
-// GetAllTraces returns all traces
-func (h *COSHandler) GetAllTraces() map[string]*PathTrace {
-	return GetAllTraces()
-}
-
-// ClearTraces clears all traces
-func (h *COSHandler) ClearTraces() {
-	ClearTraces()
-}
-
-// COSFilesystem implements billy.Filesystem interface for COS
-type COSFilesystem struct {
+// Filesystem implements billy.Filesystem interface for COS
+type Filesystem struct {
 	ops            *posix.OperationsHandler
-	logger         *Logger
+	logger         *logging.KVLogger
 	root           string
 	perfConfig     *config.PerformanceConfig
 	sessionManager *buffer.SessionManager
@@ -241,26 +36,8 @@ type COSFilesystem struct {
 	featureFlags   *feature.FeatureFlags
 }
 
-// NewCOSFilesystem creates a new COS filesystem (deprecated, use NewCOSFilesystemWithConfig)
-func NewCOSFilesystem(ops *posix.OperationsHandler, logger *Logger, root string) *COSFilesystem {
-	// Use default config if not provided
-	defaultConfig := &config.PerformanceConfig{
-		WriteBufferKB:        4096,
-		MultipartThresholdMB: 100,
-		MultipartChunkMB:     10,
-		ReadAheadKB:          config.DefaultReadAheadKB,
-		MaxBufferedWriteMB:   config.DefaultMaxBufferedWriteMB,
-	}
-	return &COSFilesystem{
-		ops:        ops,
-		logger:     logger,
-		root:       root,
-		perfConfig: defaultConfig,
-	}
-}
-
-// NewCOSFilesystemWithConfig creates a new COS filesystem with configuration
-func NewCOSFilesystemWithConfig(ops *posix.OperationsHandler, logger *Logger, root string, perfConfig *config.PerformanceConfig, stagingManager *staging.StagingManager, syncWorker *staging.SyncWorker, featureFlags *feature.FeatureFlags) *COSFilesystem {
+// NewFilesystem creates a new COS filesystem with configuration
+func NewFilesystem(ops *posix.OperationsHandler, logger *logging.KVLogger, root string, perfConfig *config.PerformanceConfig, stagingManager *staging.StagingManager, syncWorker *staging.SyncWorker, featureFlags *feature.FeatureFlags) *Filesystem {
 	if perfConfig == nil {
 		perfConfig = &config.PerformanceConfig{
 			WriteBufferKB:        4096,
@@ -289,7 +66,7 @@ func NewCOSFilesystemWithConfig(ops *posix.OperationsHandler, logger *Logger, ro
 	// Create session manager for path-scoped write buffering (legacy path)
 	sessionManager := buffer.NewSessionManager(bufferSize, sessionTimeout)
 
-	return &COSFilesystem{
+	return &Filesystem{
 		ops:            ops,
 		logger:         logger,
 		root:           root,
@@ -302,62 +79,60 @@ func NewCOSFilesystemWithConfig(ops *posix.OperationsHandler, logger *Logger, ro
 }
 
 // Create creates a new file
-func (fs *COSFilesystem) Create(filename string) (billy.File, error) {
+func (fs *Filesystem) Create(filename string) (billy.File, error) {
 	return fs.OpenFile(filename, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0666)
 }
 
-// FSStat reports staging-aware capacity so NFS clients see pressure before writeback fails.
-func (fs *COSFilesystem) FSStat(ctx context.Context, stat *nfs.FSStat) error {
-	if fs.featureFlags != nil && fs.featureFlags.IsStagingEnabled() && fs.stagingManager != nil {
-		pressure := fs.stagingManager.CurrentPressure()
-		totalBytes := pressure.QuotaBytes
-		availableBytes := pressure.AvailableBytes
-		if pressure.HighWatermarkBytes > 0 {
-			safeAvailable := pressure.HighWatermarkBytes - pressure.UsedBytes
-			if safeAvailable < 0 {
-				safeAvailable = 0
-			}
-			if safeAvailable < availableBytes {
-				availableBytes = safeAvailable
-			}
-		}
-		total := uint64(totalBytes)
-		available := uint64(0)
-		if availableBytes > 0 {
-			available = uint64(availableBytes)
-		}
-		if totalBytes == 0 {
-			total = 1 << 50
-			available = total
-		}
+// Capacity is the space the filesystem advertises to clients.
+type Capacity struct {
+	TotalBytes     uint64
+	AvailableBytes uint64
+	TotalFiles     uint64
+	AvailableFiles uint64
+}
 
-		stat.TotalSize = total
-		stat.FreeSize = available
-		stat.AvailableSize = available
-		stat.TotalFiles = 1 << 32
-		stat.FreeFiles = 1 << 32
-		stat.AvailableFiles = 1 << 32
-		stat.CacheHint = time.Second
-		return nil
+// Capacity reports staging-aware capacity so clients see pressure before
+// write-back fails: available space stops at the staging high watermark.
+func (fs *Filesystem) Capacity() Capacity {
+	capacity := Capacity{
+		TotalBytes:     1 << 50,
+		AvailableBytes: 1 << 50,
+		TotalFiles:     1 << 32,
+		AvailableFiles: 1 << 32,
+	}
+	if fs.featureFlags == nil || !fs.featureFlags.IsStagingEnabled() || fs.stagingManager == nil {
+		return capacity
 	}
 
-	stat.TotalSize = 1 << 50
-	stat.FreeSize = 1 << 50
-	stat.AvailableSize = 1 << 50
-	stat.TotalFiles = 1 << 32
-	stat.FreeFiles = 1 << 32
-	stat.AvailableFiles = 1 << 32
-	stat.CacheHint = time.Second
-	return nil
+	pressure := fs.stagingManager.CurrentPressure()
+	if pressure.QuotaBytes == 0 {
+		return capacity
+	}
+	availableBytes := pressure.AvailableBytes
+	if pressure.HighWatermarkBytes > 0 {
+		safeAvailable := pressure.HighWatermarkBytes - pressure.UsedBytes
+		if safeAvailable < 0 {
+			safeAvailable = 0
+		}
+		if safeAvailable < availableBytes {
+			availableBytes = safeAvailable
+		}
+	}
+	capacity.TotalBytes = uint64(pressure.QuotaBytes)
+	capacity.AvailableBytes = 0
+	if availableBytes > 0 {
+		capacity.AvailableBytes = uint64(availableBytes)
+	}
+	return capacity
 }
 
 // Open opens a file for reading
-func (fs *COSFilesystem) Open(filename string) (billy.File, error) {
+func (fs *Filesystem) Open(filename string) (billy.File, error) {
 	return fs.OpenFile(filename, os.O_RDONLY, 0)
 }
 
 // OpenFile opens a file with specified flags and permissions
-func (fs *COSFilesystem) OpenFile(filename string, flag int, perm os.FileMode) (billy.File, error) {
+func (fs *Filesystem) OpenFile(filename string, flag int, perm os.FileMode) (billy.File, error) {
 	fullPath := fs.Join(fs.root, filename)
 	if isReservedPath(fullPath) {
 		return nil, &os.PathError{Op: "open", Path: filename, Err: os.ErrPermission}
@@ -396,7 +171,7 @@ func (fs *COSFilesystem) OpenFile(filename string, flag int, perm os.FileMode) (
 		"perm", fmt.Sprintf("%o", perm),
 		"staging_enabled", useStagingPath)
 
-	file := &COSFile{
+	file := &File{
 		ops:            fs.ops,
 		logger:         fs.logger,
 		path:           fullPath,
@@ -582,7 +357,7 @@ func (s *stagingDirInfo) ModTime() time.Time { return s.modTime }
 func (s *stagingDirInfo) IsDir() bool        { return true }
 func (s *stagingDirInfo) Sys() interface{}   { return nil }
 
-func (fs *COSFilesystem) isStagingDirty(fullPath string) bool {
+func (fs *Filesystem) isStagingDirty(fullPath string) bool {
 	if fs.featureFlags != nil && fs.featureFlags.IsStagingEnabled() && fs.stagingManager != nil {
 		if session, exists := fs.stagingManager.GetSession(fullPath); exists {
 			// If session has any modifications not fully uploaded
@@ -599,7 +374,7 @@ func isReservedPath(fullPath string) bool {
 }
 
 // Stat returns file information
-func (fs *COSFilesystem) Stat(filename string) (os.FileInfo, error) {
+func (fs *Filesystem) Stat(filename string) (os.FileInfo, error) {
 	fullPath := fs.Join(fs.root, filename)
 	if isReservedPath(fullPath) {
 		return nil, &os.PathError{Op: "stat", Path: filename, Err: os.ErrNotExist}
@@ -641,7 +416,7 @@ func (fs *COSFilesystem) Stat(filename string) (os.FileInfo, error) {
 // statFromStaging answers a Stat from local staging knowledge when the object
 // store cannot: an existing session for the exact path, or staged data under
 // the path implying a directory.
-func (fs *COSFilesystem) statFromStaging(fullPath string) os.FileInfo {
+func (fs *Filesystem) statFromStaging(fullPath string) os.FileInfo {
 	if fs.featureFlags == nil || !fs.featureFlags.IsStagingEnabled() || fs.stagingManager == nil {
 		return nil
 	}
@@ -670,7 +445,7 @@ func (fs *COSFilesystem) statFromStaging(fullPath string) os.FileInfo {
 }
 
 // Rename renames a file
-func (fs *COSFilesystem) Rename(oldpath, newpath string) error {
+func (fs *Filesystem) Rename(oldpath, newpath string) error {
 	oldFull := fs.Join(fs.root, oldpath)
 	newFull := fs.Join(fs.root, newpath)
 	if isReservedPath(oldFull) || isReservedPath(newFull) {
@@ -722,7 +497,7 @@ func (fs *COSFilesystem) Rename(oldpath, newpath string) error {
 // renameDirtyStagedFile renames a dirty staged source by re-keying the staged
 // state and tombstoning the source object. No COS copy is needed: the staged
 // bytes sync to the destination key.
-func (fs *COSFilesystem) renameDirtyStagedFile(oldFull, newFull string) error {
+func (fs *Filesystem) renameDirtyStagedFile(oldFull, newFull string) error {
 	if err := fs.stagingManager.RenameStagedPath(oldFull, newFull); err != nil {
 		if os.IsNotExist(err) {
 			// Staged bytes vanished (stale dirty entry); fall back to the
@@ -755,7 +530,7 @@ func (fs *COSFilesystem) renameDirtyStagedFile(oldFull, newFull string) error {
 
 // discardStagedDestination drops staged state for a rename destination that is
 // about to be overwritten by an object-store rename.
-func (fs *COSFilesystem) discardStagedDestination(path string) error {
+func (fs *Filesystem) discardStagedDestination(path string) error {
 	sm := fs.stagingManager
 
 	if sm.IsDirty(path) {
@@ -789,7 +564,7 @@ func (fs *COSFilesystem) discardStagedDestination(path string) error {
 }
 
 // Remove removes a file or directory
-func (fs *COSFilesystem) Remove(filename string) error {
+func (fs *Filesystem) Remove(filename string) error {
 	fullPath := fs.Join(fs.root, filename)
 	if isReservedPath(fullPath) {
 		return &os.PathError{Op: "remove", Path: filename, Err: os.ErrPermission}
@@ -856,7 +631,7 @@ func (fs *COSFilesystem) Remove(filename string) error {
 // removeDirtyStagedFile accepts the delete of a dirty staged file. The
 // tombstone is persisted before any destructive step, so once this returns
 // success the delete survives crashes and cannot resurrect the file.
-func (fs *COSFilesystem) removeDirtyStagedFile(fullPath string) error {
+func (fs *Filesystem) removeDirtyStagedFile(fullPath string) error {
 	immediate, err := fs.stagingManager.RegisterPendingDelete(fullPath)
 	if err != nil {
 		return err
@@ -886,7 +661,7 @@ func (fs *COSFilesystem) removeDirtyStagedFile(fullPath string) error {
 
 // ensureNoDirtyStagedChildren blocks operations on a directory tree that has
 // dirty staged files strictly below path (path itself is allowed).
-func (fs *COSFilesystem) ensureNoDirtyStagedChildren(op, path string) error {
+func (fs *Filesystem) ensureNoDirtyStagedChildren(op, path string) error {
 	if fs.featureFlags == nil || !fs.featureFlags.IsStagingEnabled() || fs.stagingManager == nil {
 		return nil
 	}
@@ -909,7 +684,7 @@ func (fs *COSFilesystem) ensureNoDirtyStagedChildren(op, path string) error {
 	}
 }
 
-func (fs *COSFilesystem) ensureNoDirtyStagedData(op, path string) error {
+func (fs *Filesystem) ensureNoDirtyStagedData(op, path string) error {
 	if fs.featureFlags == nil || !fs.featureFlags.IsStagingEnabled() || fs.stagingManager == nil {
 		return nil
 	}
@@ -926,7 +701,7 @@ func (fs *COSFilesystem) ensureNoDirtyStagedData(op, path string) error {
 	}
 }
 
-func (fs *COSFilesystem) cleanupCleanStagingSessionAfterDelete(path string) {
+func (fs *Filesystem) cleanupCleanStagingSessionAfterDelete(path string) {
 	if fs.featureFlags == nil || !fs.featureFlags.IsStagingEnabled() || fs.stagingManager == nil {
 		return
 	}
@@ -944,7 +719,7 @@ func (fs *COSFilesystem) cleanupCleanStagingSessionAfterDelete(path string) {
 }
 
 // cleanupSessionsBeforeDelete ensures any active sessions are flushed before file deletion.
-func (fs *COSFilesystem) cleanupSessionsBeforeDelete(path string) error {
+func (fs *Filesystem) cleanupSessionsBeforeDelete(path string) error {
 	ctx := context.Background()
 
 	// Handle staging path (new architecture)
@@ -1040,12 +815,12 @@ func (fs *COSFilesystem) cleanupSessionsBeforeDelete(path string) error {
 }
 
 // Join joins path elements
-func (fs *COSFilesystem) Join(elem ...string) string {
+func (fs *Filesystem) Join(elem ...string) string {
 	return filepath.Join(elem...)
 }
 
 // TempFile creates a temporary file
-func (fs *COSFilesystem) TempFile(dir, prefix string) (billy.File, error) {
+func (fs *Filesystem) TempFile(dir, prefix string) (billy.File, error) {
 	// Generate a unique temporary filename
 	tempName := fmt.Sprintf("%s%d", prefix, os.Getpid())
 	fullPath := fs.Join(dir, tempName)
@@ -1053,7 +828,7 @@ func (fs *COSFilesystem) TempFile(dir, prefix string) (billy.File, error) {
 }
 
 // ReadDir reads directory contents
-func (fs *COSFilesystem) ReadDir(path string) ([]os.FileInfo, error) {
+func (fs *Filesystem) ReadDir(path string) ([]os.FileInfo, error) {
 	start := time.Now()
 
 	fullPath := fs.Join(fs.root, path)
@@ -1187,7 +962,7 @@ func (fs *COSFilesystem) ReadDir(path string) ([]os.FileInfo, error) {
 }
 
 // MkdirAll creates a directory and all parent directories
-func (fs *COSFilesystem) MkdirAll(filename string, perm os.FileMode) error {
+func (fs *Filesystem) MkdirAll(filename string, perm os.FileMode) error {
 	fullPath := fs.Join(fs.root, filename)
 	attrs := &types.POSIXAttributes{
 		Mode:  perm | os.ModeDir,
@@ -1199,24 +974,24 @@ func (fs *COSFilesystem) MkdirAll(filename string, perm os.FileMode) error {
 }
 
 // Lstat returns file information (same as Stat for COS)
-func (fs *COSFilesystem) Lstat(filename string) (os.FileInfo, error) {
+func (fs *Filesystem) Lstat(filename string) (os.FileInfo, error) {
 	return fs.Stat(filename)
 }
 
 // Symlink creates a symbolic link (not supported in COS)
-func (fs *COSFilesystem) Symlink(target, link string) error {
+func (fs *Filesystem) Symlink(target, link string) error {
 	return fmt.Errorf("symlinks not supported")
 }
 
 // Readlink reads a symbolic link (not supported in COS)
-func (fs *COSFilesystem) Readlink(link string) (string, error) {
+func (fs *Filesystem) Readlink(link string) (string, error) {
 	return "", fmt.Errorf("symlinks not supported")
 }
 
 // Chroot creates a chrooted filesystem
-func (fs *COSFilesystem) Chroot(path string) (billy.Filesystem, error) {
+func (fs *Filesystem) Chroot(path string) (billy.Filesystem, error) {
 	newRoot := fs.Join(fs.root, path)
-	return &COSFilesystem{
+	return &Filesystem{
 		ops:            fs.ops,
 		logger:         fs.logger,
 		root:           newRoot,
@@ -1229,12 +1004,12 @@ func (fs *COSFilesystem) Chroot(path string) (billy.Filesystem, error) {
 }
 
 // Root returns the root path
-func (fs *COSFilesystem) Root() string {
+func (fs *Filesystem) Root() string {
 	return fs.root
 }
 
 // Chmod changes the mode of the named file
-func (fs *COSFilesystem) Chmod(name string, mode os.FileMode) error {
+func (fs *Filesystem) Chmod(name string, mode os.FileMode) error {
 	// COS doesn't support chmod directly, but we can update metadata
 	fullPath := fs.Join(fs.root, name)
 
@@ -1273,13 +1048,13 @@ func (fs *COSFilesystem) Chmod(name string, mode os.FileMode) error {
 }
 
 // Lchown changes the uid and gid of the named file (link itself)
-func (fs *COSFilesystem) Lchown(name string, uid, gid int) error {
+func (fs *Filesystem) Lchown(name string, uid, gid int) error {
 	// COS doesn't support symlinks, so this is the same as Chown
 	return fs.Chown(name, uid, gid)
 }
 
 // Chown changes the uid and gid of the named file
-func (fs *COSFilesystem) Chown(name string, uid, gid int) error {
+func (fs *Filesystem) Chown(name string, uid, gid int) error {
 	fullPath := fs.Join(fs.root, name)
 
 	if fs.featureFlags != nil && fs.featureFlags.IsStagingEnabled() && fs.stagingManager != nil {
@@ -1317,7 +1092,7 @@ func (fs *COSFilesystem) Chown(name string, uid, gid int) error {
 }
 
 // Chtimes changes the access and modification times
-func (fs *COSFilesystem) Chtimes(name string, atime time.Time, mtime time.Time) error {
+func (fs *Filesystem) Chtimes(name string, atime time.Time, mtime time.Time) error {
 	fullPath := fs.Join(fs.root, name)
 
 	if fs.isStagingDirty(fullPath) {
@@ -1343,10 +1118,10 @@ func (fs *COSFilesystem) Chtimes(name string, atime time.Time, mtime time.Time) 
 	return fs.ops.UpdateAttributes(context.Background(), fullPath, attrs)
 }
 
-// COSFile implements billy.File interface
-type COSFile struct {
+// File implements billy.File interface
+type File struct {
 	ops            *posix.OperationsHandler
-	logger         *Logger
+	logger         *logging.KVLogger
 	path           string
 	flag           int
 	perm           os.FileMode
@@ -1370,11 +1145,11 @@ type COSFile struct {
 }
 
 // Name returns the file name
-func (f *COSFile) Name() string {
+func (f *File) Name() string {
 	return filepath.Base(f.path)
 }
 
-func (f *COSFile) maxBufferedWriteBytes() int64 {
+func (f *File) maxBufferedWriteBytes() int64 {
 	limitMB := config.DefaultMaxBufferedWriteMB
 	if f.perfConfig != nil && f.perfConfig.MaxBufferedWriteMB > 0 {
 		limitMB = f.perfConfig.MaxBufferedWriteMB
@@ -1383,7 +1158,7 @@ func (f *COSFile) maxBufferedWriteBytes() int64 {
 }
 
 // Read reads data from the file
-func (f *COSFile) Read(p []byte) (int, error) {
+func (f *File) Read(p []byte) (int, error) {
 	// STAGING PATH: Check staging session first for dirty files
 	if f.featureFlags != nil && f.featureFlags.IsStagingEnabled() && f.stagingSession != nil {
 		// Read from staging session
@@ -1467,7 +1242,7 @@ func (f *COSFile) Read(p []byte) (int, error) {
 }
 
 // Write writes data to the file with session-based buffering
-func (f *COSFile) Write(p []byte) (int, error) {
+func (f *File) Write(p []byte) (int, error) {
 	f.totalWrites++
 
 	// STAGING PATH: Write to staging session
@@ -1570,7 +1345,7 @@ func (f *COSFile) Write(p []byte) (int, error) {
 }
 
 // flushSessionBuffer flushes the write session buffer to COS
-func (f *COSFile) flushSessionBuffer() error {
+func (f *File) flushSessionBuffer() error {
 	if f.writeSession == nil {
 		return nil
 	}
@@ -1767,7 +1542,7 @@ func (f *COSFile) flushSessionBuffer() error {
 }
 
 // Close closes the file and releases the write session
-func (f *COSFile) Close() error {
+func (f *File) Close() error {
 	// STAGING PATH: Release staging session
 	if f.featureFlags != nil && f.featureFlags.IsStagingEnabled() && f.stagingSession != nil {
 		sessionSize := f.stagingSession.Size
@@ -1856,7 +1631,7 @@ func (f *COSFile) Close() error {
 }
 
 // Seek sets the file offset
-func (f *COSFile) Seek(offset int64, whence int) (int64, error) {
+func (f *File) Seek(offset int64, whence int) (int64, error) {
 	if err := f.ensureLoaded(); err != nil && !f.isNew {
 		return 0, err
 	}
@@ -1887,17 +1662,17 @@ func (f *COSFile) Seek(offset int64, whence int) (int64, error) {
 }
 
 // Lock locks the file (no-op for COS)
-func (f *COSFile) Lock() error {
+func (f *File) Lock() error {
 	return nil
 }
 
 // Unlock unlocks the file (no-op for COS)
-func (f *COSFile) Unlock() error {
+func (f *File) Unlock() error {
 	return nil
 }
 
 // ReadAt reads data from the file at a specific offset
-func (f *COSFile) ReadAt(p []byte, off int64) (int, error) {
+func (f *File) ReadAt(p []byte, off int64) (int, error) {
 	if err := f.ensureLoaded(); err != nil {
 		return 0, err
 	}
@@ -1958,7 +1733,7 @@ func (f *COSFile) ReadAt(p []byte, off int64) (int, error) {
 }
 
 // Truncate truncates the file to a specified size
-func (f *COSFile) Truncate(size int64) error {
+func (f *File) Truncate(size int64) error {
 	if err := f.ensureLoaded(); err != nil && !f.isNew {
 		return err
 	}
@@ -1975,7 +1750,7 @@ func (f *COSFile) Truncate(size int64) error {
 }
 
 // ensureLoaded loads file data from COS if not already loaded
-func (f *COSFile) ensureLoaded() error {
+func (f *File) ensureLoaded() error {
 	if f.loaded || f.isNew {
 		return nil
 	}

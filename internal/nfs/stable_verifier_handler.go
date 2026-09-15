@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/go-git/go-billy/v5"
+	"github.com/oborges/bluestone/internal/logging"
 	gonfs "github.com/willscott/go-nfs"
 )
 
@@ -17,11 +18,11 @@ import (
 type StableVerifierHandler struct {
 	handler   gonfs.Handler
 	verifiers sync.Map // map[string]uint64 - path -> stable verifier
-	logger    *Logger
+	logger    *logging.KVLogger
 }
 
 // NewStableVerifierHandler creates a handler that returns stable verifiers per directory
-func NewStableVerifierHandler(handler gonfs.Handler, logger *Logger) gonfs.Handler {
+func NewStableVerifierHandler(handler gonfs.Handler, logger *logging.KVLogger) gonfs.Handler {
 	return &StableVerifierHandler{
 		handler: handler,
 		logger:  logger,

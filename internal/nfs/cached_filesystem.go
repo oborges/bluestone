@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/go-git/go-billy/v5"
+	"github.com/oborges/bluestone/internal/logging"
 	gonfs "github.com/willscott/go-nfs"
 )
 
@@ -15,7 +16,7 @@ import (
 type CachedFilesystem struct {
 	billy.Filesystem
 	cache    sync.Map // map[string]*cachedDir
-	logger   *Logger
+	logger   *logging.KVLogger
 	cacheTTL time.Duration
 }
 
@@ -26,7 +27,7 @@ type cachedDir struct {
 }
 
 // NewCachedFilesystem creates a filesystem with directory caching
-func NewCachedFilesystem(fs billy.Filesystem, logger *Logger, cacheTTL time.Duration) *CachedFilesystem {
+func NewCachedFilesystem(fs billy.Filesystem, logger *logging.KVLogger, cacheTTL time.Duration) *CachedFilesystem {
 	return &CachedFilesystem{
 		Filesystem: fs,
 		logger:     logger,
@@ -93,12 +94,7 @@ func (cfs *CachedFilesystem) ClearCache() {
 
 // FSStat forwards dynamic filesystem capacity data through the cache wrapper.
 func (cfs *CachedFilesystem) FSStat(ctx context.Context, stat *gonfs.FSStat) error {
-	if provider, ok := cfs.Filesystem.(interface {
-		FSStat(context.Context, *gonfs.FSStat) error
-	}); ok {
-		return provider.FSStat(ctx, stat)
-	}
-	return nil
+	return fsStatFrom(ctx, cfs.Filesystem, stat)
 }
 
 // Chmod changes the mode of the named file (implements billy.Change)
