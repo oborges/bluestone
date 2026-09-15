@@ -5,8 +5,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/oborges/cos-nfs-gateway/internal/logging"
-	"github.com/oborges/cos-nfs-gateway/pkg/types"
+	"github.com/oborges/bluestone/internal/logging"
+	"github.com/oborges/bluestone/pkg/types"
 	"go.uber.org/zap"
 )
 

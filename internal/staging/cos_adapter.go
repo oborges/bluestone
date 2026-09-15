@@ -6,9 +6,9 @@ import (
 	"time"
 
 	"github.com/IBM/ibm-cos-sdk-go/service/s3"
-	"github.com/oborges/cos-nfs-gateway/internal/cos"
-	"github.com/oborges/cos-nfs-gateway/internal/posix"
-	"github.com/oborges/cos-nfs-gateway/pkg/types"
+	"github.com/oborges/bluestone/internal/cos"
+	"github.com/oborges/bluestone/internal/posix"
+	"github.com/oborges/bluestone/pkg/types"
 )
 
 // COSClientAdapter adapts the COS client to the COSClient interface required by SyncWorker

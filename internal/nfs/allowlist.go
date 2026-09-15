@@ -3,7 +3,7 @@ package nfs
 import (
 	"net"
 
-	"github.com/oborges/cos-nfs-gateway/internal/config"
+	"github.com/oborges/bluestone/internal/config"
 )
 
 // ClientFilter decides whether a client address may connect to the NFS

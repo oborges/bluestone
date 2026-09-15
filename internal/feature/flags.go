@@ -1,7 +1,7 @@
 package feature
 
 import (
-	"github.com/oborges/cos-nfs-gateway/internal/config"
+	"github.com/oborges/bluestone/internal/config"
 )
 
 // FeatureFlags controls experimental and new features

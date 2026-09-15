@@ -15,9 +15,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/oborges/cos-nfs-gateway/internal/config"
-	"github.com/oborges/cos-nfs-gateway/internal/logging"
-	"github.com/oborges/cos-nfs-gateway/internal/metrics"
+	"github.com/oborges/bluestone/internal/config"
+	"github.com/oborges/bluestone/internal/logging"
+	"github.com/oborges/bluestone/internal/metrics"
 	"go.uber.org/zap"
 )
 

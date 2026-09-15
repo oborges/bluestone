@@ -1,4 +1,4 @@
-module github.com/oborges/cos-nfs-gateway
+module github.com/oborges/bluestone
 
 go 1.25.0
 

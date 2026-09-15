@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/oborges/cos-nfs-gateway/internal/config"
+	"github.com/oborges/bluestone/internal/config"
 )
 
 func createTestConfig(t *testing.T) *config.StagingConfig {

@@ -8,8 +8,8 @@ import (
 
 	"github.com/IBM/ibm-cos-sdk-go/aws"
 	"github.com/IBM/ibm-cos-sdk-go/service/s3"
-	"github.com/oborges/cos-nfs-gateway/internal/config"
-	"github.com/oborges/cos-nfs-gateway/internal/logging"
+	"github.com/oborges/bluestone/internal/config"
+	"github.com/oborges/bluestone/internal/logging"
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 )

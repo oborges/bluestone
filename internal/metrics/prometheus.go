@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/oborges/cos-nfs-gateway/internal/logging"
+	"github.com/oborges/bluestone/internal/logging"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"

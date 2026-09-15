@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/oborges/cos-nfs-gateway/internal/cache"
-	"github.com/oborges/cos-nfs-gateway/internal/config"
-	"github.com/oborges/cos-nfs-gateway/pkg/types"
+	"github.com/oborges/bluestone/internal/cache"
+	"github.com/oborges/bluestone/internal/config"
+	"github.com/oborges/bluestone/pkg/types"
 )
 
 // downObjectStore simulates an unreachable object store: every call fails

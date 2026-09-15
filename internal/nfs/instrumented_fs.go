@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/go-git/go-billy/v5"
-	"github.com/oborges/cos-nfs-gateway/internal/metrics"
+	"github.com/oborges/bluestone/internal/metrics"
 	gonfs "github.com/willscott/go-nfs"
 )
 
