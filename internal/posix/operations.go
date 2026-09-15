@@ -177,11 +177,11 @@ func (h *OperationsHandler) ensureFullObjectReadAllowed(ctx context.Context, pat
 }
 
 // Stat retrieves file/directory metadata
-func (h *OperationsHandler) Stat(ctx context.Context, path string) (*FileInfo, error) {
+func (h *OperationsHandler) Stat(ctx context.Context, path string) (_ *FileInfo, err error) {
 	log := logging.WithOperation("Stat").With(zap.String("path", path))
 	start := time.Now()
 	defer func() {
-		metrics.RecordNFSRequest("stat", "success", time.Since(start))
+		metrics.RecordRequest(ctx, "stat", err, time.Since(start))
 	}()
 
 	// Check cache first, but skip if it's an implicit directory (needs validation)
@@ -456,7 +456,7 @@ func (h *OperationsHandler) DownloadToFile(ctx context.Context, path string, loc
 }
 
 // ReadFile reads file content
-func (h *OperationsHandler) ReadFile(ctx context.Context, path string, offset, length int64) ([]byte, error) {
+func (h *OperationsHandler) ReadFile(ctx context.Context, path string, offset, length int64) (_ []byte, err error) {
 	log := logging.WithOperation("ReadFile").With(
 		zap.String("path", path),
 		zap.Int64("offset", offset),
@@ -464,7 +464,7 @@ func (h *OperationsHandler) ReadFile(ctx context.Context, path string, offset, l
 	)
 	start := time.Now()
 	defer func() {
-		metrics.RecordNFSRequest("read", "success", time.Since(start))
+		metrics.RecordRequest(ctx, "read", err, time.Since(start))
 	}()
 
 	// Try cache first - but only for full file reads
@@ -491,7 +491,6 @@ func (h *OperationsHandler) ReadFile(ctx context.Context, path string, offset, l
 	objectKey := h.translator.ToObjectKey(path)
 
 	var data []byte
-	var err error
 
 	if length > 0 {
 		if h.dataCacheEnabled() {
@@ -760,14 +759,14 @@ func (h *OperationsHandler) fetchChunkSingleflight(ctx context.Context, path, ob
 }
 
 // WriteFile writes file content
-func (h *OperationsHandler) WriteFile(ctx context.Context, path string, data []byte, attrs *types.POSIXAttributes) error {
+func (h *OperationsHandler) WriteFile(ctx context.Context, path string, data []byte, attrs *types.POSIXAttributes) (err error) {
 	log := logging.WithOperation("WriteFile").With(
 		zap.String("path", path),
 		zap.Int("bytes", len(data)),
 	)
 	start := time.Now()
 	defer func() {
-		metrics.RecordNFSRequest("write", "success", time.Since(start))
+		metrics.RecordRequest(ctx, "write", err, time.Since(start))
 	}()
 
 	objectKey := h.translator.ToObjectKey(path)
@@ -776,7 +775,7 @@ func (h *OperationsHandler) WriteFile(ctx context.Context, path string, data []b
 	metadata := EncodePOSIXAttributes(attrs)
 
 	// Write to COS
-	err := h.cosClient.PutObject(ctx, objectKey, data, metadata)
+	err = h.cosClient.PutObject(ctx, objectKey, data, metadata)
 	if err != nil {
 		log.Error("Failed to write file", zap.Error(err))
 		return err
@@ -791,17 +790,17 @@ func (h *OperationsHandler) WriteFile(ctx context.Context, path string, data []b
 }
 
 // DeleteFile deletes a file
-func (h *OperationsHandler) DeleteFile(ctx context.Context, path string) error {
+func (h *OperationsHandler) DeleteFile(ctx context.Context, path string) (err error) {
 	log := logging.WithOperation("DeleteFile").With(zap.String("path", path))
 	start := time.Now()
 	defer func() {
-		metrics.RecordNFSRequest("delete", "success", time.Since(start))
+		metrics.RecordRequest(ctx, "delete", err, time.Since(start))
 	}()
 
 	objectKey := h.translator.ToObjectKey(path)
 
 	// Delete from COS
-	err := h.cosClient.DeleteObject(ctx, objectKey)
+	err = h.cosClient.DeleteObject(ctx, objectKey)
 	if err != nil {
 		log.Error("Failed to delete file", zap.Error(err))
 		return err
@@ -815,11 +814,11 @@ func (h *OperationsHandler) DeleteFile(ctx context.Context, path string) error {
 }
 
 // CreateDirectory creates a directory
-func (h *OperationsHandler) CreateDirectory(ctx context.Context, path string, attrs *types.POSIXAttributes) error {
+func (h *OperationsHandler) CreateDirectory(ctx context.Context, path string, attrs *types.POSIXAttributes) (err error) {
 	log := logging.WithOperation("CreateDirectory").With(zap.String("path", path))
 	start := time.Now()
 	defer func() {
-		metrics.RecordNFSRequest("mkdir", "success", time.Since(start))
+		metrics.RecordRequest(ctx, "mkdir", err, time.Since(start))
 	}()
 
 	objectKey := ToDirectoryKey(h.translator.ToObjectKey(path))
@@ -831,7 +830,7 @@ func (h *OperationsHandler) CreateDirectory(ctx context.Context, path string, at
 	metadata := EncodePOSIXAttributes(attrs)
 
 	// Create directory marker in COS
-	err := h.cosClient.PutObject(ctx, objectKey, []byte{}, metadata)
+	err = h.cosClient.PutObject(ctx, objectKey, []byte{}, metadata)
 	if err != nil {
 		log.Error("Failed to create directory", zap.Error(err))
 		return err
@@ -845,11 +844,11 @@ func (h *OperationsHandler) CreateDirectory(ctx context.Context, path string, at
 }
 
 // DeleteDirectory deletes a directory
-func (h *OperationsHandler) DeleteDirectory(ctx context.Context, path string) error {
+func (h *OperationsHandler) DeleteDirectory(ctx context.Context, path string) (err error) {
 	log := logging.WithOperation("DeleteDirectory").With(zap.String("path", path))
 	start := time.Now()
 	defer func() {
-		metrics.RecordNFSRequest("rmdir", "success", time.Since(start))
+		metrics.RecordRequest(ctx, "rmdir", err, time.Since(start))
 	}()
 
 	// Check if directory is empty
@@ -879,14 +878,14 @@ func (h *OperationsHandler) DeleteDirectory(ctx context.Context, path string) er
 }
 
 // ListDirectory lists directory contents
-func (h *OperationsHandler) ListDirectory(ctx context.Context, path string) ([]*FileInfo, error) {
+func (h *OperationsHandler) ListDirectory(ctx context.Context, path string) (_ []*FileInfo, err error) {
 	log := logging.WithOperation("ListDirectory").With(zap.String("path", path))
 	start := time.Now()
 	cacheHit := false
 
 	defer func() {
 		duration := time.Since(start)
-		metrics.RecordNFSRequest("readdir", "success", duration)
+		metrics.RecordRequest(ctx, "readdir", err, duration)
 		metrics.RecordListDirectory(duration, cacheHit)
 
 		// Log first call, cache misses, or slow operations
@@ -1048,14 +1047,14 @@ fetchFromCOS:
 }
 
 // RenameFile renames/moves a file or directory
-func (h *OperationsHandler) RenameFile(ctx context.Context, oldPath, newPath string) error {
+func (h *OperationsHandler) RenameFile(ctx context.Context, oldPath, newPath string) (err error) {
 	log := logging.WithOperation("RenameFile").With(
 		zap.String("oldPath", oldPath),
 		zap.String("newPath", newPath),
 	)
 	start := time.Now()
 	defer func() {
-		metrics.RecordNFSRequest("rename", "success", time.Since(start))
+		metrics.RecordRequest(ctx, "rename", err, time.Since(start))
 	}()
 
 	oldPath = NormalizePath(oldPath)
@@ -1168,11 +1167,11 @@ func (h *OperationsHandler) renameDirectory(ctx context.Context, oldPath, newPat
 }
 
 // UpdateAttributes updates file/directory attributes without rewriting content
-func (h *OperationsHandler) UpdateAttributes(ctx context.Context, path string, attrs *types.POSIXAttributes) error {
+func (h *OperationsHandler) UpdateAttributes(ctx context.Context, path string, attrs *types.POSIXAttributes) (err error) {
 	log := logging.WithOperation("UpdateAttributes").With(zap.String("path", path))
 	start := time.Now()
 	defer func() {
-		metrics.RecordNFSRequest("setattr", "success", time.Since(start))
+		metrics.RecordRequest(ctx, "setattr", err, time.Since(start))
 	}()
 
 	objectKey := h.translator.ToObjectKey(path)

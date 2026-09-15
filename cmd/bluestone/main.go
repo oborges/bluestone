@@ -271,7 +271,10 @@ func main() {
 	nfsLogger := logging.NewKVLogger(zapLogger)
 
 	// Create billy.Filesystem implementation with config
-	cosFilesystem := vfs.NewFilesystem(operations, nfsLogger, "/", &cfg.Performance, stagingManager, syncWorker, featureFlags)
+	// The NFS server serves its own view of the shared filesystem, so its
+	// requests are labelled protocol="nfs" in metrics.
+	cosFilesystem := vfs.NewFilesystem(operations, nfsLogger, "/", &cfg.Performance, stagingManager, syncWorker, featureFlags).
+		ForProtocol(metrics.ProtocolNFS)
 
 	// Wrap with directory caching to work around go-nfs library limitation
 	// The go-nfs library doesn't use CachingHandler for READDIR, so we cache at filesystem level
