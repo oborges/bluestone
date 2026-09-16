@@ -246,6 +246,16 @@ write access they often never use. Set-info requests map to truncate and
 `SetAttributes` (creation, write, and access times, Windows attributes).
 Connections outside `server.allowed_clients` are dropped at accept.
 
+### Byte-Range Locks
+
+Both protocol servers record locks in `internal/lock.Manager`: NFSv4 through
+`internal/nfs.NewLocker` and SMB through `internal/smb.NewLocker`, which the
+vendored server calls through its `vfs.ByteRangeLocker` interface. A lock
+taken over one protocol therefore conflicts with a lock taken over the other.
+An SMB lock belongs to the file handle that took it, so two handles conflict
+even within one session, and closing a handle or ending a session releases
+what it held. Locks that cannot be granted are refused rather than queued.
+
 ### Share Modes
 
 `internal/lock` holds the table of open files alongside the byte-range lock

@@ -335,6 +335,7 @@ func main() {
 			AllowedClients:     cfg.Server.AllowedClients,
 			EncryptionRequired: cfg.SMB.EncryptionRequired,
 			Opens:              opens,
+			Locks:              locks,
 			Logger:             zapLogger,
 		})
 		if err != nil {

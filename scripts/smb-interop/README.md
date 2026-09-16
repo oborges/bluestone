@@ -34,6 +34,21 @@ ssh gateway 'sudo sed -n "s/^ *password: \"\(.*\)\"$/\1/p" /etc/bluestone/config
 - `windows-overwrite-test.ps1` checks that overwriting an existing file
   replaces its contents rather than appending to them, through several
   different Windows write paths.
+- `windows-lock-test.ps1` checks byte-range locking: locking free bytes,
+  an overlapping lock from a second handle being refused, an adjacent lock
+  being granted, and the bytes freeing up on release. With `-HoldOffset` it
+  instead holds a lock and waits, which is how the cross-protocol check below
+  keeps a lock held.
+- `nfs-hold-lock.py` and `nfs-try-lock.py` do the same from an NFS mount, so
+  the two protocols can be checked against each other:
+
+  ```bash
+  # On the gateway host, with the export mounted at /mnt/nfs:
+  sudo python3 nfs-hold-lock.py /mnt/nfs/locktest.bin 0 100 40 &
+  # Then from Windows, a lock on the same bytes must be refused:
+  echo "$password" | ssh windows 'powershell -File windows-lock-test.ps1 -Server 10.0.0.4'
+  ```
+
 - `windows-sharemode-test.ps1` checks share modes: a file held with
   `FileShare.None` blocks other opens, one held with `FileShare.Read` admits
   readers but not writers, and listing a directory still works while a file

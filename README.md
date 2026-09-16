@@ -31,9 +31,11 @@ Test carefully with your own workload before relying on it.
 - Provides staging backpressure to prevent the local staging filesystem from
   filling unexpectedly.
 - Provides metadata and chunk/range data caching for reads.
-- Supports advisory byte-range file locking over NFSv4 (`fcntl` and `flock`),
-  with POSIX conflict semantics, capped at 512 locks per file and 8,192 per
-  client. Locks are advisory only and do not survive a gateway restart.
+- Supports advisory byte-range file locking over NFSv4 (`fcntl` and `flock`)
+  and SMB, with POSIX conflict semantics, capped at 512 locks per file and
+  8,192 per client. The two protocols share one lock table, so a range locked
+  by an NFS client is refused to an SMB client and the other way round. Locks
+  are advisory only and do not survive a gateway restart.
 - Tolerates object-store outages: starts degraded when COS is unreachable,
   keeps accepting staged writes, serves staged/cached reads and staging-backed
   or stale metadata, accepts deletes via durable tombstones, and reconciles
@@ -252,6 +254,12 @@ and writing, copying multi-megabyte files, case-insensitive access, DOS
 attributes and creation times, the write-temp-then-rename pattern that Office
 and many editors use, renames, and deletes. Scripts for repeating these checks
 are in `scripts/smb-interop/`.
+
+Byte-range locks taken over SMB go into the same table as NFS locks, so the
+two protocols conflict with each other on the same bytes. A lock belongs to
+the handle that took it and is released when that handle closes or its session
+ends. Locks that cannot be granted are refused rather than queued: a client
+that asked to wait for a lock is told no instead of blocking.
 
 Share modes are enforced: a client that opens a file without sharing it, as
 editors and Office do while a document is open, makes other clients' opens
