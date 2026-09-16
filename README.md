@@ -228,6 +228,7 @@ smb:
   share_name: "bluestone"
   domain: "BLUESTONE"
   encryption_required: false
+  concurrent_requests: 0 # reads/writes at once per connection; 0 = default (64), 1 = serial
   users:
     - username: "alice"
       password: "change-me"
@@ -254,6 +255,12 @@ and writing, copying multi-megabyte files, case-insensitive access, DOS
 attributes and creation times, the write-temp-then-rename pattern that Office
 and many editors use, renames, and deletes. Scripts for repeating these checks
 are in `scripts/smb-interop/`.
+
+Reads and writes are handled concurrently, up to 64 at a time per connection
+by default: a client waits on the object store far more than on the gateway,
+so handling requests in turn would cost it a round trip each. Requests that
+create or destroy state, such as opening and closing files, stay ordered.
+`concurrent_requests: 1` restores the older serial behaviour.
 
 Byte-range locks taken over SMB go into the same table as NFS locks, so the
 two protocols conflict with each other on the same bytes. A lock belongs to

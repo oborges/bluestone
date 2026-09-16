@@ -135,6 +135,11 @@ proposed upstream.
   STATUS_FILE_LOCK_CONFLICT, which is the status for a read or write that
   hits a lock); the upstream end-to-end test was updated to match.
 
+- `smb/transport` + `smb/server`: a connection's responses are written by one
+  writer goroutine, and the framed connection keeps separate read and write
+  header buffers with a write mutex. Upstream shared one header buffer between
+  reads and writes, which is safe only while a single goroutine does both.
+
 ## Known gaps to close in Bluestone
 
 - Blocking byte-range locks: a lock that cannot be granted is refused even

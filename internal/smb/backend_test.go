@@ -636,3 +636,67 @@ func TestSMBShareModesFollowRenames(t *testing.T) {
 		t.Fatalf("Opens() = %v, want none left", opens)
 	}
 }
+
+// Many reads and writes in flight on one connection must all come back
+// correct: the server handles them at the same time rather than in turn.
+func TestSMBConcurrentReadsAndWrites(t *testing.T) {
+	g := startGateway(t)
+
+	const readers = 16
+	payload := bytes.Repeat([]byte("bluestone"), 4096) // 36 KiB
+	g.store.put("concurrent/source.bin", payload)
+
+	var wg sync.WaitGroup
+	errs := make(chan error, readers*2)
+
+	for i := range readers {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			f, err := g.share.Open(`concurrent\source.bin`)
+			if err != nil {
+				errs <- fmt.Errorf("reader %d open: %w", i, err)
+				return
+			}
+			defer f.Close()
+			got, err := io.ReadAll(f)
+			if err != nil {
+				errs <- fmt.Errorf("reader %d read: %w", i, err)
+				return
+			}
+			if !bytes.Equal(got, payload) {
+				errs <- fmt.Errorf("reader %d read %d bytes, want %d", i, len(got), len(payload))
+			}
+		}(i)
+
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			name := fmt.Sprintf(`concurrent\writer-%02d.bin`, i)
+			content := bytes.Repeat([]byte{byte('a' + i%26)}, 8192)
+			f, err := g.share.Create(name)
+			if err != nil {
+				errs <- fmt.Errorf("writer %d create: %w", i, err)
+				return
+			}
+			if _, err := f.Write(content); err != nil {
+				f.Close()
+				errs <- fmt.Errorf("writer %d write: %w", i, err)
+				return
+			}
+			if err := f.Close(); err != nil {
+				errs <- fmt.Errorf("writer %d close: %w", i, err)
+				return
+			}
+			if got := g.readFile(t, name); got != string(content) {
+				errs <- fmt.Errorf("writer %d wrote %d bytes, read back %d", i, len(content), len(got))
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+}
