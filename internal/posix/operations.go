@@ -282,12 +282,13 @@ func (h *OperationsHandler) Stat(ctx context.Context, path string) (_ *FileInfo,
 		// It's a file
 		attrs := DecodePOSIXAttributes(metadata.Metadata, false)
 		info := &FileInfo{
-			name:    GetBaseName(path),
-			size:    metadata.Size,
-			mode:    attrs.Mode,
-			modTime: metadata.LastModified,
-			isDir:   false,
-			attrs:   attrs,
+			name:          GetBaseName(path),
+			size:          metadata.Size,
+			mode:          attrs.Mode,
+			modTime:       reportedModTime(metadata.Metadata, metadata.LastModified),
+			isDir:         false,
+			attrs:         attrs,
+			objectModTime: metadata.LastModified,
 		}
 
 		// Cache the result
@@ -305,12 +306,13 @@ func (h *OperationsHandler) Stat(ctx context.Context, path string) (_ *FileInfo,
 		// It's a directory
 		attrs := DecodePOSIXAttributes(metadata.Metadata, true)
 		info := &FileInfo{
-			name:    GetBaseName(path),
-			size:    0,
-			mode:    attrs.Mode | os.ModeDir,
-			modTime: metadata.LastModified,
-			isDir:   true,
-			attrs:   attrs,
+			name:          GetBaseName(path),
+			size:          0,
+			mode:          attrs.Mode | os.ModeDir,
+			modTime:       reportedModTime(metadata.Metadata, metadata.LastModified),
+			isDir:         true,
+			attrs:         attrs,
+			objectModTime: metadata.LastModified,
 		}
 
 		// Cache the result
@@ -431,19 +433,45 @@ func fileInfoFromCacheEntry(path string, entry *cache.MetadataEntry) *FileInfo {
 	}
 }
 
-// cachedAttributes returns attributes an earlier Stat cached for path when
-// they still describe the listed object (same kind, and for files the same
-// size and modification time). COS listings carry no object metadata, so this
-// lets listings report real attributes without a HEAD request per entry.
-func (h *OperationsHandler) cachedAttributes(path string, obj *types.ObjectMetadata, isDir bool) *types.POSIXAttributes {
+// reportedModTime is the modification time to report for an object: the one a
+// client set, when the object's metadata carries it, and otherwise when the
+// object itself last changed. Clients expect a time they set to survive, and
+// COS rewrites an object's own last-modified whenever the gateway uploads or
+// updates it.
+func reportedModTime(metadata map[string]string, objectModTime time.Time) time.Time {
+	if stored, ok := StoredMtime(metadata); ok {
+		return stored
+	}
+	return objectModTime
+}
+
+// objectModTime reports when the object behind info last changed in COS,
+// falling back to its reported modification time for entries that do not
+// track the two separately.
+func objectModTime(info os.FileInfo) time.Time {
+	if fi, ok := info.(*FileInfo); ok {
+		return fi.ObjectModTime()
+	}
+	return info.ModTime()
+}
+
+// cachedEntry returns the attributes and reported modification time an earlier
+// Stat cached for path, when they still describe the listed object (same kind,
+// and for files the same size and object modification time). COS listings
+// carry no object metadata, so this lets listings report real attributes
+// without a HEAD request per entry.
+func (h *OperationsHandler) cachedEntry(path string, obj *types.ObjectMetadata, isDir bool) (*types.POSIXAttributes, time.Time) {
 	entry, ok := h.metadataCache.Get(path)
 	if !ok || entry.Negative || entry.Attributes == nil || entry.FileInfo == nil || entry.IsDir != isDir {
-		return nil
+		return nil, time.Time{}
 	}
-	if !isDir && (entry.FileInfo.Size() != obj.Size || !entry.FileInfo.ModTime().Equal(obj.LastModified)) {
-		return nil
+	// COS reports fractional seconds when listing but whole seconds from a
+	// HEAD, so compare at second resolution or the cache never matches.
+	if !isDir && (entry.FileInfo.Size() != obj.Size ||
+		!objectModTime(entry.FileInfo).Truncate(time.Second).Equal(obj.LastModified.Truncate(time.Second))) {
+		return nil, time.Time{}
 	}
-	return entry.Attributes
+	return entry.Attributes, entry.FileInfo.ModTime()
 }
 
 // DownloadToFile streams the object from COS into a local file path
@@ -1035,8 +1063,10 @@ fetchFromCOS:
 		seen[name] = true
 
 		attrs := DecodePOSIXAttributes(obj.Metadata, isDir)
-		if cached := h.cachedAttributes(JoinPath(NormalizePath(path), name), obj, isDir); cached != nil {
+		modTime := reportedModTime(obj.Metadata, obj.LastModified)
+		if cached, cachedModTime := h.cachedEntry(JoinPath(NormalizePath(path), name), obj, isDir); cached != nil {
 			attrs = cached
+			modTime = cachedModTime
 		}
 		mode := attrs.Mode
 		if isDir && (mode&os.ModeDir) == 0 {
@@ -1044,12 +1074,13 @@ fetchFromCOS:
 		}
 
 		info := &FileInfo{
-			name:    name,
-			size:    obj.Size,
-			mode:    mode,
-			modTime: obj.LastModified,
-			isDir:   isDir,
-			attrs:   attrs,
+			name:          name,
+			size:          obj.Size,
+			mode:          mode,
+			modTime:       modTime,
+			isDir:         isDir,
+			attrs:         attrs,
+			objectModTime: obj.LastModified,
 		}
 
 		log.Debug("Adding entry",
@@ -1254,6 +1285,10 @@ type FileInfo struct {
 	modTime time.Time
 	isDir   bool
 	attrs   *types.POSIXAttributes
+	// objectModTime is when the object itself last changed in COS, which is
+	// not the reported modification time once a client has set one. Listings
+	// compare it to decide whether cached attributes still apply.
+	objectModTime time.Time
 }
 
 // Implement os.FileInfo interface
@@ -1263,6 +1298,15 @@ func (f *FileInfo) Mode() os.FileMode  { return f.mode }
 func (f *FileInfo) ModTime() time.Time { return f.modTime }
 func (f *FileInfo) IsDir() bool        { return f.isDir }
 func (f *FileInfo) Sys() interface{}   { return nil }
+
+// ObjectModTime reports when the object last changed in COS. It matches
+// ModTime unless a client set a modification time of its own.
+func (f *FileInfo) ObjectModTime() time.Time {
+	if f.objectModTime.IsZero() {
+		return f.modTime
+	}
+	return f.objectModTime
+}
 
 // Attributes returns the entry's attributes: decoded from object metadata, or
 // defaults when its source (such as a listing) carried none. Without a stored

@@ -16,6 +16,10 @@ type StagedAttributes struct {
 	GID               uint32      `json:"gid"`
 	Btime             time.Time   `json:"btime,omitempty"`
 	WindowsAttributes uint32      `json:"windows_attributes,omitempty"`
+	// Atime and Mtime are times a client set explicitly. They are zero when
+	// no client has set them, and the staged file's own last write stands in.
+	Atime time.Time `json:"atime,omitempty"`
+	Mtime time.Time `json:"mtime,omitempty"`
 }
 
 // StagedAttributesFrom converts object attributes for staging.
@@ -26,6 +30,8 @@ func StagedAttributesFrom(attrs types.POSIXAttributes) StagedAttributes {
 		GID:               uint32(attrs.GID),
 		Btime:             attrs.Btime,
 		WindowsAttributes: attrs.WindowsAttributes,
+		Atime:             attrs.Atime,
+		Mtime:             attrs.Mtime,
 	}
 }
 
@@ -37,6 +43,8 @@ func (a StagedAttributes) POSIX() *types.POSIXAttributes {
 		GID:               int(a.GID),
 		Btime:             a.Btime,
 		WindowsAttributes: a.WindowsAttributes,
+		Atime:             a.Atime,
+		Mtime:             a.Mtime,
 	}
 }
 

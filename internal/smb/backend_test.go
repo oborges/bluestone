@@ -477,3 +477,51 @@ func TestSMBTruncateShrinksFile(t *testing.T) {
 		t.Fatalf("content after truncate = %q, want %q", got, "the o")
 	}
 }
+
+// A modification time a client sets must stick, including on a file that is
+// still staged, and a later write must move it again.
+func TestSMBSetsModificationTime(t *testing.T) {
+	g := startGateway(t)
+
+	f, err := g.share.Create("timestamps.txt")
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	if _, err := f.Write([]byte("first")); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	want := time.Date(2021, 3, 4, 5, 6, 7, 0, time.UTC)
+	if err := g.share.Chtimes("timestamps.txt", want, want); err != nil {
+		t.Fatalf("Chtimes() error = %v", err)
+	}
+	info, err := g.share.Stat("timestamps.txt")
+	if err != nil {
+		t.Fatalf("Stat() error = %v", err)
+	}
+	if !info.ModTime().UTC().Equal(want) {
+		t.Fatalf("ModTime() = %v, want %v", info.ModTime().UTC(), want)
+	}
+
+	// Writing again moves the modification time off the value that was set.
+	again, err := g.share.OpenFile("timestamps.txt", os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("OpenFile() error = %v", err)
+	}
+	if _, err := again.WriteAt([]byte("second"), 0); err != nil {
+		t.Fatalf("WriteAt() error = %v", err)
+	}
+	if err := again.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	info, err = g.share.Stat("timestamps.txt")
+	if err != nil {
+		t.Fatalf("Stat() after write error = %v", err)
+	}
+	if info.ModTime().UTC().Equal(want) {
+		t.Fatal("writing left the modification time at the value set earlier")
+	}
+}
