@@ -203,13 +203,15 @@ change.
   in the staging sidecar, so crash recovery and staged renames keep them.
 - COS listings do not return object metadata. Directory listings reuse
   attributes cached from a recent stat when the listed size and modification
-  time still match, and report defaults otherwise.
+  time still match, and report defaults otherwise. A listing served from cache
+  picks up attributes a stat recorded after it was cached, so a listing does
+  not keep reporting defaults for the rest of its lifetime.
 - A modification time a client sets (`utimes`, or Windows setting the write
   time) is stored in object metadata and reported back by stat, instead of the
   object's own last-modified, which COS rewrites on every upload. Writing to
-  the file moves the modification time again. Directory listings still report
-  the object's last-modified unless an earlier stat cached the file's
-  attributes, because COS listings carry no user metadata.
+  the file moves the modification time again. A directory listing reports the
+  object's last-modified until something stats the file; from then on listings
+  report what the stat found.
 - Creation time (`btime`) and Windows attribute flags (`windows-attributes`:
   read-only, hidden, system, archive) are stored and preserved the same way,
   including through sync uploads. Files the gateway creates record their

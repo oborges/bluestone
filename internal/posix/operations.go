@@ -455,6 +455,30 @@ func objectModTime(info os.FileInfo) time.Time {
 	return info.ModTime()
 }
 
+// refreshCachedEntries replaces listing entries with what an earlier stat
+// cached for the same file, so a listing reports the attributes and
+// modification time a stat would report.
+func (h *OperationsHandler) refreshCachedEntries(dirPath string, entries []*FileInfo) []*FileInfo {
+	parent := NormalizePath(dirPath)
+	for i, entry := range entries {
+		cached, ok := h.metadataCache.Get(JoinPath(parent, entry.Name()))
+		if !ok || cached.Negative || cached.Attributes == nil || cached.FileInfo == nil {
+			continue
+		}
+		stated, ok := cached.FileInfo.(*FileInfo)
+		if !ok || stated.IsDir() != entry.IsDir() {
+			continue
+		}
+		// Only when it still describes the same object.
+		if !entry.IsDir() && (stated.Size() != entry.Size() ||
+			!objectModTime(stated).Truncate(time.Second).Equal(objectModTime(entry).Truncate(time.Second))) {
+			continue
+		}
+		entries[i] = stated
+	}
+	return entries
+}
+
 // cachedEntry returns the attributes and reported modification time an earlier
 // Stat cached for path, when they still describe the listed object (same kind,
 // and for files the same size and object modification time). COS listings
@@ -970,8 +994,10 @@ func (h *OperationsHandler) ListDirectory(ctx context.Context, path string) (_ [
 			}
 		}
 
-		// O(1) cache hit - no per-file Stat() calls!
-		return entries, nil
+		// A listing is often cached before anything stats the files in it, and
+		// COS listings carry no user metadata, so pick up attributes a later
+		// stat recorded. These are cache lookups, not COS calls.
+		return h.refreshCachedEntries(path, entries), nil
 	}
 
 	// DEPRECATED: Old cache format with just names (fallback for compatibility)
