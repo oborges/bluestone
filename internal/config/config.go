@@ -51,6 +51,10 @@ type SMBConfig struct {
 	Domain string `mapstructure:"domain"`
 	// EncryptionRequired rejects sessions that do not encrypt traffic.
 	EncryptionRequired bool `mapstructure:"encryption_required"`
+	// ConcurrentRequests bounds how many reads and writes one connection
+	// handles at once. 0 selects the built-in default (64); 1 handles every
+	// request in turn.
+	ConcurrentRequests int `mapstructure:"concurrent_requests"`
 	// Users are the accounts allowed to connect, authenticated with NTLM.
 	Users []SMBUser `mapstructure:"users"`
 }
@@ -349,6 +353,7 @@ func bindEnvOverrides(v *viper.Viper) error {
 		"smb.share_name",
 		"smb.domain",
 		"smb.encryption_required",
+		"smb.concurrent_requests",
 	}
 
 	for _, key := range keys {
@@ -497,6 +502,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("smb.share_name", "bluestone")
 	v.SetDefault("smb.domain", "BLUESTONE")
 	v.SetDefault("smb.encryption_required", false)
+	v.SetDefault("smb.concurrent_requests", 0)
 }
 
 // GetReadTimeout returns the parsed read timeout duration

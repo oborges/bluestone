@@ -83,6 +83,9 @@ func validateSMB(config *SMBConfig) error {
 	if strings.TrimSpace(config.Domain) == "" {
 		return fmt.Errorf("domain must not be empty")
 	}
+	if config.ConcurrentRequests < 0 {
+		return fmt.Errorf("invalid concurrent_requests: %d (must be 0 or more)", config.ConcurrentRequests)
+	}
 	if len(config.Users) == 0 {
 		return fmt.Errorf("at least one user is required when enabled")
 	}

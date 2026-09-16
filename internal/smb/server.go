@@ -51,6 +51,10 @@ type ServerOptions struct {
 	// lock taken over SMB conflicts with one taken over NFS; nil leaves the
 	// SMB server with a table of its own.
 	Locks *lock.Manager
+	// ConcurrentRequests bounds how many reads and writes one connection
+	// handles at once. 0 selects the library default; 1 handles every request
+	// in turn.
+	ConcurrentRequests int
 	// Logger receives server logs; nil discards them.
 	Logger *zap.Logger
 }
@@ -98,6 +102,9 @@ func NewServer(fs *vfs.Filesystem, opts ServerOptions) (*Server, error) {
 	}
 	if opts.Locks != nil {
 		serverOpts = append(serverOpts, server.WithLocker(NewLocker(opts.Locks)))
+	}
+	if opts.ConcurrentRequests > 0 {
+		serverOpts = append(serverOpts, server.WithMaxConcurrentRequests(opts.ConcurrentRequests))
 	}
 	srv, err := server.New(serverOpts...)
 	if err != nil {

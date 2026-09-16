@@ -336,6 +336,7 @@ func main() {
 			EncryptionRequired: cfg.SMB.EncryptionRequired,
 			Opens:              opens,
 			Locks:              locks,
+			ConcurrentRequests: cfg.SMB.ConcurrentRequests,
 			Logger:             zapLogger,
 		})
 		if err != nil {

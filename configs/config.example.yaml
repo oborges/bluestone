@@ -105,6 +105,9 @@ smb:
   share_name: "bluestone"   # clients connect to \\<host>\bluestone
   domain: "BLUESTONE"
   encryption_required: false
+  # Reads and writes handled at once per connection. 0 (default) uses the
+  # built-in value (64); 1 handles every request in turn, as an escape hatch.
+  concurrent_requests: 0
   # users:
   #   - username: "alice"
   #     password: "change-me"
