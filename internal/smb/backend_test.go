@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -419,5 +420,60 @@ func TestSMBServerStopClosesOpenSessions(t *testing.T) {
 func TestNewServerRequiresUsers(t *testing.T) {
 	if _, err := NewServer(nil, ServerOptions{Address: "127.0.0.1:0", ShareName: "share", Domain: "BLUESTONE"}); err == nil {
 		t.Fatal("NewServer() without users succeeded")
+	}
+}
+
+// A directory larger than one response must be listed completely: the server
+// pages through it across several requests.
+func TestSMBListsLargeDirectoryCompletely(t *testing.T) {
+	g := startGateway(t)
+
+	const count = 120
+	want := make(map[string]bool, count)
+	for i := range count {
+		name := fmt.Sprintf("file-%03d-with-a-reasonably-long-name.txt", i)
+		g.store.put("bulk/"+name, []byte("x"))
+		want[name] = true
+	}
+
+	entries, err := g.share.ReadDir("bulk")
+	if err != nil {
+		t.Fatalf("ReadDir(bulk) error = %v", err)
+	}
+	for _, entry := range entries {
+		delete(want, entry.Name())
+	}
+	if len(entries) != count || len(want) != 0 {
+		t.Fatalf("ReadDir(bulk) returned %d of %d entries; %d missing", len(entries), count, len(want))
+	}
+}
+
+// Shrinking a file through SMB must drop the old tail, not leave it behind.
+func TestSMBTruncateShrinksFile(t *testing.T) {
+	g := startGateway(t)
+
+	f, err := g.share.Create("shrink.txt")
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	if _, err := f.Write([]byte("the original, rather long content")); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	if err := f.Truncate(5); err != nil {
+		t.Fatalf("Truncate() error = %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	info, err := g.share.Stat("shrink.txt")
+	if err != nil {
+		t.Fatalf("Stat() error = %v", err)
+	}
+	if info.Size() != 5 {
+		t.Fatalf("size after truncate = %d, want 5", info.Size())
+	}
+	if got := g.readFile(t, "shrink.txt"); got != "the o" {
+		t.Fatalf("content after truncate = %q, want %q", got, "the o")
 	}
 }
