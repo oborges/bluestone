@@ -84,6 +84,31 @@ proposed upstream.
   position, mode, accepted as no-ops). Windows failed writes with
   STATUS_NOT_SUPPORTED without them.
 
+- `smb/server`: FILE_FS_VOLUME_INFORMATION puts the volume label at its real
+  offset (18) and sizes the buffer to match. Upstream's response was two
+  bytes short with the label misplaced, and Windows answered later requests
+  on that share with "the specified server cannot perform the requested
+  operation".
+
+- `smb/server`: QUERY_DIRECTORY pages through a directory across calls and
+  honours SMB2_RETURN_SINGLE_ENTRY. Upstream answered the first call with
+  everything it could fit and reported "no more files" afterwards, so a
+  client that asks one entry at a time (Windows does) saw only the first
+  entry of every directory, and large directories were silently truncated.
+
+- `smb/server`: CREATE grants no oplock. Upstream granted whatever level the
+  client asked for, including exclusive and batch, without implementing
+  breaks, so Windows cached file contents and wrote stale buffers back:
+  PowerShell's Set-Content appended to files instead of replacing them.
+  Re-grant them only together with working oplock or lease breaks.
+
+- `smb/server`: SET_INFO FileAllocationInformation truncates the file when
+  the requested allocation is smaller than it (MS-FSCC section 2.4.4).
+  Windows relies on this: PowerShell's Set-Content empties a file this way
+  before writing, and treating it as a no-op silently appended to the old
+  contents instead of replacing them. CreateAction also reports
+  FILE_SUPERSEDED and FILE_OVERWRITTEN for the dispositions that mean them.
+
 ## Known gaps to close in Bluestone
 
 - Requests on a connection are handled one at a time.
