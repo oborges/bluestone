@@ -47,6 +47,10 @@ type ServerOptions struct {
 	// gateway's table to share it with other protocols; nil gets one of its
 	// own, which still covers every SMB client of this server.
 	Opens *lock.ShareTable
+	// Locks is the byte-range lock table. Pass the gateway's table so that a
+	// lock taken over SMB conflicts with one taken over NFS; nil leaves the
+	// SMB server with a table of its own.
+	Locks *lock.Manager
 	// Logger receives server logs; nil discards them.
 	Logger *zap.Logger
 }
@@ -91,6 +95,9 @@ func NewServer(fs *vfs.Filesystem, opts ServerOptions) (*Server, error) {
 	}
 	if opts.EncryptionRequired {
 		serverOpts = append(serverOpts, server.WithEncryptionRequired())
+	}
+	if opts.Locks != nil {
+		serverOpts = append(serverOpts, server.WithLocker(NewLocker(opts.Locks)))
 	}
 	srv, err := server.New(serverOpts...)
 	if err != nil {

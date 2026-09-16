@@ -118,7 +118,28 @@ proposed upstream.
   STATUS_SHARING_VIOLATION. Upstream parsed share modes and discarded them,
   so no open ever conflicted with another.
 
+- `smb/wire`: LOCK request elements are read from offset 24, where they
+  belong (StructureSize 48 counts the 24-byte fixed part plus the first
+  element). Upstream read them from offset 48, so every real client's LOCK
+  was rejected with STATUS_INVALID_PARAMETER; its end-to-end test passed only
+  because the test built requests in the same wrong shape, which was
+  corrected too.
+- `smb/vfs` + `smb/server`: byte-range locks go through a
+  `vfs.ByteRangeLocker` the application can supply (`server.WithLocker`), so
+  they can share a table with other protocols. The built-in table now records
+  each lock's owner, so a handle's locks are released when it closes and a
+  holder no longer conflicts with itself; previously locks lived per tree
+  connect, were never released, and an unlock removed any matching range
+  regardless of who held it. A refused lock answers STATUS_LOCK_NOT_GRANTED,
+  as MS-SMB2 section 3.3.5.14 specifies (upstream answered
+  STATUS_FILE_LOCK_CONFLICT, which is the status for a read or write that
+  hits a lock); the upstream end-to-end test was updated to match.
+
 ## Known gaps to close in Bluestone
+
+- Blocking byte-range locks: a lock that cannot be granted is refused even
+  when the client did not set SMB2_LOCKFLAG_FAIL_IMMEDIATELY, instead of
+  waiting for the conflicting lock to be released.
 
 - Requests on a connection are handled one at a time.
 - CREATE share access is parsed but not enforced (no sharing violations).
