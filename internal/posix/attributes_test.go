@@ -335,3 +335,50 @@ func TestStoredModificationTimeIsReported(t *testing.T) {
 		t.Fatalf("listed plain ModTime() = %v, want %v", got, uploaded)
 	}
 }
+
+// A listing is usually cached before anything stats the files in it, and COS
+// listings carry no user metadata. Once a stat has recorded a file's
+// attributes, later listings must report them rather than the object's own
+// upload time.
+func TestCachedListingPicksUpAttributesFromLaterStat(t *testing.T) {
+	ctx := context.Background()
+	store := newFakeObjectStore()
+	uploaded := time.Unix(1_700_000_000, 0).UTC()
+	store.put("dir/stamped.txt", []byte("data"), uploaded)
+	wanted := time.Date(2021, 3, 4, 5, 6, 7, 0, time.UTC)
+	setObjectMetadata(store, "dir/stamped.txt", EncodePOSIXAttributes(&types.POSIXAttributes{
+		Mode:  0640,
+		Mtime: wanted,
+	}))
+	store.omitListingMetadata()
+	ops := newAttributeTestOps(store)
+
+	// The listing happens first, so it can only report the upload time.
+	entries, err := ops.ListDirectory(ctx, "/dir")
+	if err != nil {
+		t.Fatalf("ListDirectory() error = %v", err)
+	}
+	if len(entries) != 1 || !entries[0].ModTime().Equal(uploaded) {
+		t.Fatalf("first listing = %v, want the upload time %v", entries, uploaded)
+	}
+
+	// A stat records the stored attributes.
+	if _, err := ops.Stat(ctx, "/dir/stamped.txt"); err != nil {
+		t.Fatalf("Stat() error = %v", err)
+	}
+
+	// The listing is still cached, and must now report what the stat found.
+	entries, err = ops.ListDirectory(ctx, "/dir")
+	if err != nil {
+		t.Fatalf("second ListDirectory() error = %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("second listing returned %d entries, want 1", len(entries))
+	}
+	if got := entries[0].ModTime(); !got.Equal(wanted) {
+		t.Fatalf("listed ModTime() = %v, want the time a client set %v", got, wanted)
+	}
+	if got := entries[0].Attributes().Mode; got != 0640 {
+		t.Fatalf("listed mode = %v, want the stored 0640", got)
+	}
+}
