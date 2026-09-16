@@ -92,3 +92,9 @@ docs/STRESS_TESTING_GUIDE.md
 
 # Remote benchmark run artifacts (kept locally, not versioned)
 remote-test-results-*/
+
+# Local credentials and machine access for testing (never commit)
+configs/coscred.json
+configs/rdppass.txt
+configs/*.pem
+configs/*.key
