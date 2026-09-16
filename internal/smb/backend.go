@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/go-git/go-billy/v5"
+	"github.com/oborges/bluestone/internal/lock"
 	"github.com/oborges/bluestone/internal/posix"
 	"github.com/oborges/bluestone/internal/vfs"
 	smbvfs "github.com/sonroyaalmerol/go-smb-server/smb/vfs"
@@ -25,12 +26,81 @@ import (
 // with Windows naming (vfs.Filesystem.WithWindowsNames), labelled for SMB
 // metrics, so names behave as SMB clients expect.
 type Backend struct {
-	fs *vfs.Filesystem
+	fs    *vfs.Filesystem
+	opens *lock.ShareTable
 }
 
-// NewBackend returns an SMB share backend over fs.
-func NewBackend(fs *vfs.Filesystem) *Backend {
-	return &Backend{fs: fs}
+// NewBackend returns an SMB share backend over fs. Opens are recorded in the
+// share table, so a client that opens a file without sharing it blocks other
+// clients until it closes; a nil table gets one of its own.
+func NewBackend(fs *vfs.Filesystem, opens *lock.ShareTable) *Backend {
+	if opens == nil {
+		opens = lock.NewShareTable(lock.ShareOptions{})
+	}
+	return &Backend{fs: fs, opens: opens}
+}
+
+// SMB access bits an open can ask for (MS-SMB2 section 2.2.13).
+const (
+	accessReadData     uint32 = 0x00000001
+	accessWriteData    uint32 = 0x00000002
+	accessAppendData   uint32 = 0x00000004
+	accessExecute      uint32 = 0x00000020
+	accessDelete       uint32 = 0x00010000
+	accessGenericAll   uint32 = 0x10000000
+	accessGenericExec  uint32 = 0x20000000
+	accessGenericWrite uint32 = 0x40000000
+	accessGenericRead  uint32 = 0x80000000
+	shareAccessRead    uint32 = 0x00000001
+	shareAccessWrite   uint32 = 0x00000002
+	shareAccessDelete  uint32 = 0x00000004
+)
+
+// requestedAccess reduces an SMB desired access mask to the file uses share
+// modes are decided on. Opens that only touch metadata need nothing.
+func requestedAccess(desired uint32, deleteOnClose bool) lock.Access {
+	var access lock.Access
+	if desired&(accessReadData|accessExecute|accessGenericRead|accessGenericExec|accessGenericAll) != 0 {
+		access |= lock.AccessRead
+	}
+	if desired&(accessWriteData|accessAppendData|accessGenericWrite|accessGenericAll) != 0 {
+		access |= lock.AccessWrite
+	}
+	if desired&(accessDelete|accessGenericAll) != 0 || deleteOnClose {
+		access |= lock.AccessDelete
+	}
+	return access
+}
+
+// permittedAccess reduces an SMB share access mask to what the open lets
+// other opens do.
+func permittedAccess(share uint32) lock.Access {
+	var permitted lock.Access
+	if share&shareAccessRead != 0 {
+		permitted |= lock.AccessRead
+	}
+	if share&shareAccessWrite != 0 {
+		permitted |= lock.AccessWrite
+	}
+	if share&shareAccessDelete != 0 {
+		permitted |= lock.AccessDelete
+	}
+	return permitted
+}
+
+// reserve records the open in the share table, reporting a conflict in the
+// form the SMB server turns into STATUS_SHARING_VIOLATION.
+func (b *Backend) reserve(path string, opts smbvfs.OpenOptions) (*lock.ShareHandle, error) {
+	reservation, err := b.opens.Acquire(path,
+		requestedAccess(opts.DesiredAccess, opts.DeleteOnClose),
+		permittedAccess(opts.ShareAccess))
+	switch {
+	case errors.Is(err, lock.ErrSharingViolation):
+		return nil, smbvfs.ErrSharingViolation
+	case err != nil:
+		return nil, err
+	}
+	return reservation, nil
 }
 
 var (
@@ -53,6 +123,23 @@ func (b *Backend) Open(_ context.Context, opts smbvfs.OpenOptions) (smbvfs.Handl
 	exists := err == nil
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return nil, err
+	}
+
+	// Directories are not reserved: clients open them constantly to list and
+	// look up names, and share modes there would only produce false
+	// conflicts.
+	var reservation *lock.ShareHandle
+	if !opts.CreateDir && !(exists && info.IsDir()) {
+		reservation, err = b.reserve(p, opts)
+		if err != nil {
+			return nil, err
+		}
+		defer func() {
+			// Released unless a handle takes it over.
+			if reservation != nil {
+				reservation.Release()
+			}
+		}()
 	}
 
 	if opts.CreateDir {
@@ -78,32 +165,43 @@ func (b *Backend) Open(_ context.Context, opts smbvfs.OpenOptions) (smbvfs.Handl
 		return nil, fs.ErrExist
 	}
 
-	switch opts.Disposition {
-	case smbvfs.DispositionOpen:
-		if !exists {
-			return nil, fs.ErrNotExist
-		}
-		return &handle{fs: b.fs, path: p}, nil
-	case smbvfs.DispositionOpenIf:
-		if exists {
+	opened, err := func() (smbvfs.Handle, error) {
+		switch opts.Disposition {
+		case smbvfs.DispositionOpen:
+			if !exists {
+				return nil, fs.ErrNotExist
+			}
 			return &handle{fs: b.fs, path: p}, nil
+		case smbvfs.DispositionOpenIf:
+			if exists {
+				return &handle{fs: b.fs, path: p}, nil
+			}
+			return b.openWritable(p, os.O_RDWR|os.O_CREATE|os.O_TRUNC)
+		case smbvfs.DispositionCreate:
+			if exists {
+				return nil, fs.ErrExist
+			}
+			return b.openWritable(p, os.O_RDWR|os.O_CREATE|os.O_TRUNC)
+		case smbvfs.DispositionOverwrite:
+			if !exists {
+				return nil, fs.ErrNotExist
+			}
+			return b.openWritable(p, os.O_RDWR|os.O_TRUNC)
+		case smbvfs.DispositionSupersede, smbvfs.DispositionOverwriteIf:
+			return b.openWritable(p, os.O_RDWR|os.O_CREATE|os.O_TRUNC)
+		default:
+			return nil, fs.ErrInvalid
 		}
-		return b.openWritable(p, os.O_RDWR|os.O_CREATE|os.O_TRUNC)
-	case smbvfs.DispositionCreate:
-		if exists {
-			return nil, fs.ErrExist
-		}
-		return b.openWritable(p, os.O_RDWR|os.O_CREATE|os.O_TRUNC)
-	case smbvfs.DispositionOverwrite:
-		if !exists {
-			return nil, fs.ErrNotExist
-		}
-		return b.openWritable(p, os.O_RDWR|os.O_TRUNC)
-	case smbvfs.DispositionSupersede, smbvfs.DispositionOverwriteIf:
-		return b.openWritable(p, os.O_RDWR|os.O_CREATE|os.O_TRUNC)
-	default:
-		return nil, fs.ErrInvalid
+	}()
+	if err != nil {
+		return nil, err
 	}
+	if h, ok := opened.(*handle); ok {
+		h.reservation = reservation
+		h.opens = b.opens
+		reservation = nil // the handle releases it on close
+	}
+	return opened, nil
 }
 
 // openWritable opens a file for writing immediately; used when the CREATE
@@ -134,6 +232,10 @@ type handle struct {
 	path     string
 	file     billy.File
 	writable bool
+	// reservation is this open's entry in the share table, released when the
+	// handle closes; opens is where a rename moves it.
+	reservation *lock.ShareHandle
+	opens       *lock.ShareTable
 }
 
 // fileFor returns the open file, reopening it read-write when write is set
@@ -188,6 +290,8 @@ func (h *handle) Write(_ context.Context, offset int64, p []byte) (int, error) {
 func (h *handle) Close(_ context.Context) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	h.reservation.Release()
+	h.reservation = nil
 	if h.file == nil {
 		return nil
 	}
@@ -293,6 +397,9 @@ func (h *handle) Rename(_ context.Context, newPath string, replaceIfExists bool)
 	}
 	if err := h.fs.Rename(h.path, target); err != nil {
 		return err
+	}
+	if h.opens != nil {
+		h.opens.Rename(h.path, target)
 	}
 	h.path = target
 	return nil

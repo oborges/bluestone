@@ -112,6 +112,12 @@ proposed upstream.
 - `smb/server`: added FileAlternateNameInformation (the 8.3 name Windows asks
   for; the name itself is returned, since no aliases are kept).
 
+- `smb/vfs` + `smb/server`: CREATE passes the client's DesiredAccess,
+  ShareAccess and delete-on-close flag to the backend, and a backend that
+  answers `vfs.ErrSharingViolation` reaches the client as
+  STATUS_SHARING_VIOLATION. Upstream parsed share modes and discarded them,
+  so no open ever conflicted with another.
+
 ## Known gaps to close in Bluestone
 
 - Requests on a connection are handled one at a time.

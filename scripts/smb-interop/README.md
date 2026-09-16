@@ -34,3 +34,7 @@ ssh gateway 'sudo sed -n "s/^ *password: \"\(.*\)\"$/\1/p" /etc/bluestone/config
 - `windows-overwrite-test.ps1` checks that overwriting an existing file
   replaces its contents rather than appending to them, through several
   different Windows write paths.
+- `windows-sharemode-test.ps1` checks share modes: a file held with
+  `FileShare.None` blocks other opens, one held with `FileShare.Read` admits
+  readers but not writers, and listing a directory still works while a file
+  in it is held exclusively.

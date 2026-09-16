@@ -142,6 +142,10 @@ func main() {
 	// Byte-range lock table shared by every file protocol server
 	locks := lock.NewManager(lock.Options{})
 
+	// Open files and what each open lets others do, so an SMB client that
+	// opens a file exclusively conflicts with every other open of it.
+	opens := lock.NewShareTable(lock.ShareOptions{})
+
 	// Initialize metrics
 	metrics.Initialize()
 	if cfg.Server.MetricsEnabled {
@@ -330,6 +334,7 @@ func main() {
 			Users:              users,
 			AllowedClients:     cfg.Server.AllowedClients,
 			EncryptionRequired: cfg.SMB.EncryptionRequired,
+			Opens:              opens,
 			Logger:             zapLogger,
 		})
 		if err != nil {

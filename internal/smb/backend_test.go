@@ -18,12 +18,14 @@ import (
 	"github.com/oborges/bluestone/internal/cache"
 	"github.com/oborges/bluestone/internal/config"
 	"github.com/oborges/bluestone/internal/feature"
+	"github.com/oborges/bluestone/internal/lock"
 	"github.com/oborges/bluestone/internal/logging"
 	"github.com/oborges/bluestone/internal/metrics"
 	"github.com/oborges/bluestone/internal/posix"
 	"github.com/oborges/bluestone/internal/staging"
 	"github.com/oborges/bluestone/internal/vfs"
 	"github.com/oborges/bluestone/pkg/types"
+	smbvfs "github.com/sonroyaalmerol/go-smb-server/smb/vfs"
 	"go.uber.org/zap"
 )
 
@@ -146,10 +148,11 @@ func (s *memStore) UpdateObjectMetadata(_ context.Context, key string, metadata 
 }
 
 type testGateway struct {
-	store   *memStore
-	manager *staging.StagingManager
-	server  *Server
-	share   *client.Share
+	store      *memStore
+	manager    *staging.StagingManager
+	server     *Server
+	share      *client.Share
+	filesystem *vfs.Filesystem
 }
 
 // startGateway serves a staging-backed filesystem over SMB on a local port.
@@ -211,7 +214,7 @@ func startGateway(t *testing.T, configure ...func(*ServerOptions)) *testGateway 
 	}
 	t.Cleanup(func() { _ = srv.Stop() })
 
-	g := &testGateway{store: store, manager: manager, server: srv}
+	g := &testGateway{store: store, manager: manager, server: srv, filesystem: filesystem}
 	if len(configure) == 0 {
 		g.share, err = g.mount(t, "alice", "secret", "BLUESTONE")
 		if err != nil {
@@ -523,5 +526,113 @@ func TestSMBSetsModificationTime(t *testing.T) {
 	}
 	if info.ModTime().UTC().Equal(want) {
 		t.Fatal("writing left the modification time at the value set earlier")
+	}
+}
+
+// openOptions is a CREATE the way a client sends it, with the access it wants
+// and what it lets other opens do.
+func openOptions(path string, disposition uint32, desired, share uint32) smbvfs.OpenOptions {
+	return smbvfs.OpenOptions{
+		Path:          path,
+		Disposition:   disposition,
+		DesiredAccess: desired,
+		ShareAccess:   share,
+	}
+}
+
+// A client that opens a file without sharing it blocks other opens until it
+// closes, which is what stops two editors writing over each other.
+func TestSMBShareModesRefuseConflictingOpens(t *testing.T) {
+	g := startGateway(t)
+	ctx := context.Background()
+	backend := NewBackend(g.filesystem, lock.NewShareTable(lock.ShareOptions{}))
+
+	const shareNothing = 0
+	const shareAll = 0x1 | 0x2 | 0x4
+	exclusive, err := backend.Open(ctx, openOptions("exclusive.txt", smbvfs.DispositionCreate, 0x2, shareNothing))
+	if err != nil {
+		t.Fatalf("first Open() error = %v", err)
+	}
+
+	if _, err := backend.Open(ctx, openOptions("exclusive.txt", smbvfs.DispositionOpen, 0x1, shareAll)); !errors.Is(err, smbvfs.ErrSharingViolation) {
+		t.Fatalf("second Open() error = %v, want a sharing violation", err)
+	}
+	// A different file is unaffected.
+	other, err := backend.Open(ctx, openOptions("other.txt", smbvfs.DispositionCreate, 0x2, shareNothing))
+	if err != nil {
+		t.Fatalf("Open(other file) error = %v", err)
+	}
+	if err := other.Close(ctx); err != nil {
+		t.Fatalf("Close(other) error = %v", err)
+	}
+
+	if err := exclusive.Close(ctx); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	reopened, err := backend.Open(ctx, openOptions("exclusive.txt", smbvfs.DispositionOpen, 0x1, shareAll))
+	if err != nil {
+		t.Fatalf("Open() after close error = %v", err)
+	}
+	if err := reopened.Close(ctx); err != nil {
+		t.Fatalf("Close(reopened) error = %v", err)
+	}
+}
+
+// Opens that permit each other coexist, and listing a directory never
+// conflicts with a file open inside it.
+func TestSMBShareModesAllowCompatibleOpens(t *testing.T) {
+	g := startGateway(t)
+	ctx := context.Background()
+	backend := NewBackend(g.filesystem, lock.NewShareTable(lock.ShareOptions{}))
+	g.store.put("shared/report.txt", []byte("content"))
+
+	const shareAll = 0x1 | 0x2 | 0x4
+	first, err := backend.Open(ctx, openOptions(`shared\report.txt`, smbvfs.DispositionOpen, 0x1, shareAll))
+	if err != nil {
+		t.Fatalf("first Open() error = %v", err)
+	}
+	second, err := backend.Open(ctx, openOptions(`shared\report.txt`, smbvfs.DispositionOpen, 0x1, shareAll))
+	if err != nil {
+		t.Fatalf("second Open() error = %v, want both readers admitted", err)
+	}
+	directory, err := backend.Open(ctx, smbvfs.OpenOptions{Path: "shared", Disposition: smbvfs.DispositionOpen, CreateDir: true})
+	if err != nil {
+		t.Fatalf("Open(directory) error = %v", err)
+	}
+
+	for _, h := range []smbvfs.Handle{first, second, directory} {
+		if err := h.Close(ctx); err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+	}
+}
+
+// A file that was renamed while open keeps its share state under the new name.
+func TestSMBShareModesFollowRenames(t *testing.T) {
+	g := startGateway(t)
+	ctx := context.Background()
+	opens := lock.NewShareTable(lock.ShareOptions{})
+	backend := NewBackend(g.filesystem, opens)
+
+	held, err := backend.Open(ctx, openOptions("before.txt", smbvfs.DispositionCreate, 0x2, 0))
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	renamer, ok := held.(smbvfs.Renamer)
+	if !ok {
+		t.Fatal("the handle cannot rename")
+	}
+	if err := renamer.Rename(ctx, "after.txt", false); err != nil {
+		t.Fatalf("Rename() error = %v", err)
+	}
+
+	if _, err := backend.Open(ctx, openOptions("after.txt", smbvfs.DispositionOpen, 0x1, 0x1|0x2|0x4)); !errors.Is(err, smbvfs.ErrSharingViolation) {
+		t.Fatalf("Open(new name) error = %v, want the open to still conflict", err)
+	}
+	if err := held.Close(ctx); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if opens := opens.Opens("/after.txt"); len(opens) != 0 {
+		t.Fatalf("Opens() = %v, want none left", opens)
 	}
 }

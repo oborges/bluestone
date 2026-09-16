@@ -246,6 +246,19 @@ write access they often never use. Set-info requests map to truncate and
 `SetAttributes` (creation, write, and access times, Windows attributes).
 Connections outside `server.allowed_clients` are dropped at accept.
 
+### Share Modes
+
+`internal/lock` holds the table of open files alongside the byte-range lock
+table: each open records what it needs (read, write, delete) and what it
+permits other opens. An open is refused when it and an existing open of the
+same file do not permit each other, which reaches an SMB client as
+STATUS_SHARING_VIOLATION. The table is protocol-neutral, so NFSv4 share
+reservations can use it, and it lives in the gateway rather than in a
+connection, so opens conflict across all clients. Directories are not
+reserved: clients open them constantly to list and look up names, and share
+modes there would only produce false conflicts. A rename carries an open's
+reservation to the new name.
+
 ### Object-Side Refresh Path
 
 Direct changes made in COS by tools outside the gateway are discovered in two
