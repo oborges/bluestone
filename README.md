@@ -253,12 +253,18 @@ attributes and creation times, the write-temp-then-rename pattern that Office
 and many editors use, renames, and deletes. Scripts for repeating these checks
 are in `scripts/smb-interop/`.
 
+Share modes are enforced: a client that opens a file without sharing it, as
+editors and Office do while a document is open, makes other clients' opens
+fail with a sharing violation until it closes. The table of open files lives
+in the gateway, so opens conflict across all SMB clients; NFS does not take
+part in it yet.
+
 No oplocks or leases are granted, so clients do not cache file contents
 locally and write through to the gateway. That keeps SMB clients consistent
 with NFS clients and with changes made directly in the bucket, at the cost of
-some client-side caching performance. Also not supported yet: share modes
-(sharing violations), alternate data streams, and security descriptors.
-Signing uses AES-CMAC and encryption AES-128-CCM.
+some client-side caching performance. Also not supported yet: alternate data
+streams and security descriptors. Signing uses AES-CMAC and encryption
+AES-128-CCM.
 
 ### Staging And Async Sync
 

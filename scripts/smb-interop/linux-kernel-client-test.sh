@@ -13,6 +13,8 @@ if ! sudo -n mount -t cifs "//${SERVER:-127.0.0.1}/bluestone" "$MNT" -o "usernam
   echo "MOUNT FAILED:"; cat /tmp/mounterr; exit 1
 fi
 echo "mounted"
+mkdir -p "$MNT/smbtest"
+
 echo "=== ls -la mount root"
 ls -la "$MNT" | head
 echo "=== ls empty vs populated dir"

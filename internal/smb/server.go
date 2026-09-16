@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 
 	"github.com/oborges/bluestone/internal/config"
+	"github.com/oborges/bluestone/internal/lock"
 	"github.com/oborges/bluestone/internal/vfs"
 	"github.com/sonroyaalmerol/go-smb-server/smb/ntlmssp"
 	"github.com/sonroyaalmerol/go-smb-server/smb/server"
@@ -42,6 +43,10 @@ type ServerOptions struct {
 	AllowedClients []string
 	// EncryptionRequired rejects sessions that do not encrypt traffic.
 	EncryptionRequired bool
+	// Opens is the share-mode table recording which files are open. Pass the
+	// gateway's table to share it with other protocols; nil gets one of its
+	// own, which still covers every SMB client of this server.
+	Opens *lock.ShareTable
 	// Logger receives server logs; nil discards them.
 	Logger *zap.Logger
 }
@@ -80,7 +85,7 @@ func NewServer(fs *vfs.Filesystem, opts ServerOptions) (*Server, error) {
 	}
 
 	serverOpts := []server.Option{
-		server.WithShares(smbvfs.NewDiskShare(opts.ShareName, NewBackend(fs))),
+		server.WithShares(smbvfs.NewDiskShare(opts.ShareName, NewBackend(fs, opts.Opens))),
 		server.WithAuth(ntlmssp.NewServer(newCredentials(opts.Users), opts.Domain)),
 		server.WithLogger(slog.New(zapHandler{logger: logger})),
 	}
