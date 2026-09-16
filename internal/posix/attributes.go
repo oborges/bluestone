@@ -86,6 +86,22 @@ func EncodePOSIXAttributes(attrs *types.POSIXAttributes) map[string]string {
 	return metadata
 }
 
+// StoredMtime returns the modification time recorded in an object's metadata
+// and whether one is recorded at all. Decoding fills a missing modification
+// time with a default, so callers that must tell "a client set this" from
+// "nothing was stored" ask here.
+func StoredMtime(metadata map[string]string) (time.Time, bool) {
+	value, ok := metaValue(metadata, MetaKeyMtime)
+	if !ok {
+		return time.Time{}, false
+	}
+	t, err := time.Parse(time.RFC3339, value)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return t, true
+}
+
 // DecodePOSIXAttributes decodes POSIX attributes from COS metadata. Keys match
 // case-insensitively, and attributes stored under legacy keys still decode.
 func DecodePOSIXAttributes(metadata map[string]string, isDir bool) *types.POSIXAttributes {

@@ -286,3 +286,52 @@ func TestCreationTimeFallsBackToModificationTimeWithoutBeingStored(t *testing.T)
 		t.Fatalf("stored attributes = %+v, want btime %v, hidden, mode 600", decoded, btime)
 	}
 }
+
+// A modification time a client set is reported instead of the object's own
+// last-modified, which COS rewrites on every upload, and listings agree with
+// what a stat reported.
+func TestStoredModificationTimeIsReported(t *testing.T) {
+	ctx := context.Background()
+	store := newFakeObjectStore()
+	uploaded := time.Unix(1_700_000_000, 0).UTC()
+	store.put("dir/stamped.txt", []byte("data"), uploaded)
+	store.put("dir/plain.txt", []byte("data"), uploaded)
+	wanted := time.Date(2021, 3, 4, 5, 6, 7, 0, time.UTC)
+	setObjectMetadata(store, "dir/stamped.txt", EncodePOSIXAttributes(&types.POSIXAttributes{Mode: 0644, Mtime: wanted}))
+	// COS listings carry no user metadata, so the listing has to recover the
+	// time from what an earlier stat cached.
+	store.omitListingMetadata()
+	ops := newAttributeTestOps(store)
+
+	stamped, err := ops.Stat(ctx, "/dir/stamped.txt")
+	if err != nil {
+		t.Fatalf("Stat(stamped) error = %v", err)
+	}
+	if got := stamped.ModTime(); !got.Equal(wanted) {
+		t.Fatalf("stamped ModTime() = %v, want the stored %v", got, wanted)
+	}
+
+	// An object nobody stamped keeps reporting when it was last uploaded.
+	plain, err := ops.Stat(ctx, "/dir/plain.txt")
+	if err != nil {
+		t.Fatalf("Stat(plain) error = %v", err)
+	}
+	if got := plain.ModTime(); !got.Equal(uploaded) {
+		t.Fatalf("plain ModTime() = %v, want the upload time %v", got, uploaded)
+	}
+
+	entries, err := ops.ListDirectory(ctx, "/dir")
+	if err != nil {
+		t.Fatalf("ListDirectory() error = %v", err)
+	}
+	times := make(map[string]time.Time, len(entries))
+	for _, entry := range entries {
+		times[entry.Name()] = entry.ModTime()
+	}
+	if got := times["stamped.txt"]; !got.Equal(wanted) {
+		t.Fatalf("listed stamped ModTime() = %v, want %v", got, wanted)
+	}
+	if got := times["plain.txt"]; !got.Equal(uploaded) {
+		t.Fatalf("listed plain ModTime() = %v, want %v", got, uploaded)
+	}
+}

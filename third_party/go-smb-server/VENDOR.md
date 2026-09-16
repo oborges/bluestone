@@ -109,6 +109,9 @@ proposed upstream.
   contents instead of replacing them. CreateAction also reports
   FILE_SUPERSEDED and FILE_OVERWRITTEN for the dispositions that mean them.
 
+- `smb/server`: added FileAlternateNameInformation (the 8.3 name Windows asks
+  for; the name itself is returned, since no aliases are kept).
+
 ## Known gaps to close in Bluestone
 
 - Requests on a connection are handled one at a time.

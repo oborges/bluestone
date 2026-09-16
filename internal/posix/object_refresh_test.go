@@ -269,8 +269,10 @@ type fakeObjectStore struct {
 	objects      map[string]fakeObject
 	copyErrors   map[string]error
 	deleteErrors map[string]error
-	rangeCalls   int
-	headCalls    int
+	// omitListMetadata drops user metadata from listings, as COS does.
+	omitListMetadata bool
+	rangeCalls       int
+	headCalls        int
 }
 
 type fakeObject struct {
@@ -395,6 +397,14 @@ func (s *fakeObjectStore) HeadObject(_ context.Context, key string) (*types.Obje
 	}, nil
 }
 
+// omitListMetadata makes listings carry no user metadata, the way COS
+// ListObjectsV2 behaves. Tests that care about that path set it.
+func (s *fakeObjectStore) omitListingMetadata() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.omitListMetadata = true
+}
+
 func (s *fakeObjectStore) ListObjects(_ context.Context, prefix string, maxKeys int) ([]*types.ObjectMetadata, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -413,13 +423,17 @@ func (s *fakeObjectStore) ListObjects(_ context.Context, prefix string, maxKeys 
 	out := make([]*types.ObjectMetadata, 0, len(keys))
 	for _, key := range keys {
 		obj := s.objects[key]
-		out = append(out, &types.ObjectMetadata{
+		listed := &types.ObjectMetadata{
 			Key:          key,
 			Size:         int64(len(obj.data)),
 			LastModified: obj.lastModified,
 			ETag:         obj.etag,
 			Metadata:     copyStringMap(obj.metadata),
-		})
+		}
+		if s.omitListMetadata {
+			listed.Metadata = nil
+		}
+		out = append(out, listed)
 	}
 	return out, nil
 }

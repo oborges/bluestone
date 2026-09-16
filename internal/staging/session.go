@@ -31,6 +31,10 @@ type WriteSession struct {
 	// syncs with; read them through Attributes.
 	btime             time.Time
 	windowsAttributes uint32
+	// atime and mtime hold times a client set explicitly; a later write to
+	// the file clears mtime, so writing moves the modification time again.
+	atime time.Time
+	mtime time.Time
 	// attributesSet records that the attributes came from the staged object
 	// or a client rather than the new-session defaults.
 	attributesSet bool
@@ -112,6 +116,19 @@ func (ws *WriteSession) SetWindowsAttributes(flags uint32) {
 	ws.updateAttributes(func() { ws.windowsAttributes = flags })
 }
 
+// SetTimes changes the access and modification times the staged file syncs
+// with. Zero times are left alone, so a caller can set one without the other.
+func (ws *WriteSession) SetTimes(atime, mtime time.Time) {
+	ws.updateAttributes(func() {
+		if !atime.IsZero() {
+			ws.atime = atime
+		}
+		if !mtime.IsZero() {
+			ws.mtime = mtime
+		}
+	})
+}
+
 // SetBirthTimeIfUnset records the creation time of a file the gateway is
 // creating. Sessions that already have attributes, seeded from an existing
 // object or set by a client, keep theirs.
@@ -151,12 +168,15 @@ func (ws *WriteSession) attributesLocked() StagedAttributes {
 		GID:               ws.GID,
 		Btime:             ws.btime,
 		WindowsAttributes: ws.windowsAttributes,
+		Atime:             ws.atime,
+		Mtime:             ws.mtime,
 	}
 }
 
 func (ws *WriteSession) setAttributesLocked(attrs StagedAttributes) {
 	ws.Mode, ws.UID, ws.GID = attrs.Mode, attrs.UID, attrs.GID
 	ws.btime, ws.windowsAttributes = attrs.Btime, attrs.WindowsAttributes
+	ws.atime, ws.mtime = attrs.Atime, attrs.Mtime
 	ws.attributesSet = true
 }
 
@@ -230,6 +250,9 @@ func (ws *WriteSession) Write(data []byte, offset int64) (int, error) {
 	ws.Dirty = true
 	ws.LastWrite = now
 	ws.LastAccess = now
+	// Writing moves the modification time again, so a time a client set
+	// earlier no longer stands.
+	ws.mtime = time.Time{}
 
 	return n, nil
 }

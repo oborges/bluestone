@@ -404,11 +404,18 @@ type stagingFileInfo struct {
 
 // stagedFileInfo describes a file from its staging session.
 func stagedFileInfo(name string, session *staging.WriteSession) *stagingFileInfo {
+	attrs := session.Attributes()
+	// A modification time a client set explicitly wins over the staged
+	// file's own last write; writing clears it again.
+	modTime := session.LastWrite
+	if !attrs.Mtime.IsZero() {
+		modTime = attrs.Mtime
+	}
 	return &stagingFileInfo{
 		name:    name,
 		size:    session.GetSize(),
-		modTime: session.LastWrite,
-		attrs:   session.Attributes(),
+		modTime: modTime,
+		attrs:   attrs,
 	}
 }
 
@@ -1151,6 +1158,16 @@ func applyStagedUpdate(session *staging.WriteSession, update posix.AttributeUpda
 	if update.WindowsAttributes != nil {
 		session.SetWindowsAttributes(*update.WindowsAttributes & posix.WindowsAttributesStored)
 	}
+	if update.Atime != nil || update.Mtime != nil {
+		var atime, mtime time.Time
+		if update.Atime != nil {
+			atime = *update.Atime
+		}
+		if update.Mtime != nil {
+			mtime = *update.Mtime
+		}
+		session.SetTimes(atime, mtime)
+	}
 }
 
 // Lchown changes the uid and gid of the named file (link itself)
@@ -1166,14 +1183,9 @@ func (fs *Filesystem) Chown(name string, uid, gid int) error {
 
 // Chtimes changes the access and modification times
 func (fs *Filesystem) Chtimes(name string, atime time.Time, mtime time.Time) error {
-	fullPath := fs.keyPath(name)
-
-	if fs.isStagingDirty(fullPath) {
-		return nil // Staged files bypass COS metadata swaps
-	}
-
-	// A metadata-only update that keeps every other attribute.
-	return fs.ops.UpdateAttributes(fs.requestContext(), fullPath, posix.AttributeUpdate{Atime: &atime, Mtime: &mtime})
+	// SetAttributes records the times on the staging session when the file is
+	// staged, and updates the object's metadata otherwise.
+	return fs.SetAttributes(name, posix.AttributeUpdate{Atime: &atime, Mtime: &mtime})
 }
 
 // File implements billy.File interface
