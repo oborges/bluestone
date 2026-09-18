@@ -27,6 +27,7 @@ type OperationsHandler struct {
 	translator    *PathTranslator
 	perfConfig    *config.PerformanceConfig
 	readGroup     singleflight.Group
+	listings      listingFence
 }
 
 // ObjectStore is the COS API surface used by POSIX operations and refresh scans.
@@ -109,19 +110,42 @@ func (h *OperationsHandler) InvalidateFileMutation(path string) {
 	h.invalidateFileMutation(path)
 }
 
-// InvalidateObjectAfterSync purges caches that observed the pre-sync object
-// without touching ancestor directory listings: a completed upload does not
-// change the namespace (the file and its size were already visible), and
-// invalidating listings after every sync forced parent re-probes against COS
-// under write churn.
+// InvalidateObjectAfterSync purges caches that observed the pre-sync object.
+// A completed upload of a file the parent listing already shows does not
+// change the namespace, so that listing is kept: invalidating listings after
+// every sync forced parent re-probes against COS under write churn. A file
+// the cached listing lacks was visible only through its staging session,
+// which may now be cleaned up, so that listing is dropped or the file would
+// vanish from listings until it expired.
 func (h *OperationsHandler) InvalidateObjectAfterSync(path string) {
 	if h == nil {
 		return
 	}
 	if h.metadataCache != nil {
-		h.metadataCache.Delete(path)
+		normalized := NormalizePath(path)
+		parent := GetParentPath(normalized)
+		h.metadataCache.Delete(normalized)
+		// A listing of the parent in flight may predate the upload.
+		h.listings.invalidate(parent)
+		if !h.cachedListingHas(parent, GetBaseName(normalized)) {
+			h.metadataCache.Delete(parent)
+		}
 	}
 	h.invalidateDataPath(path)
+}
+
+// cachedListingHas reports whether dir has a cached listing naming name.
+func (h *OperationsHandler) cachedListingHas(dir, name string) bool {
+	entry, ok := h.metadataCache.Get(dir)
+	if !ok || entry.ChildEntries == nil {
+		return false
+	}
+	for _, child := range entry.ChildEntries {
+		if child.Name() == name {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *OperationsHandler) invalidateDirectoryMutation(path string) {
@@ -1015,6 +1039,15 @@ fetchFromCOS:
 	prefix := ListPrefix(path)
 	log.Info("ListDirectory cache miss, fetching from COS", zap.String("prefix", prefix))
 
+	fenceDir := NormalizePath(path)
+	fenceGeneration := h.listings.begin(fenceDir)
+	fenceEnded := false
+	defer func() {
+		if !fenceEnded {
+			h.listings.end(fenceDir, fenceGeneration)
+		}
+	}()
+
 	cosStart := time.Now()
 	metrics.RecordCOSListObjects()
 	maxEntries := h.maxDirectoryEntries()
@@ -1121,6 +1154,13 @@ fetchFromCOS:
 	osEntries := make([]os.FileInfo, len(entries))
 	for i, entry := range entries {
 		osEntries[i] = entry
+	}
+	fenceEnded = true
+	if !h.listings.end(fenceDir, fenceGeneration) {
+		// The directory changed while this listing was in flight; return it
+		// but do not let it outlive the change.
+		log.Info("Directory listed, not cached: changed during listing", zap.Int("entries", len(entries)))
+		return entries, nil
 	}
 	h.metadataCache.SetDirEntries(path, osEntries)
 

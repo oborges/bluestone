@@ -952,6 +952,16 @@ func (fs *Filesystem) ReadDir(path string) ([]os.FileInfo, error) {
 	// Track per-path calls
 	metrics.GetGlobalCounters().RecordPathCall(fullPath)
 
+	// Take the staged sessions before listing COS. A file whose sync
+	// completes in between is then either still in this snapshot or already
+	// in the object store the listing reads (the sync drops any cached
+	// listing that lacks it); snapshotting afterwards could miss it in both.
+	stagingEnabled := fs.featureFlags != nil && fs.featureFlags.IsStagingEnabled() && fs.stagingManager != nil
+	var stagingSessions []*staging.WriteSession
+	if stagingEnabled {
+		stagingSessions = fs.stagingManager.GetSessionsInDirectory(fullPath)
+	}
+
 	listStart := time.Now()
 	entries, err := fs.ops.ListDirectory(fs.requestContext(), fullPath)
 	listDuration := time.Since(listStart)
@@ -960,8 +970,8 @@ func (fs *Filesystem) ReadDir(path string) ([]os.FileInfo, error) {
 		// If the object store cannot answer but staged sessions exist under
 		// this directory, serve the staged entries: a partial listing keeps
 		// applications working during a backend outage.
-		if fs.featureFlags != nil && fs.featureFlags.IsStagingEnabled() && fs.stagingManager != nil {
-			if staged := fs.stagingManager.GetSessionsInDirectory(fullPath); len(staged) > 0 {
+		if stagingEnabled {
+			if staged := stagingSessions; len(staged) > 0 {
 				fs.logger.Error("ReadDir serving staged entries only: object store unreachable",
 					zap.String("path", fullPath), zap.Error(err))
 				result := make([]os.FileInfo, 0, len(staged))
@@ -996,7 +1006,7 @@ func (fs *Filesystem) ReadDir(path string) ([]os.FileInfo, error) {
 	}
 
 	// Safely inject StagingManager Memory bounds natively into directories!
-	if fs.featureFlags != nil && fs.featureFlags.IsStagingEnabled() && fs.stagingManager != nil {
+	if stagingEnabled {
 		// Hide paths whose delete was accepted but not yet confirmed in COS.
 		if fs.stagingManager.PendingDeleteCount() > 0 {
 			visible := result[:0]
@@ -1009,7 +1019,6 @@ func (fs *Filesystem) ReadDir(path string) ([]os.FileInfo, error) {
 			result = visible
 		}
 
-		stagingSessions := fs.stagingManager.GetSessionsInDirectory(fullPath)
 		for _, session := range stagingSessions {
 			if fs.stagingManager.HasPendingDelete(session.Path) {
 				continue

@@ -229,8 +229,9 @@ func main() {
 		// invalidate its caches whenever the worker mutates a COS object;
 		// otherwise state cached during the dirty window (e.g. a zero-byte
 		// truncate object) outlives the sync and serves stale reads. Deletes
-		// change the namespace and purge ancestor listings; uploads do not,
-		// so they use the narrower invalidation.
+		// change the namespace and purge ancestor listings; uploads keep a
+		// parent listing that already shows the file, so they use the
+		// narrower invalidation.
 		syncWorker.SetObjectMutatedCallback(operations.InvalidateFileMutation)
 		syncWorker.SetObjectSyncedCallback(operations.InvalidateObjectAfterSync)
 
