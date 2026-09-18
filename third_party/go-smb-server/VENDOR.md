@@ -140,6 +140,34 @@ proposed upstream.
   header buffers with a write mutex. Upstream shared one header buffer between
   reads and writes, which is safe only while a single goroutine does both.
 
+- `smb/server`: TREE_CONNECT matches share names case-insensitively, as
+  Windows does. macOS sends the share name upper-cased and was refused with
+  STATUS_BAD_NETWORK_NAME.
+
+- `smb/server`: credits are granted as the client requests them, up to the
+  maximum, instead of topping the client up to the maximum in whichever
+  response comes first. That was the NEGOTIATE response, whose grant macOS
+  does not count, so macOS believed it had a single credit: it waited two
+  seconds before every compound request and eventually hung. Every request,
+  including one with a CreditCharge of zero, now uses at least one credit.
+
+- `smb/server`: each response in a compound reply is signed after the next
+  one is appended, so the signature covers its padding and NextCommand.
+  Signing them as they were built left every response but the last with a
+  signature that did not verify.
+
+- `smb/server`: a QUERY_DIRECTORY that matches nothing answers
+  STATUS_NO_SUCH_FILE; STATUS_NO_MORE_FILES is for a listing that has
+  returned every match (MS-FSA 2.1.5.6.3). macOS looks up single names this
+  way.
+
+- `smb/vfs` (LocalBackend, which Bluestone does not use): paths convert SMB
+  backslashes to slashes, so a file in a subdirectory no longer lands in the
+  share root with a backslash in its name outside Windows; a rename takes the
+  new path from the share root, so files can move between directories; and
+  creating a directory with FILE_CREATE no longer fails with
+  STATUS_OBJECT_NAME_COLLISION after making it.
+
 ## Known gaps to close in Bluestone
 
 - Blocking byte-range locks: a lock that cannot be granted is refused even
