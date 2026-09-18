@@ -166,7 +166,10 @@ proposed upstream.
   share root with a backslash in its name outside Windows; a rename takes the
   new path from the share root, so files can move between directories; and
   creating a directory with FILE_CREATE no longer fails with
-  STATUS_OBJECT_NAME_COLLISION after making it.
+  STATUS_OBJECT_NAME_COLLISION after making it. Setting attributes makes a
+  file read-only only for FILE_ATTRIBUTE_READONLY (0x01); it did so for
+  HIDDEN (0x02), and macOS hides the AppleDouble files it writes, which then
+  could not be deleted.
 
 ## Known gaps to close in Bluestone
 

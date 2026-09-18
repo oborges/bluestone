@@ -1,8 +1,8 @@
 # SMB interoperability checks
 
 Scripts for exercising a running Bluestone SMB share from real clients. They
-were used to validate the server against Windows Server 2025, the Linux kernel
-SMB client, and `smbclient`.
+were used to validate the server against Windows Server 2025, macOS, the Linux
+kernel SMB client, and `smbclient`.
 
 Each script reads the share password rather than taking it on a command line:
 the shell scripts read it from `/etc/bluestone/config.yaml` on the gateway
@@ -17,6 +17,20 @@ sudo ./linux-kernel-client-test.sh       # mount -t cifs, then copy and stat
 ```
 
 Both default to `127.0.0.1`; pass another address as the first argument.
+
+## From a macOS client
+
+```bash
+ssh gateway 'sudo sed -n "s/^ *password: \"\(.*\)\"$/\1/p" /etc/bluestone/config.yaml' \
+  | ./macos-client-test.sh 10.0.0.4
+```
+
+`macos-client-test.sh` mounts the share with `mount_smbfs` and covers listing,
+reading, writing, making a folder and moving a file into it, overwriting, a
+5 MB copy compared byte for byte, rename, and delete, in a `macos-test` folder
+it removes afterwards. Every step runs under a watchdog, so a server that
+leaves the client waiting shows up as `HUNG` rather than hanging the script.
+Pass `SERVER:PORT` to reach the share through a tunnel.
 
 ## From a Windows client
 

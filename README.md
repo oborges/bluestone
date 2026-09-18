@@ -249,8 +249,9 @@ Linux needs root or `CAP_NET_BIND_SERVICE`. `smb.enabled`, `smb.port`,
 overridden with `BLUESTONE_SMB_*` environment variables; users are read from
 the file only.
 
-Tested against Windows Server 2025 (SMB 3.0.2 with signing), the Linux kernel
-client (`mount -t cifs`), and `smbclient`: mapping a drive, listing, reading
+Tested against Windows Server 2025 (SMB 3.0.2 with signing), macOS
+(`mount_smbfs`), the Linux kernel client (`mount -t cifs`), and `smbclient`:
+mapping a drive, listing, reading
 and writing, copying multi-megabyte files, case-insensitive access, DOS
 attributes and creation times, the write-temp-then-rename pattern that Office
 and many editors use, renames, and deletes. Scripts for repeating these checks

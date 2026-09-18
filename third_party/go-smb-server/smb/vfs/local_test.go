@@ -83,3 +83,54 @@ func TestLocalBackendBackslashPaths(t *testing.T) {
 		t.Fatalf("old name still present: %v", err)
 	}
 }
+
+// Only FILE_ATTRIBUTE_READONLY makes a local file read-only. macOS marks the
+// AppleDouble files it creates hidden, and treating hidden as read-only left
+// them impossible to delete.
+func TestLocalBackendAttributes(t *testing.T) {
+	root := t.TempDir()
+	b, err := NewLocalBackend(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	h, err := b.Open(ctx, OpenOptions{Path: "._file", Disposition: DispositionCreate})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = h.Close(ctx) }()
+	si := h.(SetInfoer)
+	full := filepath.Join(root, "._file")
+	perm := func() os.FileMode {
+		t.Helper()
+		fi, err := os.Stat(full)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return fi.Mode().Perm()
+	}
+
+	hidden := uint32(0x02)
+	if err := si.SetInfo(ctx, &SetInfoRequest{Attributes: &hidden}); err != nil {
+		t.Fatal(err)
+	}
+	if perm()&0o200 == 0 {
+		t.Fatalf("hidden file mode = %v, want it still writable", perm())
+	}
+
+	readOnly := uint32(0x01)
+	if err := si.SetInfo(ctx, &SetInfoRequest{Attributes: &readOnly}); err != nil {
+		t.Fatal(err)
+	}
+	if perm()&0o222 != 0 {
+		t.Fatalf("read-only file mode = %v, want no write bits", perm())
+	}
+
+	normal := uint32(0x80)
+	if err := si.SetInfo(ctx, &SetInfoRequest{Attributes: &normal}); err != nil {
+		t.Fatal(err)
+	}
+	if perm()&0o200 == 0 {
+		t.Fatalf("mode after clearing read-only = %v, want writable", perm())
+	}
+}

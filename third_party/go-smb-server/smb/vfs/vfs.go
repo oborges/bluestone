@@ -278,9 +278,23 @@ func (h *localHandle) SetInfo(_ context.Context, req *SetInfoRequest) error {
 			return err
 		}
 	}
-	if req.Attributes != nil && *req.Attributes&0x02 != 0 {
-		if err := os.Chmod(h.path, 0400); err != nil {
+	if req.Attributes != nil {
+		// FILE_ATTRIBUTE_READONLY (0x01) is the only attribute a local file
+		// can carry; HIDDEN (0x02) and the rest leave its mode alone.
+		fi, err := h.f.Stat()
+		if err != nil {
 			return err
+		}
+		mode := fi.Mode().Perm()
+		if *req.Attributes&0x01 != 0 {
+			mode &^= 0o222
+		} else {
+			mode |= 0o200
+		}
+		if mode != fi.Mode().Perm() {
+			if err := os.Chmod(h.path, mode); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
