@@ -250,6 +250,7 @@ func (h *OperationsHandler) invalidateAncestorListings(dir string) int {
 	count := 0
 	for {
 		h.metadataCache.Delete(dir)
+		h.listings.invalidate(dir)
 		count++
 		if dir == "/" || dir == "" {
 			break

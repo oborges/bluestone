@@ -273,6 +273,9 @@ type fakeObjectStore struct {
 	omitListMetadata bool
 	rangeCalls       int
 	headCalls        int
+	// afterList runs once a listing has been taken, before it is returned,
+	// to simulate an object changing while the listing is in flight.
+	afterList func()
 }
 
 type fakeObject struct {
@@ -406,6 +409,14 @@ func (s *fakeObjectStore) omitListingMetadata() {
 }
 
 func (s *fakeObjectStore) ListObjects(_ context.Context, prefix string, maxKeys int) ([]*types.ObjectMetadata, error) {
+	out, afterList := s.listObjects(prefix, maxKeys)
+	if afterList != nil {
+		afterList()
+	}
+	return out, nil
+}
+
+func (s *fakeObjectStore) listObjects(prefix string, maxKeys int) ([]*types.ObjectMetadata, func()) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -435,7 +446,7 @@ func (s *fakeObjectStore) ListObjects(_ context.Context, prefix string, maxKeys 
 		}
 		out = append(out, listed)
 	}
-	return out, nil
+	return out, s.afterList
 }
 
 func (s *fakeObjectStore) CopyObject(_ context.Context, sourceKey, destKey string) error {
