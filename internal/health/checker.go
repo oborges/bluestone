@@ -204,6 +204,43 @@ func CacheHealthCheck(isEnabled func() bool, getStats func() interface{}) CheckF
 	}
 }
 
+// SMBStats is what an SMB server reports about itself to a health check.
+type SMBStats struct {
+	// Running is false once the server has stopped serving, whether it was
+	// asked to stop or its accept loop failed.
+	Running bool
+	// Connections, Sessions and OpenFiles are what it currently carries.
+	Connections int
+	Sessions    int
+	OpenFiles   int
+}
+
+// SMBHealthCheck creates a health check for the SMB server. Pass a nil stats
+// function when SMB is disabled, which is healthy: the gateway is doing what
+// it was configured to do.
+func SMBHealthCheck(stats func() SMBStats) CheckFunc {
+	return func(ctx context.Context) CheckDetail {
+		if stats == nil {
+			return CheckDetail{
+				Status:  StatusHealthy,
+				Message: "SMB server is disabled",
+			}
+		}
+		current := stats()
+		if !current.Running {
+			return CheckDetail{
+				Status:  StatusUnhealthy,
+				Message: "SMB server is not serving",
+			}
+		}
+		return CheckDetail{
+			Status: StatusHealthy,
+			Message: fmt.Sprintf("SMB server is serving: %d connections, %d sessions, %d open files",
+				current.Connections, current.Sessions, current.OpenFiles),
+		}
+	}
+}
+
 // DiskSpaceHealthCheck creates a health check for disk space
 func DiskSpaceHealthCheck(path string, minFreePercent float64) CheckFunc {
 	return func(ctx context.Context) CheckDetail {

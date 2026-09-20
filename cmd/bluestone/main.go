@@ -347,8 +347,18 @@ func main() {
 			logging.Fatal("Failed to start SMB server", zap.Error(err))
 		}
 		defer smbServer.Stop()
+		healthChecker.RegisterCheck("smb", health.SMBHealthCheck(func() health.SMBStats {
+			stats := smbServer.Stats()
+			return health.SMBStats{
+				Running:     smbServer.Running(),
+				Connections: stats.Connections,
+				Sessions:    stats.Sessions,
+				OpenFiles:   stats.OpenFiles,
+			}
+		}))
 	} else {
 		logging.Info("SMB server disabled by configuration")
+		healthChecker.RegisterCheck("smb", health.SMBHealthCheck(nil))
 	}
 
 	logging.Info("Bluestone started successfully",

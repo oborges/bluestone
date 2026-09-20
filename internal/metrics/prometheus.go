@@ -127,6 +127,46 @@ var (
 		},
 	)
 
+	// SMB metrics. Requests are counted per SMB2 command, so a compound
+	// request counts once per command in it.
+	smbRequestsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "smb_requests_total",
+			Help: "Total SMB requests by command and NT status",
+		},
+		[]string{"command", "status"},
+	)
+
+	smbRequestDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "smb_request_duration_seconds",
+			Help:    "SMB request duration in seconds by command",
+			Buckets: prometheus.DefBuckets,
+		},
+		[]string{"command"},
+	)
+
+	smbConnections = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "smb_connections",
+			Help: "Number of SMB client connections",
+		},
+	)
+
+	smbSessions = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "smb_sessions",
+			Help: "Number of authenticated SMB sessions",
+		},
+	)
+
+	smbOpenFiles = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "smb_open_files",
+			Help: "Number of files SMB clients hold open",
+		},
+	)
+
 	// Lock metrics
 	activeLocksTotal = prometheus.NewGauge(
 		prometheus.GaugeOpts{
@@ -314,6 +354,11 @@ func Initialize() {
 		bytesReadTotal,
 		bytesWrittenTotal,
 		activeConnections,
+		smbRequestsTotal,
+		smbRequestDuration,
+		smbConnections,
+		smbSessions,
+		smbOpenFiles,
 		activeLocksTotal,
 		stagingSyncQueueDepth,
 		stagingSyncQueueBytes,
@@ -397,6 +442,28 @@ func RequestStatus(err error) string {
 	default:
 		return StatusError
 	}
+}
+
+// RecordSMBRequest records one SMB request: command is the SMB2 command
+// name, status the NT status returned, such as "STATUS_SUCCESS".
+func RecordSMBRequest(command, status string, duration time.Duration) {
+	smbRequestsTotal.WithLabelValues(command, status).Inc()
+	smbRequestDuration.WithLabelValues(command).Observe(duration.Seconds())
+}
+
+// SetSMBConnections records how many SMB connections are open.
+func SetSMBConnections(count int) {
+	smbConnections.Set(float64(count))
+}
+
+// SetSMBSessions records how many authenticated SMB sessions exist.
+func SetSMBSessions(count int) {
+	smbSessions.Set(float64(count))
+}
+
+// SetSMBOpenFiles records how many files SMB clients hold open.
+func SetSMBOpenFiles(count int) {
+	smbOpenFiles.Set(float64(count))
 }
 
 // RecordCOSAPICall records a COS API call

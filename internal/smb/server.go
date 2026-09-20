@@ -10,9 +10,11 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/oborges/bluestone/internal/config"
 	"github.com/oborges/bluestone/internal/lock"
+	"github.com/oborges/bluestone/internal/metrics"
 	"github.com/oborges/bluestone/internal/vfs"
 	"github.com/sonroyaalmerol/go-smb-server/smb/ntlmssp"
 	"github.com/sonroyaalmerol/go-smb-server/smb/server"
@@ -69,6 +71,8 @@ type Server struct {
 	started  atomic.Bool
 	done     chan struct{}
 	stopOnce sync.Once
+	observer *observer
+	opens    *lock.ShareTable
 }
 
 // NewServer creates an SMB server for fs and binds its listener. Give it a
@@ -92,10 +96,12 @@ func NewServer(fs *vfs.Filesystem, opts ServerOptions) (*Server, error) {
 		allowed = networks
 	}
 
+	obs := &observer{}
 	serverOpts := []server.Option{
 		server.WithShares(smbvfs.NewDiskShare(opts.ShareName, NewBackend(fs, opts.Opens))),
 		server.WithAuth(ntlmssp.NewServer(newCredentials(opts.Users), opts.Domain)),
 		server.WithLogger(slog.New(zapHandler{logger: logger})),
+		server.WithObserver(obs),
 	}
 	if opts.EncryptionRequired {
 		serverOpts = append(serverOpts, server.WithEncryptionRequired())
@@ -124,6 +130,8 @@ func NewServer(fs *vfs.Filesystem, opts ServerOptions) (*Server, error) {
 		srv:      srv,
 		listener: newConnListener(inner, allowed, logger),
 		logger:   logger,
+		observer: obs,
+		opens:    opts.Opens,
 		ctx:      ctx,
 		cancel:   cancel,
 		done:     make(chan struct{}),
@@ -136,6 +144,7 @@ func (s *Server) Start() error {
 		return errors.New("smb: server already started")
 	}
 	s.logger.Info("Starting SMB server", zap.String("address", s.Address()))
+	go s.publishOpenFiles()
 	go func() {
 		defer close(s.done)
 		if err := s.srv.Serve(s.ctx, s.listener); err != nil {
@@ -161,6 +170,40 @@ func (s *Server) Stop() error {
 		s.logger.Info("SMB server stopped")
 	})
 	return nil
+}
+
+// publishOpenFiles samples how many files clients hold open. Connections,
+// sessions and requests are reported as they happen; this one is counted in
+// the share table, so it is sampled rather than hooked into every open.
+func (s *Server) publishOpenFiles() {
+	const interval = 10 * time.Second
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.ctx.Done():
+			metrics.SetSMBOpenFiles(0)
+			return
+		case <-ticker.C:
+			if s.opens != nil {
+				metrics.SetSMBOpenFiles(s.opens.Len())
+			}
+		}
+	}
+}
+
+// Running reports whether the server is serving clients: it has been started
+// and its accept loop has not returned, whether from Stop or an error.
+func (s *Server) Running() bool {
+	if !s.started.Load() {
+		return false
+	}
+	select {
+	case <-s.done:
+		return false
+	default:
+		return true
+	}
 }
 
 // Address returns the server's listening address.

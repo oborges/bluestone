@@ -197,6 +197,9 @@ func (c *request) handleSessionSetup(ctx context.Context, msg []byte, hdr *wire.
 	}
 	c.out = ssr.Append(c.out)
 	if sess.authenticated {
+		if sess.counted.CompareAndSwap(false, true) {
+			c.srv.obs().SessionOpened()
+		}
 		return wire.StatusSuccess
 	}
 	return wire.StatusMoreProcessingRequired

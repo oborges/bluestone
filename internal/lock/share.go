@@ -137,6 +137,18 @@ func (t *ShareTable) Opens(path string) []ShareOpen {
 	return opens
 }
 
+// Len reports how many opens the table holds, across every file.
+func (t *ShareTable) Len() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	count := 0
+	for _, opens := range t.files {
+		count += len(opens)
+	}
+	return count
+}
+
 // Rename moves the opens held on a path, so a file keeps its share state
 // under its new name.
 func (t *ShareTable) Rename(oldPath, newPath string) {
