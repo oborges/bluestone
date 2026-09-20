@@ -160,6 +160,35 @@ var (
 		},
 	)
 
+	smbConnectionsRefusedTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "smb_connections_refused_total",
+			Help: "SMB connections refused, by which limit refused them",
+		},
+		[]string{"reason"},
+	)
+
+	smbAuthFailuresTotal = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "smb_auth_failures_total",
+			Help: "Failed SMB authentication attempts",
+		},
+	)
+
+	smbAuthBlockedTotal = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "smb_auth_blocked_total",
+			Help: "SMB authentication attempts refused because the client is blocked after repeated failures",
+		},
+	)
+
+	smbAuthBlockedClients = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "smb_auth_blocked_clients",
+			Help: "Client addresses currently blocked from authenticating",
+		},
+	)
+
 	smbOpenFiles = prometheus.NewGauge(
 		prometheus.GaugeOpts{
 			Name: "smb_open_files",
@@ -359,6 +388,10 @@ func Initialize() {
 		smbConnections,
 		smbSessions,
 		smbOpenFiles,
+		smbConnectionsRefusedTotal,
+		smbAuthFailuresTotal,
+		smbAuthBlockedTotal,
+		smbAuthBlockedClients,
 		activeLocksTotal,
 		stagingSyncQueueDepth,
 		stagingSyncQueueBytes,
@@ -464,6 +497,28 @@ func SetSMBSessions(count int) {
 // SetSMBOpenFiles records how many files SMB clients hold open.
 func SetSMBOpenFiles(count int) {
 	smbOpenFiles.Set(float64(count))
+}
+
+// RecordSMBConnectionRefused records a connection refused by a limit, named
+// by the limit that refused it.
+func RecordSMBConnectionRefused(reason string) {
+	smbConnectionsRefusedTotal.WithLabelValues(reason).Inc()
+}
+
+// RecordSMBAuthFailure records a failed SMB authentication attempt.
+func RecordSMBAuthFailure() {
+	smbAuthFailuresTotal.Inc()
+}
+
+// RecordSMBAuthBlocked records an attempt refused because the client is
+// blocked after repeated failures.
+func RecordSMBAuthBlocked() {
+	smbAuthBlockedTotal.Inc()
+}
+
+// SetSMBAuthBlockedClients records how many client addresses are blocked.
+func SetSMBAuthBlockedClients(count int) {
+	smbAuthBlockedClients.Set(float64(count))
 }
 
 // RecordCOSAPICall records a COS API call

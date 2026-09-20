@@ -57,8 +57,29 @@ type ServerOptions struct {
 	// handles at once. 0 selects the library default; 1 handles every request
 	// in turn.
 	ConcurrentRequests int
+	// Limits bound what clients can make the server hold. Zero values mean
+	// no limit.
+	Limits Limits
+	// AuthLimits slow down repeated authentication failures from one client
+	// address. Zero values select the defaults.
+	AuthLimits AuthLimits
 	// Logger receives server logs; nil discards them.
 	Logger *zap.Logger
+}
+
+// Limits bound what one client can make the server hold. Zero means no
+// limit; the gateway's configuration supplies defaults.
+type Limits struct {
+	// Connections caps connections to the server, and ConnectionsPerClient
+	// caps those from one client address.
+	Connections          int
+	ConnectionsPerClient int
+	// SessionsPerConnection caps authenticated sessions on one connection.
+	SessionsPerConnection int
+	// TreesPerSession caps share connections on one session.
+	TreesPerSession int
+	// OpensPerSession caps the files one session holds open.
+	OpensPerSession int
 }
 
 // Server serves one share of a filesystem view over SMB.
@@ -73,6 +94,7 @@ type Server struct {
 	stopOnce sync.Once
 	observer *observer
 	opens    *lock.ShareTable
+	gate     *authGate
 }
 
 // NewServer creates an SMB server for fs and binds its listener. Give it a
@@ -97,11 +119,18 @@ func NewServer(fs *vfs.Filesystem, opts ServerOptions) (*Server, error) {
 	}
 
 	obs := &observer{}
+	gate := newAuthGate(opts.AuthLimits, logger)
 	serverOpts := []server.Option{
 		server.WithShares(smbvfs.NewDiskShare(opts.ShareName, NewBackend(fs, opts.Opens))),
 		server.WithAuth(ntlmssp.NewServer(newCredentials(opts.Users), opts.Domain)),
 		server.WithLogger(slog.New(zapHandler{logger: logger})),
 		server.WithObserver(obs),
+		server.WithAuthGate(gate),
+		server.WithLimits(server.Limits{
+			SessionsPerConnection: opts.Limits.SessionsPerConnection,
+			OpensPerSession:       opts.Limits.OpensPerSession,
+			TreesPerSession:       opts.Limits.TreesPerSession,
+		}),
 	}
 	if opts.EncryptionRequired {
 		serverOpts = append(serverOpts, server.WithEncryptionRequired())
@@ -128,10 +157,11 @@ func NewServer(fs *vfs.Filesystem, opts ServerOptions) (*Server, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Server{
 		srv:      srv,
-		listener: newConnListener(inner, allowed, logger),
+		listener: newConnListener(inner, allowed, logger, opts.Limits.Connections, opts.Limits.ConnectionsPerClient),
 		logger:   logger,
 		observer: obs,
 		opens:    opts.Opens,
+		gate:     gate,
 		ctx:      ctx,
 		cancel:   cancel,
 		done:     make(chan struct{}),
@@ -144,7 +174,7 @@ func (s *Server) Start() error {
 		return errors.New("smb: server already started")
 	}
 	s.logger.Info("Starting SMB server", zap.String("address", s.Address()))
-	go s.publishOpenFiles()
+	go s.publishSampledStats()
 	go func() {
 		defer close(s.done)
 		if err := s.srv.Serve(s.ctx, s.listener); err != nil {
@@ -172,10 +202,11 @@ func (s *Server) Stop() error {
 	return nil
 }
 
-// publishOpenFiles samples how many files clients hold open. Connections,
-// sessions and requests are reported as they happen; this one is counted in
-// the share table, so it is sampled rather than hooked into every open.
-func (s *Server) publishOpenFiles() {
+// publishSampledStats samples the counts that are held elsewhere rather than
+// reported as they change: files clients hold open, and client addresses
+// blocked from authenticating. Sampling the blocked clients also drops the
+// records of clients that have gone away.
+func (s *Server) publishSampledStats() {
 	const interval = 10 * time.Second
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -183,11 +214,13 @@ func (s *Server) publishOpenFiles() {
 		select {
 		case <-s.ctx.Done():
 			metrics.SetSMBOpenFiles(0)
+			metrics.SetSMBAuthBlockedClients(0)
 			return
 		case <-ticker.C:
 			if s.opens != nil {
 				metrics.SetSMBOpenFiles(s.opens.Len())
 			}
+			metrics.SetSMBAuthBlockedClients(s.gate.blockedClients())
 		}
 	}
 }
@@ -243,14 +276,28 @@ type connListener struct {
 	net.Listener
 	allowed []*net.IPNet
 	logger  *zap.Logger
+	// maxConns caps connections to the server, and maxConnsPerClient caps
+	// those from one address, so one client cannot use them all up. Zero
+	// means no limit.
+	maxConns          int
+	maxConnsPerClient int
 
-	mu     sync.Mutex
-	closed bool
-	conns  map[*trackedConn]struct{}
+	mu        sync.Mutex
+	closed    bool
+	conns     map[*trackedConn]struct{}
+	perClient map[string]int
 }
 
-func newConnListener(inner net.Listener, allowed []*net.IPNet, logger *zap.Logger) *connListener {
-	return &connListener{Listener: inner, allowed: allowed, logger: logger, conns: make(map[*trackedConn]struct{})}
+func newConnListener(inner net.Listener, allowed []*net.IPNet, logger *zap.Logger, maxConns, maxConnsPerClient int) *connListener {
+	return &connListener{
+		Listener:          inner,
+		allowed:           allowed,
+		logger:            logger,
+		maxConns:          maxConns,
+		maxConnsPerClient: maxConnsPerClient,
+		conns:             make(map[*trackedConn]struct{}),
+		perClient:         make(map[string]int),
+	}
 }
 
 func (l *connListener) Accept() (net.Conn, error) {
@@ -265,17 +312,55 @@ func (l *connListener) Accept() (net.Conn, error) {
 			_ = conn.Close()
 			continue
 		}
-		tracked := &trackedConn{Conn: conn, owner: l}
+		client := clientKey(conn.RemoteAddr())
+		tracked := &trackedConn{Conn: conn, owner: l, client: client}
 		l.mu.Lock()
 		if l.closed {
 			l.mu.Unlock()
 			_ = conn.Close()
 			return nil, net.ErrClosed
 		}
+		if reason := l.overLimitLocked(client); reason != "" {
+			l.mu.Unlock()
+			l.logger.Warn("Refused SMB connection over limit",
+				zap.String("remote_addr", conn.RemoteAddr().String()),
+				zap.String("limit", reason))
+			metrics.RecordSMBConnectionRefused(reason)
+			_ = conn.Close()
+			continue
+		}
 		l.conns[tracked] = struct{}{}
+		l.perClient[client]++
 		l.mu.Unlock()
 		return tracked, nil
 	}
+}
+
+// overLimitLocked names the limit a new connection would exceed, or "" when
+// it fits. The caller holds l.mu.
+func (l *connListener) overLimitLocked(client string) string {
+	if l.maxConns > 0 && len(l.conns) >= l.maxConns {
+		return "max_connections"
+	}
+	if l.maxConnsPerClient > 0 && l.perClient[client] >= l.maxConnsPerClient {
+		return "max_connections_per_client"
+	}
+	return ""
+}
+
+// clientKey identifies the client a connection came from, by address without
+// its port, so a client's connections are counted together.
+func clientKey(addr net.Addr) string {
+	if tcpAddr, ok := addr.(*net.TCPAddr); ok && tcpAddr.IP != nil {
+		return tcpAddr.IP.String()
+	}
+	if addr == nil {
+		return ""
+	}
+	if host, _, err := net.SplitHostPort(addr.String()); err == nil {
+		return host
+	}
+	return addr.String()
 }
 
 func (l *connListener) allowedAddr(addr net.Addr) bool {
@@ -310,14 +395,20 @@ func (l *connListener) closeConns() {
 
 type trackedConn struct {
 	net.Conn
-	owner *connListener
-	once  sync.Once
+	owner  *connListener
+	client string
+	once   sync.Once
 }
 
 func (c *trackedConn) Close() error {
 	c.once.Do(func() {
 		c.owner.mu.Lock()
 		delete(c.owner.conns, c)
+		if n := c.owner.perClient[c.client] - 1; n > 0 {
+			c.owner.perClient[c.client] = n
+		} else {
+			delete(c.owner.perClient, c.client)
+		}
 		c.owner.mu.Unlock()
 	})
 	return c.Conn.Close()

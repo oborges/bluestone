@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 )
 
 // Validate validates the configuration
@@ -64,6 +65,54 @@ func validateHA(config *HAConfig) error {
 
 // validateSMB validates the SMB server configuration. Nothing is checked
 // while the server is disabled.
+func validateSMBLimits(limits *SMBLimits) error {
+	counts := []struct {
+		name  string
+		value int
+	}{
+		{"max_connections", limits.MaxConnections},
+		{"max_connections_per_client", limits.MaxConnectionsPerClient},
+		{"max_sessions_per_connection", limits.MaxSessionsPerConnection},
+		{"max_trees_per_session", limits.MaxTreesPerSession},
+		{"max_opens_per_session", limits.MaxOpensPerSession},
+		{"auth_failures", limits.AuthFailures},
+	}
+	for _, count := range counts {
+		if count.value < 0 {
+			return fmt.Errorf("invalid limits.%s: %d (must be 0 or more)", count.name, count.value)
+		}
+	}
+	if limits.MaxConnections > 0 && limits.MaxConnectionsPerClient > limits.MaxConnections {
+		return fmt.Errorf("limits.max_connections_per_client (%d) exceeds limits.max_connections (%d)",
+			limits.MaxConnectionsPerClient, limits.MaxConnections)
+	}
+
+	window, err := limits.GetAuthWindow()
+	if err != nil {
+		return fmt.Errorf("invalid limits.auth_window %q: %w", limits.AuthWindow, err)
+	}
+	block, err := limits.GetAuthBlock()
+	if err != nil {
+		return fmt.Errorf("invalid limits.auth_block %q: %w", limits.AuthBlock, err)
+	}
+	maxBlock, err := limits.GetAuthMaxBlock()
+	if err != nil {
+		return fmt.Errorf("invalid limits.auth_max_block %q: %w", limits.AuthMaxBlock, err)
+	}
+	for _, d := range []struct {
+		name  string
+		value time.Duration
+	}{{"auth_window", window}, {"auth_block", block}, {"auth_max_block", maxBlock}} {
+		if d.value <= 0 {
+			return fmt.Errorf("invalid limits.%s: %s (must be positive)", d.name, d.value)
+		}
+	}
+	if maxBlock < block {
+		return fmt.Errorf("limits.auth_max_block (%s) is shorter than limits.auth_block (%s)", maxBlock, block)
+	}
+	return nil
+}
+
 func validateSMB(config *SMBConfig) error {
 	if !config.Enabled {
 		return nil
@@ -85,6 +134,9 @@ func validateSMB(config *SMBConfig) error {
 	}
 	if config.ConcurrentRequests < 0 {
 		return fmt.Errorf("invalid concurrent_requests: %d (must be 0 or more)", config.ConcurrentRequests)
+	}
+	if err := validateSMBLimits(&config.Limits); err != nil {
+		return err
 	}
 	if len(config.Users) == 0 {
 		return fmt.Errorf("at least one user is required when enabled")

@@ -40,6 +40,8 @@ type Server struct {
 	dialect       uint16
 	locker        vfs.ByteRangeLocker
 	observer      Observer
+	limits        Limits
+	authGate      AuthGate
 	maxConcurrent int
 	maxTransact   uint32
 	maxRead       uint32
@@ -229,6 +231,13 @@ func (t *tree) open(id [16]byte) (*openHandle, bool) {
 }
 
 // addOpen records a new open handle and returns its id.
+// openCount reports how many files the tree holds open.
+func (t *tree) openCount() int {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return len(t.opens)
+}
+
 func (t *tree) addOpen(oh *openHandle) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -735,6 +744,38 @@ func (c *conn) dropSession(id uint64) {
 	if sess != nil && sess.counted.CompareAndSwap(true, false) {
 		c.srv.obs().SessionClosed()
 	}
+}
+
+// sessionCount reports how many sessions the connection carries, including
+// one still authenticating.
+func (c *conn) sessionCount() int {
+	c.sessionsMu.RLock()
+	defer c.sessionsMu.RUnlock()
+	return len(c.sessions)
+}
+
+// remoteAddr identifies the client for the authentication gate.
+func (c *conn) remoteAddr() string {
+	if addr := c.fc.Underlying().RemoteAddr(); addr != nil {
+		return addr.String()
+	}
+	return ""
+}
+
+// openCount reports how many files a session holds open across its trees.
+func (s *session) openCount() int {
+	count := 0
+	for _, tr := range s.allTrees() {
+		count += tr.openCount()
+	}
+	return count
+}
+
+// treeCount reports how many trees a session has connected.
+func (s *session) treeCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.trees)
 }
 
 // eachSession calls fn for every session on the connection.

@@ -176,6 +176,13 @@ proposed upstream.
   can count what the server does without wrapping the protocol. A compound
   request reports each of its commands.
 
+- `smb/server`: `WithLimits` caps the sessions a connection may hold, the
+  trees a session may connect, and the files it may hold open; a request past
+  a limit is refused with STATUS_INSUFFICIENT_RESOURCES. `WithAuthGate` lets
+  the application refuse or slow down authentication attempts per client
+  address, and is told the outcome of each attempt. Both default to off, so a
+  server without them behaves as before.
+
 ## Known gaps to close in Bluestone
 
 Tracked with the rest of the SMB work in `docs/SMB_ROADMAP.md`.

@@ -55,8 +55,35 @@ type SMBConfig struct {
 	// handles at once. 0 selects the built-in default (64); 1 handles every
 	// request in turn.
 	ConcurrentRequests int `mapstructure:"concurrent_requests"`
+	// Limits bound what clients can make the server hold. 0 means no limit.
+	Limits SMBLimits `mapstructure:"limits"`
 	// Users are the accounts allowed to connect, authenticated with NTLM.
 	Users []SMBUser `mapstructure:"users"`
+}
+
+// SMBLimits bound what SMB clients can make the gateway hold, and how fast a
+// client may keep failing to authenticate. A value of 0 means no limit,
+// except in auth_*, where 0 selects the default.
+type SMBLimits struct {
+	// MaxConnections caps connections to the server, and
+	// MaxConnectionsPerClient caps those from one client address, so one
+	// client cannot use them all up.
+	MaxConnections          int `mapstructure:"max_connections"`
+	MaxConnectionsPerClient int `mapstructure:"max_connections_per_client"`
+	// MaxSessionsPerConnection caps authenticated sessions on one
+	// connection, MaxTreesPerSession caps share connections on a session,
+	// and MaxOpensPerSession caps the files it holds open.
+	MaxSessionsPerConnection int `mapstructure:"max_sessions_per_connection"`
+	MaxTreesPerSession       int `mapstructure:"max_trees_per_session"`
+	MaxOpensPerSession       int `mapstructure:"max_opens_per_session"`
+	// AuthFailures is how many failed logins from one client address start a
+	// block, AuthWindow how long failures are remembered, AuthBlock the
+	// first block (each further failure doubles it), and AuthMaxBlock the
+	// longest block.
+	AuthFailures int    `mapstructure:"auth_failures"`
+	AuthWindow   string `mapstructure:"auth_window"`
+	AuthBlock    string `mapstructure:"auth_block"`
+	AuthMaxBlock string `mapstructure:"auth_max_block"`
 }
 
 // SMBUser is an account allowed to connect to the SMB share.
@@ -75,6 +102,30 @@ type HAConfig struct {
 	// only (set BLUESTONE_HA_FORCE_TAKEOVER=true); never leave enabled in
 	// a config file.
 	ForceTakeover bool `mapstructure:"force_takeover"`
+}
+
+// GetAuthWindow parses how long authentication failures are remembered,
+// defaulting to 5 minutes.
+func (l *SMBLimits) GetAuthWindow() (time.Duration, error) {
+	return smbDuration(l.AuthWindow, 5*time.Minute)
+}
+
+// GetAuthBlock parses the first block after repeated failures, defaulting to
+// 30 seconds.
+func (l *SMBLimits) GetAuthBlock() (time.Duration, error) {
+	return smbDuration(l.AuthBlock, 30*time.Second)
+}
+
+// GetAuthMaxBlock parses the longest block, defaulting to 15 minutes.
+func (l *SMBLimits) GetAuthMaxBlock() (time.Duration, error) {
+	return smbDuration(l.AuthMaxBlock, 15*time.Minute)
+}
+
+func smbDuration(value string, fallback time.Duration) (time.Duration, error) {
+	if strings.TrimSpace(value) == "" {
+		return fallback, nil
+	}
+	return time.ParseDuration(value)
 }
 
 // GetHeartbeatInterval parses the heartbeat interval with a 15s default.
@@ -354,6 +405,15 @@ func bindEnvOverrides(v *viper.Viper) error {
 		"smb.domain",
 		"smb.encryption_required",
 		"smb.concurrent_requests",
+		"smb.limits.max_connections",
+		"smb.limits.max_connections_per_client",
+		"smb.limits.max_sessions_per_connection",
+		"smb.limits.max_trees_per_session",
+		"smb.limits.max_opens_per_session",
+		"smb.limits.auth_failures",
+		"smb.limits.auth_window",
+		"smb.limits.auth_block",
+		"smb.limits.auth_max_block",
 	}
 
 	for _, key := range keys {
@@ -503,6 +563,17 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("smb.domain", "BLUESTONE")
 	v.SetDefault("smb.encryption_required", false)
 	v.SetDefault("smb.concurrent_requests", 0)
+	// Limits are generous enough that no ordinary client meets them, and
+	// small enough that one client cannot exhaust the gateway.
+	v.SetDefault("smb.limits.max_connections", 256)
+	v.SetDefault("smb.limits.max_connections_per_client", 64)
+	v.SetDefault("smb.limits.max_sessions_per_connection", 32)
+	v.SetDefault("smb.limits.max_trees_per_session", 64)
+	v.SetDefault("smb.limits.max_opens_per_session", 4096)
+	v.SetDefault("smb.limits.auth_failures", 5)
+	v.SetDefault("smb.limits.auth_window", "5m")
+	v.SetDefault("smb.limits.auth_block", "30s")
+	v.SetDefault("smb.limits.auth_max_block", "15m")
 }
 
 // GetReadTimeout returns the parsed read timeout duration
