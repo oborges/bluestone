@@ -80,6 +80,26 @@ func (c *request) handleIoctl(ctx context.Context, msg []byte, tr *tree) uint32 
 	case wire.FSCTLQueryNetworkInterfaceInfo:
 		c.out = wire.IoctlResponseAppend(c.out, req.CtlCode, req.FileId, nil, nil, req.Flags)
 		return wire.StatusSuccess
+	case wire.FSCTLSrvRequestResumeKey:
+		if tr == nil {
+			return c.errBody(wire.StatusInvalidDeviceRequest)
+		}
+		oh, ok := tr.open(req.FileId)
+		if !ok {
+			return c.errBody(wire.StatusInvalidHandle)
+		}
+		return c.handleRequestResumeKey(&req, oh)
+
+	case wire.FSCTLSrvCopychunk, wire.FSCTLSrvCopychunkWrite:
+		if tr == nil {
+			return c.errBody(wire.StatusInvalidDeviceRequest)
+		}
+		oh, ok := tr.open(req.FileId)
+		if !ok {
+			return c.errBody(wire.StatusInvalidHandle)
+		}
+		return c.handleCopyChunk(ctx, &req, oh)
+
 	case wire.FSCTLPipeWait:
 		c.out = wire.IoctlResponseAppend(c.out, req.CtlCode, req.FileId, nil, nil, req.Flags)
 		return wire.StatusSuccess

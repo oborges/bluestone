@@ -34,6 +34,15 @@ type memStore struct {
 	mu       sync.Mutex
 	objects  map[string][]byte
 	metadata map[string]map[string]string
+	// copies counts bucket-side copies, so a test can tell one from the
+	// gateway reading and writing the bytes itself.
+	copies int
+}
+
+func (s *memStore) copyCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.copies
 }
 
 func newMemStore() *memStore {
@@ -128,6 +137,7 @@ func (s *memStore) ListObjects(_ context.Context, prefix string, maxKeys int) ([
 func (s *memStore) CopyObject(_ context.Context, sourceKey, destKey string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.copies++
 	data, ok := s.objects[sourceKey]
 	if !ok {
 		return os.ErrNotExist
@@ -698,5 +708,95 @@ func TestSMBConcurrentReadsAndWrites(t *testing.T) {
 	close(errs)
 	for err := range errs {
 		t.Error(err)
+	}
+}
+
+// Copying a whole file whose destination is not staged becomes a copy
+// inside the bucket: the bytes never reach the gateway, let alone the
+// client.
+func TestServerSideCopyUsesBucketCopy(t *testing.T) {
+	g := startGateway(t)
+	const contents = "the file that gets copied"
+	g.store.put("source.txt", []byte(contents))
+
+	before := g.store.copyCount()
+	srcHandle := &handle{fs: g.filesystem, path: "/source.txt"}
+	dstHandle := &handle{fs: g.filesystem, path: "/copy.txt", opens: g.server.opens}
+	n, err := dstHandle.CopyChunk(context.Background(), srcHandle, 0, 0, int64(len(contents)))
+	if err != nil {
+		t.Fatalf("CopyChunk() error = %v", err)
+	}
+	if n != int64(len(contents)) {
+		t.Fatalf("CopyChunk() = %d bytes, want %d", n, len(contents))
+	}
+	if copies := g.store.copyCount() - before; copies != 1 {
+		t.Fatalf("bucket-side copies = %d, want 1", copies)
+	}
+	if got := g.readFile(t, "copy.txt"); got != contents {
+		t.Fatalf("copy contains %q, want %q", got, contents)
+	}
+}
+
+// Windows creates the destination before asking for the copy, which stages
+// it. A bucket-side copy would then be overwritten when that staged, empty
+// file syncs, so the backend declines and the server moves the bytes
+// instead: still gateway-side, never out to the client.
+func TestServerSideCopyDeclinesStagedDestination(t *testing.T) {
+	g := startGateway(t)
+	g.store.put("source.txt", []byte("the file that gets copied"))
+
+	dst, err := g.share.Create("copy.txt")
+	if err != nil {
+		t.Fatalf("create destination: %v", err)
+	}
+	defer dst.Close()
+
+	srcHandle := &handle{fs: g.filesystem, path: "/source.txt"}
+	dstHandle := &handle{fs: g.filesystem, path: "/copy.txt", opens: g.server.opens}
+	if _, err := dstHandle.CopyChunk(context.Background(), srcHandle, 0, 0, 25); !errors.Is(err, errors.ErrUnsupported) {
+		t.Fatalf("CopyChunk() with a staged destination = %v, want ErrUnsupported", err)
+	}
+}
+
+// A partial range cannot be expressed as a bucket-side copy, so the backend
+// declines and the server moves the bytes instead.
+func TestServerSideCopyDeclinesPartialRange(t *testing.T) {
+	g := startGateway(t)
+	g.store.put("source.txt", []byte("0123456789"))
+
+	srcHandle := &handle{fs: g.filesystem, path: "/source.txt"}
+	dstHandle := &handle{fs: g.filesystem, path: "/copy.txt", opens: g.server.opens}
+
+	if _, err := dstHandle.CopyChunk(context.Background(), srcHandle, 0, 0, 4); !errors.Is(err, errors.ErrUnsupported) {
+		t.Fatalf("CopyChunk() of a partial range = %v, want ErrUnsupported", err)
+	}
+	if _, err := dstHandle.CopyChunk(context.Background(), srcHandle, 2, 0, 8); !errors.Is(err, errors.ErrUnsupported) {
+		t.Fatalf("CopyChunk() from an offset = %v, want ErrUnsupported", err)
+	}
+}
+
+// While the source is staged, the object in the bucket is not what a reader
+// would see, so a bucket-side copy would copy the wrong bytes.
+func TestServerSideCopyDeclinesStagedSource(t *testing.T) {
+	g := startGateway(t)
+	f, err := g.share.Create("staged.txt")
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	if _, err := f.Write([]byte("written through the gateway and not yet synced")); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	srcHandle := &handle{fs: g.filesystem, path: "/staged.txt"}
+	dstHandle := &handle{fs: g.filesystem, path: "/copy.txt", opens: g.server.opens}
+	info, err := g.filesystem.Stat("/staged.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dstHandle.CopyChunk(context.Background(), srcHandle, 0, 0, info.Size()); !errors.Is(err, errors.ErrUnsupported) {
+		t.Fatalf("CopyChunk() with a staged source = %v, want ErrUnsupported", err)
 	}
 }

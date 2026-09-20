@@ -428,3 +428,48 @@ func matchPattern(pattern, name string) (bool, error) {
 	}
 	return filepath.Match(strings.ToLower(pattern), strings.ToLower(name))
 }
+
+// CopyChunk implements smbvfs.ChunkCopier: a client copying a file inside
+// the share asks the gateway to move the bytes, and for a whole file that
+// becomes a copy inside the bucket, with no bytes moving at all.
+//
+// Anything else, a partial range or a source the gateway cannot copy in the
+// bucket, returns errors.ErrUnsupported so the server copies the bytes
+// itself. Even then they only travel gateway-side, never out to the client.
+func (h *handle) CopyChunk(_ context.Context, src smbvfs.Handle, srcOffset, dstOffset, length int64) (int64, error) {
+	source, ok := src.(*handle)
+	if !ok || h.dir || source.dir {
+		return 0, errors.ErrUnsupported
+	}
+	if srcOffset != 0 || dstOffset != 0 {
+		return 0, errors.ErrUnsupported
+	}
+
+	source.mu.Lock()
+	srcPath := source.path
+	source.mu.Unlock()
+	h.mu.Lock()
+	dstPath := h.path
+	writable := h.writable
+	h.mu.Unlock()
+
+	info, err := h.fs.Stat(srcPath)
+	if err != nil {
+		return 0, err
+	}
+	// Only a copy of the whole file: a shorter range would leave the rest of
+	// the destination as it was, which a bucket-side copy cannot express.
+	if info.Size() != length {
+		return 0, errors.ErrUnsupported
+	}
+	// A destination already open for writing has staged state that a
+	// bucket-side copy would not replace.
+	if writable {
+		return 0, errors.ErrUnsupported
+	}
+
+	if err := h.fs.CopyFile(srcPath, dstPath); err != nil {
+		return 0, err
+	}
+	return length, nil
+}
