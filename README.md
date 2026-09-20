@@ -309,6 +309,14 @@ so handling requests in turn would cost it a round trip each. Requests that
 create or destroy state, such as opening and closing files, stay ordered.
 `concurrent_requests: 1` restores the older serial behaviour.
 
+Failures are reported as the status a client acts on, rather than as a
+permissions error: a full staging area or bucket quota reaches Windows as
+"there is not enough space on the disk", a read-only backend as a
+write-protected disk, an operation that timed out as an I/O timeout, and a
+backend failure the gateway does not recognise as an I/O device error.
+`smb_requests_total{status="..."}` counts them, so a rise in
+`STATUS_DISK_FULL` is visible before users report it.
+
 Byte-range locks taken over SMB go into the same table as NFS locks, so the
 two protocols conflict with each other on the same bytes. A lock belongs to
 the handle that took it and is released when that handle closes or its session

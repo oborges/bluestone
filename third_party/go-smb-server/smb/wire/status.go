@@ -34,6 +34,13 @@ const (
 	StatusRangeNotLocked         uint32 = 0xC000007A
 	StatusNoMoreFiles            uint32 = 0x80000006
 	StatusUserSessionDeleted     uint32 = 0xC0000203
+	StatusDiskFull               uint32 = 0xC000007F
+	StatusDirectoryNotEmpty      uint32 = 0xC0000101
+	StatusMediaWriteProtected    uint32 = 0xC00000A2
+	StatusObjectNameInvalid      uint32 = 0xC0000033
+	StatusIOTimeout              uint32 = 0xC00000B5
+	StatusUnexpectedIOError      uint32 = 0xC00000E9
+	StatusConnectionDisconnected uint32 = 0xC000020C
 )
 
 type NTError struct {

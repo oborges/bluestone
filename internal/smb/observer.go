@@ -127,6 +127,13 @@ var statusNames = map[uint32]string{
 	wire.StatusBadNetworkName:         "STATUS_BAD_NETWORK_NAME",
 	wire.StatusNotADirectory:          "STATUS_NOT_A_DIRECTORY",
 	wire.StatusUserSessionDeleted:     "STATUS_USER_SESSION_DELETED",
+	wire.StatusDiskFull:               "STATUS_DISK_FULL",
+	wire.StatusDirectoryNotEmpty:      "STATUS_DIRECTORY_NOT_EMPTY",
+	wire.StatusMediaWriteProtected:    "STATUS_MEDIA_WRITE_PROTECTED",
+	wire.StatusObjectNameInvalid:      "STATUS_OBJECT_NAME_INVALID",
+	wire.StatusIOTimeout:              "STATUS_IO_TIMEOUT",
+	wire.StatusUnexpectedIOError:      "STATUS_UNEXPECTED_IO_ERROR",
+	wire.StatusConnectionDisconnected: "STATUS_CONNECTION_DISCONNECTED",
 }
 
 // statusName labels a metric with the NT status. A status the server does

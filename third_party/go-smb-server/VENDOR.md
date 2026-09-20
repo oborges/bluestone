@@ -188,6 +188,15 @@ proposed upstream.
   rather than the password and still accept any user and domain. `NTOWFv2`
   is now the two called together.
 
+- `smb/server` + `smb/wire`: backend errors map to the status a client acts
+  on rather than mostly to STATUS_ACCESS_DENIED: ENOSPC becomes
+  STATUS_DISK_FULL, EROFS a write-protected disk, ENOTEMPTY, EISDIR and
+  ENOTDIR their own statuses, EBUSY a sharing violation, EMFILE and ENOMEM
+  insufficient resources, a deadline or ETIMEDOUT an I/O timeout, and
+  anything unrecognised STATUS_UNEXPECTED_IO_ERROR. The errno cases are
+  tested before the io/fs sentinels, because Go reports some errnos as those
+  sentinels (ENOTEMPTY reads as fs.ErrExist).
+
 ## Known gaps to close in Bluestone
 
 Tracked with the rest of the SMB work in `docs/SMB_ROADMAP.md`.
