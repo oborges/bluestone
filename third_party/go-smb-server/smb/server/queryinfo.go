@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/binary"
 	"strings"
 
 	"github.com/sonroyaalmerol/go-smb-server/smb/vfs"
@@ -106,10 +107,35 @@ func (c *request) handleQueryInfo(ctx context.Context, msg []byte, tr *tree) uin
 		c.out = wire.QueryInfoResponseAppend(c.out, info)
 		return wire.StatusSuccess
 
+	case wire.InfoSecurity:
+		fi, err := oh.h.Stat(ctx)
+		if err != nil {
+			return c.errBody(osErrToStatus(err))
+		}
+		descriptor := wire.SecurityDescriptor(req.AdditionalInfo, fi.IsDir)
+		if uint32(len(descriptor)) > req.OutputBufferLength {
+			// The client asks with a small buffer first and retries with
+			// the size the server reports (MS-SMB2 3.3.5.20.3), so the
+			// error carries that size rather than a truncated descriptor.
+			return c.securityBufferTooSmall(uint32(len(descriptor)))
+		}
+		c.out = wire.QueryInfoResponseAppend(c.out, descriptor)
+		return wire.StatusSuccess
+
 	default:
 		c.log.Debug("unsupported query-info type", "info_type", req.InfoType, "class", req.FileInfoClass)
 		return c.errBody(wire.StatusNotSupported)
 	}
+}
+
+// securityBufferTooSmall answers a security query whose buffer is too small
+// with the size the client should ask for.
+func (c *request) securityBufferTooSmall(needed uint32) uint32 {
+	var size [4]byte
+	binary.LittleEndian.PutUint32(size[:], needed)
+	resp := wire.ErrorResponse{ErrorData: size[:]}
+	c.out = resp.Append(c.out)
+	return wire.StatusBufferTooSmall
 }
 
 func networkOpenInfo(basic wire.FileBasicInformation, size int64) []byte {
@@ -342,6 +368,13 @@ func (c *request) handleSetInfo(ctx context.Context, msg []byte, tr *tree) uint3
 		}
 		c.out = wire.SetInfoResponseAppend(c.out)
 		return wire.StatusSuccess
+	}
+	if req.InfoType == wire.InfoSecurity {
+		// Refused rather than accepted and dropped: the gateway keeps no
+		// Windows ACLs, and a client told its change was saved would show
+		// permissions that are not enforced anywhere.
+		c.log.Debug("refusing to set a security descriptor", "path", oh.path)
+		return c.errBody(wire.StatusNotSupported)
 	}
 	c.log.Debug("unsupported set-info type", "info_type", req.InfoType, "class", req.FileInfoClass)
 	return c.errBody(wire.StatusNotSupported)

@@ -338,6 +338,14 @@ fail with a sharing violation until it closes. The table of open files lives
 in the gateway, so opens conflict across all SMB clients; NFS does not take
 part in it yet.
 
+Windows asks for a file's security descriptor to show its Security tab, and
+some applications ask on open. The gateway answers with everyone having full
+access, owned by `BUILTIN\Administrators`: it stores no Windows owners or
+ACLs, and says so plainly rather than inventing detail. Changing permissions
+from Windows is refused, because accepting a change the gateway cannot store
+would show permissions that nothing enforces. Access is controlled by the
+accounts in `smb.users` and by `server.allowed_clients`.
+
 No oplocks or leases are granted, so clients do not cache file contents
 locally and write through to the gateway. That keeps SMB clients consistent
 with NFS clients and with changes made directly in the bucket, at the cost of
