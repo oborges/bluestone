@@ -604,6 +604,7 @@ func IoctlResponseAppend(dst []byte, ctlCode uint32, fileId [16]byte, in, out []
 const (
 	FSCTLDfsGetReferrals           uint32 = 0x00060194
 	FSCTLSrvCopychunk              uint32 = 0x001440F2
+	FSCTLSrvCopychunkWrite         uint32 = 0x001480F2
 	FSCTLSrvEnumerateSnapshots     uint32 = 0x00144064
 	FSCTLSrvRequestResumeKey       uint32 = 0x00140078
 	FSCTLQueryNetworkInterfaceInfo uint32 = 0x001401FC
@@ -612,3 +613,62 @@ const (
 	FSCTLPipeWait                  uint32 = 0x00110018
 	FSCTLPipeTransceive            uint32 = 0x0011C017
 )
+
+// CopyChunk is one range to copy in a server-side copy request
+// (SRV_COPYCHUNK, MS-SMB2 section 2.2.32.1).
+type CopyChunk struct {
+	SourceOffset uint64
+	TargetOffset uint64
+	Length       uint32
+}
+
+// CopyChunkRequest is the SRV_COPYCHUNK_COPY structure a client sends with
+// FSCTL_SRV_COPYCHUNK, naming the source by the resume key it was given.
+type CopyChunkRequest struct {
+	SourceKey [24]byte
+	Chunks    []CopyChunk
+}
+
+// Parse reads the request from an IOCTL's input buffer.
+func (r *CopyChunkRequest) Parse(b []byte) error {
+	const header = 32
+	if len(b) < header {
+		return fmt.Errorf("wire: copychunk needs %d bytes, got %d", header, len(b))
+	}
+	copy(r.SourceKey[:], b[0:24])
+	count := binary.LittleEndian.Uint32(b[24:28])
+	const chunkSize = 24
+	// Guard the allocation: the count is attacker-controlled, so it must
+	// match the bytes actually sent.
+	if uint64(count)*chunkSize > uint64(len(b)-header) {
+		return fmt.Errorf("wire: copychunk claims %d chunks, more than its %d bytes hold", count, len(b)-header)
+	}
+	r.Chunks = make([]CopyChunk, 0, count)
+	for i := uint32(0); i < count; i++ {
+		c := b[header+int(i)*chunkSize:]
+		r.Chunks = append(r.Chunks, CopyChunk{
+			SourceOffset: binary.LittleEndian.Uint64(c[0:8]),
+			TargetOffset: binary.LittleEndian.Uint64(c[8:16]),
+			Length:       binary.LittleEndian.Uint32(c[16:20]),
+		})
+	}
+	return nil
+}
+
+// CopyChunkResponse is SRV_COPYCHUNK_RESPONSE (MS-SMB2 section 2.2.32.1).
+// On a refusal for being too large it carries the server's limits instead of
+// what was copied.
+type CopyChunkResponse struct {
+	ChunksWritten     uint32
+	ChunkBytesWritten uint32
+	TotalBytesWritten uint32
+}
+
+// Encode renders the response.
+func (r CopyChunkResponse) Encode() []byte {
+	out := make([]byte, 12)
+	binary.LittleEndian.PutUint32(out[0:4], r.ChunksWritten)
+	binary.LittleEndian.PutUint32(out[4:8], r.ChunkBytesWritten)
+	binary.LittleEndian.PutUint32(out[8:12], r.TotalBytesWritten)
+	return out
+}

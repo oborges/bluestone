@@ -303,6 +303,7 @@ func (c *request) handleTreeDisconnect(ctx context.Context, hdr *wire.Header, se
 func (c *conn) closeAllOpens(ctx context.Context, tr *tree) {
 	for _, oh := range tr.allOpens() {
 		c.srv.lockTable().ReleaseOwner(lockOwner(oh.sessionID, oh.fileId))
+		c.srv.resumeKeyTable().release(oh)
 		_ = oh.h.Close(ctx)
 	}
 	tr.opens = make(map[[16]byte]*openHandle)
@@ -421,6 +422,7 @@ func (c *request) handleClose(ctx context.Context, msg []byte, tr *tree) uint32 
 		return c.errBody(osErrToStatus(err))
 	}
 	tr.removeOpen(req.FileId)
+	c.srv.resumeKeyTable().release(oh)
 	if tr.oplocks != nil {
 		tr.oplocks.release(oh.path)
 	}

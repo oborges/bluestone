@@ -357,3 +357,12 @@ func statToFileInfo(name string, fi fs.FileInfo) FileInfo {
 		ChangeTime:   now,
 	}
 }
+
+// ChunkCopier is a handle that can copy a range from another file itself,
+// which a backend over object storage can often do without moving the bytes
+// at all. The server calls it for a server-side copy (FSCTL_SRV_COPYCHUNK)
+// and copies the bytes through itself when it is not implemented, or when
+// the backend returns errors.ErrUnsupported for a particular copy.
+type ChunkCopier interface {
+	CopyChunk(ctx context.Context, src Handle, srcOffset, dstOffset, length int64) (int64, error)
+}

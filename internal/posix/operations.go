@@ -1169,6 +1169,46 @@ fetchFromCOS:
 }
 
 // RenameFile renames/moves a file or directory
+// CopyFile copies one object to another inside the bucket, without the bytes
+// passing through the gateway. It is what a server-side copy (SMB's
+// FSCTL_SRV_COPYCHUNK) becomes when the whole file is being copied and the
+// source is clean in COS.
+func (h *OperationsHandler) CopyFile(ctx context.Context, srcPath, dstPath string) (err error) {
+	log := logging.WithOperation("CopyFile").With(
+		zap.String("srcPath", srcPath),
+		zap.String("dstPath", dstPath),
+	)
+	start := time.Now()
+	defer func() {
+		metrics.RecordRequest(ctx, "copy", err, time.Since(start))
+	}()
+
+	srcPath = NormalizePath(srcPath)
+	dstPath = NormalizePath(dstPath)
+	if srcPath == dstPath {
+		return nil
+	}
+
+	info, err := h.Stat(ctx, srcPath)
+	if err != nil {
+		return err
+	}
+	if info.IsDir() {
+		return &os.PathError{Op: "copy", Path: srcPath, Err: errors.ErrUnsupported}
+	}
+
+	// The destination's cached metadata and any cached listing of its
+	// directory describe a file that is about to change.
+	defer h.invalidateFileMutation(dstPath)
+
+	if err := h.cosClient.CopyObject(ctx, h.translator.ToObjectKey(srcPath), h.translator.ToObjectKey(dstPath)); err != nil {
+		log.Error("Failed to copy object", zap.Error(err))
+		return err
+	}
+	log.Debug("File copied inside the bucket", zap.Int64("size", info.Size()))
+	return nil
+}
+
 func (h *OperationsHandler) RenameFile(ctx context.Context, oldPath, newPath string) (err error) {
 	log := logging.WithOperation("RenameFile").With(
 		zap.String("oldPath", oldPath),

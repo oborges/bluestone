@@ -42,6 +42,7 @@ type Server struct {
 	observer      Observer
 	limits        Limits
 	authGate      AuthGate
+	resume        *resumeKeys
 	maxConcurrent int
 	maxTransact   uint32
 	maxRead       uint32
@@ -333,6 +334,7 @@ func (t *tree) addOpen(oh *openHandle) {
 }
 
 // removeOpen forgets an open handle.
+// removeOpen forgets an open handle and the resume key naming it.
 func (t *tree) removeOpen(id [16]byte) {
 	t.mu.Lock()
 	defer t.mu.Unlock()

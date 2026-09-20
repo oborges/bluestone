@@ -338,6 +338,13 @@ fail with a sharing violation until it closes. The table of open files lives
 in the gateway, so opens conflict across all SMB clients; NFS does not take
 part in it yet.
 
+Copying a file inside the share is done by the gateway: the client asks for
+a server-side copy and the bytes never travel to it and back. When the whole
+file is being copied and neither side is staged, the gateway goes further and
+copies the object inside the bucket, so no bytes move at all. A copy whose
+destination the client created first, which is what Windows Explorer does,
+is staged and so is copied by the gateway rather than inside the bucket.
+
 Windows asks for a file's security descriptor to show its Security tab, and
 some applications ask on open. The gateway answers with everyone having full
 access, owned by `BUILTIN\Administrators`: it stores no Windows owners or

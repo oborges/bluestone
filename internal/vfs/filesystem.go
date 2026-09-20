@@ -561,6 +561,42 @@ func (fs *Filesystem) statFromStaging(fullPath string) os.FileInfo {
 }
 
 // Rename renames a file
+// CopyFile copies src to dst inside the bucket, without the bytes passing
+// through the gateway or the client. It is what SMB's server-side copy
+// becomes when a whole file is being copied.
+//
+// It returns errors.ErrUnsupported when a bucket-side copy would not produce
+// the same bytes a read-and-write would: the caller then copies the data
+// itself. That is the case while either file is staged, because the object
+// in COS is not what a reader would see.
+func (fs *Filesystem) CopyFile(src, dst string) error {
+	srcFull := fs.keyPath(src)
+	dstFull := fs.keyPath(dst)
+	if isReservedPath(srcFull) || isReservedPath(dstFull) {
+		return &os.PathError{Op: "copy", Path: src, Err: os.ErrPermission}
+	}
+	if srcFull == dstFull {
+		return nil
+	}
+
+	if fs.featureFlags != nil && fs.featureFlags.IsStagingEnabled() && fs.stagingManager != nil {
+		for _, path := range []string{srcFull, dstFull} {
+			// Staged state is the truth for these paths, and the object in
+			// COS may be older or absent.
+			if fs.stagingManager.IsDirty(path) || fs.stagingManager.HasPendingDelete(path) ||
+				fs.stagingManager.IsConflicted(path) {
+				return errors.ErrUnsupported
+			}
+		}
+	}
+
+	if err := fs.ops.CopyFile(fs.requestContext(), srcFull, dstFull); err != nil {
+		return err
+	}
+	fs.logger.Debug("Copied inside the bucket", "src", srcFull, "dst", dstFull)
+	return nil
+}
+
 func (fs *Filesystem) Rename(oldpath, newpath string) error {
 	oldFull := fs.keyPath(oldpath)
 	newFull := fs.renameTargetPath(oldFull, newpath)

@@ -219,6 +219,19 @@ proposed upstream.
   are the first bytes of the FileId, so both fields were whatever the handle
   happened to contain.
 
+- `smb/server` + `smb/wire` + `smb/vfs`: server-side copy.
+  FSCTL_SRV_REQUEST_RESUME_KEY hands out a token naming an open, and
+  FSCTL_SRV_COPYCHUNK copies ranges from the file that token names into
+  another open, so a copy within a share never travels to the client and
+  back. Requests past the limits (16 chunks, 1 MiB each, 16 MiB total) are
+  answered with those limits, as MS-SMB2 3.3.5.15.6 specifies, and an
+  unknown resume key with STATUS_OBJECT_NAME_NOT_FOUND so the client falls
+  back. A backend that implements `vfs.ChunkCopier` copies the range
+  itself, which over object storage can mean no bytes moving at all;
+  returning errors.ErrUnsupported for a particular copy falls back to the
+  server moving them. Upstream answered STATUS_NOT_SUPPORTED to both
+  controls, so every copy went out to the client and back.
+
 ## Known gaps to close in Bluestone
 
 Tracked with the rest of the SMB work in `docs/SMB_ROADMAP.md`.
