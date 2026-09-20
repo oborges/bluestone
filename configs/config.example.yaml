@@ -129,7 +129,7 @@ smb:
   #   - username: "alice"
   #     # The account's NT hash, printed by: bluestone -smb-hash
   #     # (it reads the password from stdin, so it stays out of shell history)
-  #     ntlm_hash: "8846f7eaee8fb117ad06bdd830b7586c"
+  #     ntlm_hash: "<32 hex characters>"
   #     # password: "change-me"   # deprecated: use ntlm_hash
 
 logging:

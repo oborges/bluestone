@@ -27,8 +27,13 @@ func TestNTOWFv2FromHashMatchesPassword(t *testing.T) {
 
 // The NT hash is the one Windows and Samba use, so a hash taken from
 // elsewhere works here. This is the documented MD4 of the UTF-16LE password.
+//
+// The constant below is the published NT hash of the word "password", used
+// as a test vector in MS-NLMP and by Samba and hashcat. Secret scanners
+// recognise it, correctly, as a valid NT hash: it belongs in this test,
+// where the point is that the function agrees with everyone else, and
+// nowhere else in the tree.
 func TestNTHashMatchesKnownValue(t *testing.T) {
-	// "password" hashes to this well-known value.
 	const want = "8846f7eaee8fb117ad06bdd830b7586c"
 	if got := NTHash("password"); got == nil || hexOf(got) != want {
 		t.Fatalf("NTHash(\"password\") = %x, want %s", got, want)
