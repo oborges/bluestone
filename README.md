@@ -235,7 +235,9 @@ smb:
 ```
 
 The SMB server is experimental and disabled by default. It serves the same
-bucket and staging layer as NFS, so both protocols see the same files. SMB
+bucket and staging layer as NFS, so both protocols see the same files. What
+"experimental" still means, and the work to remove it, is in
+[`docs/SMB_ROADMAP.md`](docs/SMB_ROADMAP.md). SMB
 clients get Windows naming: names match case-insensitively, and characters
 Windows cannot use in names are shown as Unicode private-use characters and
 mapped back to the stored key. Creation time and the read-only, hidden,
