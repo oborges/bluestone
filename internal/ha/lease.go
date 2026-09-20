@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/oborges/bluestone/internal/logging"
@@ -51,11 +52,20 @@ type Manager struct {
 	heartbeatInterval time.Duration
 	leaseTimeout      time.Duration
 	holderMarkerPath  string
+	onLeaseLost       func(LeaseLoss)
 
-	mu     sync.Mutex
-	lease  Lease
-	cancel context.CancelFunc
-	done   chan struct{}
+	mu sync.Mutex
+	// lastRenewed is when the lease was last written successfully, so the
+	// manager knows how long it has been unable to prove it still holds it.
+	lastRenewed time.Time
+	lease       Lease
+	cancel      context.CancelFunc
+	done        chan struct{}
+	// lost records that the loss was already reported, so a node is fenced
+	// once rather than on every heartbeat after it.
+	lost atomic.Bool
+	// now is time.Now, replaced in tests.
+	now func() time.Time
 }
 
 // Options configures the lease manager.
@@ -70,6 +80,35 @@ type Options struct {
 	// ForceTakeover steals a fresh foreign lease. Break-glass only: the
 	// operator must know the previous holder is dead.
 	ForceTakeover bool
+	// OnLeaseLost is called once when this node can no longer prove it holds
+	// the lease: another gateway took it, or heartbeats have been failing
+	// for longer than the lease timeout, after which a standby is entitled
+	// to promote. The gateway uses it to stop serving the bucket. It is
+	// called from the heartbeat goroutine; nil keeps the old behaviour of
+	// logging and serving on.
+	OnLeaseLost func(LeaseLoss)
+}
+
+// LeaseLoss describes why a node stopped holding the lease.
+type LeaseLoss struct {
+	// Reason is "taken" when another holder owns the lease now, or
+	// "unreachable" when heartbeats failed for longer than the lease
+	// timeout.
+	Reason string
+	// TakenBy is the holder that owns the lease, when it was taken.
+	TakenBy *Lease
+	// Since is how long heartbeats have been failing, when unreachable.
+	Since time.Duration
+	// Err is the last heartbeat error, when unreachable.
+	Err error
+}
+
+// Description reports the loss in the form an operator reads in a log.
+func (l LeaseLoss) Description() string {
+	if l.Reason == "taken" && l.TakenBy != nil {
+		return fmt.Sprintf("another gateway holds the lease (%s on %s)", l.TakenBy.HolderID, l.TakenBy.Hostname)
+	}
+	return fmt.Sprintf("the lease could not be renewed for %s: %v", l.Since.Round(time.Second), l.Err)
 }
 
 // ErrLeaseHeld is returned when another live gateway holds the lease.
@@ -101,7 +140,9 @@ func Acquire(ctx context.Context, opts Options) (*Manager, error) {
 		heartbeatInterval: opts.HeartbeatInterval,
 		leaseTimeout:      opts.LeaseTimeout,
 		holderMarkerPath:  filepath.Join(opts.HolderMarkerDir, "ha-holder-marker"),
+		onLeaseLost:       opts.OnLeaseLost,
 		done:              make(chan struct{}),
+		now:               time.Now,
 	}
 	if m.heartbeatInterval <= 0 {
 		m.heartbeatInterval = 15 * time.Second
@@ -140,9 +181,13 @@ func Acquire(ctx context.Context, opts Options) (*Manager, error) {
 		HolderID:   m.holderID,
 		Hostname:   m.hostname,
 		Epoch:      m.lease.Epoch + 1,
-		AcquiredAt: time.Now(),
-		RenewedAt:  time.Now(),
+		AcquiredAt: m.now(),
+		RenewedAt:  m.now(),
 	}
+	// The clock for "unable to prove we hold the lease" runs from here, so
+	// a node whose first write fails is still fenced once the lease times
+	// out rather than serving on indefinitely.
+	m.lastRenewed = m.now()
 	if err := m.writeLease(ctx); err != nil {
 		if !m.localMarkerPresent() && !opts.ForceTakeover {
 			return nil, fmt.Errorf("failed to write bucket lease: %w", err)
@@ -180,13 +225,19 @@ func (m *Manager) readLease(ctx context.Context) (*Lease, error) {
 
 func (m *Manager) writeLease(ctx context.Context) error {
 	m.mu.Lock()
-	m.lease.RenewedAt = time.Now()
+	m.lease.RenewedAt = m.now()
 	payload, err := json.MarshalIndent(m.lease, "", "  ")
 	m.mu.Unlock()
 	if err != nil {
 		return err
 	}
-	return m.store.PutObject(ctx, LeaseObjectKey, payload, map[string]string{})
+	if err := m.store.PutObject(ctx, LeaseObjectKey, payload, map[string]string{}); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	m.lastRenewed = m.now()
+	m.mu.Unlock()
+	return nil
 }
 
 func (m *Manager) heartbeatLoop(ctx context.Context) {
@@ -200,23 +251,57 @@ func (m *Manager) heartbeatLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 			hbCtx, cancel := context.WithTimeout(ctx, m.heartbeatInterval)
-			// Detect theft: if another holder overwrote the lease, scream.
-			// The thief had to force (or we went silent past the timeout);
-			// shutting down I/O automatically risks more harm than loud
-			// alerts, so log at the highest severity and keep serving.
+			// Theft: another holder owns the lease, so this node must stop
+			// serving the bucket. Two gateways writing one bucket is what
+			// the lease exists to prevent.
 			if current, err := m.readLease(hbCtx); err == nil && current.HolderID != m.holderID {
-				logging.Error("HA LEASE LOST: another gateway took over this bucket; stop this node immediately",
+				logging.Error("HA LEASE LOST: another gateway took over this bucket",
 					zap.String("taken_by", current.HolderID),
 					zap.String("taken_by_host", current.Hostname))
+				taken := *current
+				m.reportLoss(LeaseLoss{Reason: "taken", TakenBy: &taken})
+				cancel()
+				continue
 			}
 			if err := m.writeLease(hbCtx); err != nil {
+				failingFor := m.renewFailingFor()
 				logging.Error("HA lease heartbeat failed; standby may take over after the lease timeout",
 					zap.Error(err),
+					zap.Duration("failing_for", failingFor),
 					zap.Duration("lease_timeout", m.leaseTimeout))
+				// Past the lease timeout a standby is entitled to promote,
+				// so this node can no longer claim the bucket is its own.
+				if failingFor > m.leaseTimeout {
+					m.reportLoss(LeaseLoss{Reason: "unreachable", Since: failingFor, Err: err})
+				}
 			}
 			cancel()
 		}
 	}
+}
+
+// renewFailingFor reports how long it has been since the lease was last
+// written successfully.
+func (m *Manager) renewFailingFor() time.Duration {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.lastRenewed.IsZero() {
+		return 0
+	}
+	return m.now().Sub(m.lastRenewed)
+}
+
+// reportLoss tells the application once that this node no longer holds the
+// lease. Without a handler the node keeps serving and the error log is the
+// only warning, which is what it did before fencing existed.
+func (m *Manager) reportLoss(loss LeaseLoss) {
+	if !m.lost.CompareAndSwap(false, true) {
+		return
+	}
+	if m.onLeaseLost == nil {
+		return
+	}
+	m.onLeaseLost(loss)
 }
 
 func (m *Manager) localMarkerPresent() bool {
@@ -260,6 +345,14 @@ func (m *Manager) Release() {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	// Never delete a lease this node does not hold: after a takeover the
+	// object belongs to the gateway that now serves the bucket, and
+	// deleting it would let a third one start.
+	if current, err := m.readLease(ctx); err == nil && current.HolderID != m.holderID {
+		logging.Warn("Not releasing the HA lease: another gateway holds it now",
+			zap.String("held_by", current.HolderID))
+		return
+	}
 	if err := m.store.DeleteObject(ctx, LeaseObjectKey); err != nil {
 		logging.Error("Failed to release HA lease; standby promotion will wait for the lease timeout",
 			zap.Error(err))

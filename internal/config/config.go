@@ -144,6 +144,32 @@ type HAConfig struct {
 	// only (set BLUESTONE_HA_FORCE_TAKEOVER=true); never leave enabled in
 	// a config file.
 	ForceTakeover bool `mapstructure:"force_takeover"`
+	// OnLeaseLost is what the gateway does when it can no longer prove it
+	// holds the lease, because another gateway took it or because the lease
+	// could not be renewed for longer than lease_timeout:
+	//
+	//   stop  stop serving and exit non-zero, so a supervisor restarts the
+	//         gateway, which then fences itself against the holder. This is
+	//         the default: two gateways writing one bucket is what the
+	//         lease exists to prevent.
+	//   warn  log and keep serving, which risks two writers but never
+	//         interrupts this one.
+	OnLeaseLost string `mapstructure:"on_lease_lost"`
+}
+
+// Values for HAConfig.OnLeaseLost.
+const (
+	LeaseLostStop = "stop"
+	LeaseLostWarn = "warn"
+)
+
+// GetOnLeaseLost reports what to do when the lease is lost, defaulting to
+// stopping.
+func (c *HAConfig) GetOnLeaseLost() string {
+	if strings.TrimSpace(c.OnLeaseLost) == "" {
+		return LeaseLostStop
+	}
+	return strings.ToLower(strings.TrimSpace(c.OnLeaseLost))
 }
 
 // GetDrainTimeout parses how long a shutdown waits for requests in flight,
@@ -447,6 +473,7 @@ func bindEnvOverrides(v *viper.Viper) error {
 		"ha.heartbeat_interval",
 		"ha.lease_timeout",
 		"ha.force_takeover",
+		"ha.on_lease_lost",
 		"smb.enabled",
 		"smb.port",
 		"smb.share_name",
@@ -604,6 +631,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("ha.heartbeat_interval", "15s")
 	v.SetDefault("ha.lease_timeout", "60s")
 	v.SetDefault("ha.force_takeover", false)
+	v.SetDefault("ha.on_lease_lost", "stop")
 
 	// SMB server defaults (disabled unless explicitly enabled)
 	v.SetDefault("smb.enabled", false)

@@ -412,3 +412,37 @@ func TestSMBDrainTimeout(t *testing.T) {
 		}
 	}
 }
+
+func TestHAOnLeaseLost(t *testing.T) {
+	setRequiredTestEnv(t)
+
+	cfg, err := Load(writeTestConfig(t, "staging:\n  enabled: false\n"))
+	if err != nil {
+		t.Fatalf("Load() returned error: %v", err)
+	}
+	if got := cfg.HA.GetOnLeaseLost(); got != LeaseLostStop {
+		t.Fatalf("on_lease_lost default = %q, want %q", got, LeaseLostStop)
+	}
+
+	cfg, err = Load(writeTestConfig(t, "staging:\n  enabled: false\nha:\n  on_lease_lost: WARN\n"))
+	if err != nil {
+		t.Fatalf("Load() with on_lease_lost returned error: %v", err)
+	}
+	if got := cfg.HA.GetOnLeaseLost(); got != LeaseLostWarn {
+		t.Fatalf("on_lease_lost = %q, want %q (case-insensitive)", got, LeaseLostWarn)
+	}
+
+	valid := HAConfig{Enabled: true, HeartbeatInterval: "15s", LeaseTimeout: "60s"}
+	for _, value := range []string{"", "stop", "warn", "Stop"} {
+		cfg := valid
+		cfg.OnLeaseLost = value
+		if err := validateHA(&cfg); err != nil {
+			t.Errorf("validateHA() with on_lease_lost %q = %v, want nil", value, err)
+		}
+	}
+	bad := valid
+	bad.OnLeaseLost = "panic"
+	if err := validateHA(&bad); err == nil {
+		t.Error("validateHA() accepted an unknown on_lease_lost")
+	}
+}

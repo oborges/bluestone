@@ -60,6 +60,11 @@ func validateHA(config *HAConfig) error {
 	if config.Enabled && timeout <= heartbeat*2 {
 		return fmt.Errorf("lease_timeout (%s) must be more than twice heartbeat_interval (%s) or transient heartbeat delays cause spurious takeovers", timeout, heartbeat)
 	}
+	switch config.GetOnLeaseLost() {
+	case LeaseLostStop, LeaseLostWarn:
+	default:
+		return fmt.Errorf("invalid on_lease_lost %q: want %q or %q", config.OnLeaseLost, LeaseLostStop, LeaseLostWarn)
+	}
 	return nil
 }
 
