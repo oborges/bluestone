@@ -54,10 +54,26 @@ const serverChallengeFlags = FlagNegotiateUnicode |
 	FlagNegotiateKeyExch
 
 func NTOWFv2(password, user, domain string) []byte {
+	return NTOWFv2FromHash(NTHash(password), user, domain)
+}
+
+// NTHash returns the NT hash of a password (MD4 of its UTF-16LE form), which
+// is what NTLM authentication needs rather than the password itself. A server
+// can store this instead of the password: it still authenticates any user and
+// domain, because those are mixed in per login by NTOWFv2FromHash.
+//
+// The NT hash is password-equivalent for NTLM, so it is a secret: storing it
+// keeps the password itself out of the configuration, not out of the threat
+// model.
+func NTHash(password string) []byte {
 	hash := md4.New()
 	hash.Write([]byte(toUTF16LE(password)))
-	ntHash := hash.Sum(nil)
+	return hash.Sum(nil)
+}
 
+// NTOWFv2FromHash derives the NTLMv2 key for one login from an NT hash, the
+// username, and the domain the client sent.
+func NTOWFv2FromHash(ntHash []byte, user, domain string) []byte {
 	concat := strings.ToUpper(user) + domain
 	key := []byte(toUTF16LE(concat))
 
