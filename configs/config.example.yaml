@@ -89,6 +89,12 @@ object_refresh:
 # crashed) or immediately after a graceful shutdown. Break-glass takeover of
 # a fresh lease: BLUESTONE_HA_FORCE_TAKEOVER=true (never set in this file).
 ha:
+  # What to do when this gateway can no longer prove it holds the lease,
+  # because another gateway took it or it could not be renewed for longer
+  # than lease_timeout: "stop" stops serving and exits 3 (a supervisor can
+  # restart it; it will refuse to serve while the other holder is alive),
+  # "warn" logs and keeps serving, which risks two writers.
+  on_lease_lost: "stop"
   enabled: false
   heartbeat_interval: "15s"
   lease_timeout: "60s"

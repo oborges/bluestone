@@ -217,14 +217,25 @@ func (s *Server) Start() error {
 // that has stopped responding cannot hold up a restart. It is safe to call
 // more than once.
 func (s *Server) Stop() error {
+	return s.stop(s.drain)
+}
+
+// StopNow stops without draining, for when serving even one more request
+// would be wrong: the gateway has lost the bucket lease, so another gateway
+// may already be writing to it.
+func (s *Server) StopNow() error {
+	return s.stop(0)
+}
+
+func (s *Server) stop(drain time.Duration) error {
 	s.stopOnce.Do(func() {
-		s.logger.Info("Stopping SMB server", zap.Duration("drain_timeout", s.drain))
+		s.logger.Info("Stopping SMB server", zap.Duration("drain_timeout", drain))
 
 		// Drain stops the listener itself, so it runs before anything else
 		// closes it: a closed listener would make the drain give up at once
 		// and cut off the clients it is meant to let finish.
 		started := time.Now()
-		ctx, cancel := context.WithTimeout(context.Background(), s.drain)
+		ctx, cancel := context.WithTimeout(context.Background(), drain)
 		defer cancel()
 		if err := s.srv.Drain(ctx, drainIdleFor); err != nil {
 			stats := s.Stats()

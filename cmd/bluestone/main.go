@@ -46,6 +46,10 @@ var (
 	smbHash    = flag.Bool("smb-hash", false, "Read a password from standard input and print its NT hash for smb.users[].ntlm_hash")
 )
 
+// exitLeaseLost is the exit status when the gateway stops because it lost
+// the bucket lease, so a supervisor can tell it apart from a clean stop.
+const exitLeaseLost = 3
+
 // printSMBHash reads a password from standard input and prints its NT hash,
 // so an operator can put the hash in the configuration instead of the
 // password. The password is read from stdin rather than taken as an
@@ -144,17 +148,31 @@ func main() {
 
 	logging.Info("COS client initialized successfully")
 
-	// HA fencing: exactly one gateway may serve this bucket.
+	// HA fencing: exactly one gateway may serve this bucket. Losing the
+	// lease means another gateway may be writing to it, so this one stops
+	// serving rather than risking two writers.
+	leaseLost := make(chan ha.LeaseLoss, 1)
 	if cfg.HA.Enabled {
 		heartbeat, _ := cfg.HA.GetHeartbeatInterval()
 		leaseTimeout, _ := cfg.HA.GetLeaseTimeout()
-		leaseManager, err := ha.Acquire(context.Background(), ha.Options{
+		haOptions := ha.Options{
 			Store:             cosClient,
 			HeartbeatInterval: heartbeat,
 			LeaseTimeout:      leaseTimeout,
 			HolderMarkerDir:   cfg.Staging.RootDir,
 			ForceTakeover:     cfg.HA.ForceTakeover,
-		})
+		}
+		if cfg.HA.GetOnLeaseLost() == config.LeaseLostStop {
+			haOptions.OnLeaseLost = func(loss ha.LeaseLoss) {
+				select {
+				case leaseLost <- loss:
+				default:
+				}
+			}
+		} else {
+			logging.Warn("ha.on_lease_lost is \"warn\": this gateway will keep serving a bucket it no longer holds the lease for")
+		}
+		leaseManager, err := ha.Acquire(context.Background(), haOptions)
 		if err != nil {
 			logging.Fatal("HA lease acquisition failed", zap.Error(err))
 		}
@@ -582,15 +600,31 @@ func main() {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
-	<-sigChan
-	logging.Info("Received shutdown signal, shutting down gracefully...")
+	var fenced *ha.LeaseLoss
+	select {
+	case <-sigChan:
+		logging.Info("Received shutdown signal, shutting down gracefully...")
+	case loss := <-leaseLost:
+		fenced = &loss
+		// Another gateway may be writing to this bucket already, so this
+		// one stops serving at once: no draining, because finishing a
+		// client's copy would mean writing to a bucket that is no longer
+		// ours.
+		logging.Error("HA LEASE LOST: stopping this gateway to keep one writer per bucket",
+			zap.String("reason", loss.Reason),
+			zap.String("detail", loss.Description()))
+	}
 
 	// Shutdown NFS server
 	if err := nfsServer.Stop(); err != nil {
 		logging.Error("Error stopping NFS server", zap.Error(err))
 	}
 	if smbServer != nil {
-		if err := smbServer.Stop(); err != nil {
+		stop := smbServer.Stop
+		if fenced != nil {
+			stop = smbServer.StopNow
+		}
+		if err := stop(); err != nil {
 			logging.Error("Error stopping SMB server", zap.Error(err))
 		}
 	}
@@ -604,6 +638,18 @@ func main() {
 	// Close COS client
 	if err := cosClient.Close(); err != nil {
 		logging.Error("Error closing COS client", zap.Error(err))
+	}
+
+	if fenced != nil {
+		// Exit non-zero so a supervisor restarts the gateway: on startup it
+		// reads the lease, finds the other holder, and refuses to serve
+		// rather than becoming a second writer. The lease is deliberately
+		// not released: it belongs to the gateway that took it.
+		logging.Error("Gateway stopped because it lost the bucket lease",
+			zap.String("detail", fenced.Description()),
+			zap.Int("exit_code", exitLeaseLost))
+		logging.Sync()
+		os.Exit(exitLeaseLost)
 	}
 
 	logging.Info("Shutdown complete")

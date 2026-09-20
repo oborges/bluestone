@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -219,3 +220,121 @@ func TestDegradedStartRequiresLocalMarker(t *testing.T) {
 }
 
 // Made with Bob
+
+// writeForeignLease replaces the lease in the store as though another
+// gateway had taken over the bucket.
+func writeForeignLease(t *testing.T, store *memStore, holder string) {
+	t.Helper()
+	payload, err := json.Marshal(Lease{HolderID: holder, Hostname: "other-host", Epoch: 99, AcquiredAt: time.Now(), RenewedAt: time.Now()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	store.objects[LeaseObjectKey] = payload
+}
+
+// Losing the lease to another gateway is reported, so the gateway can stop
+// serving a bucket that is no longer its own.
+func TestLeaseTakenIsReported(t *testing.T) {
+	store := newMemStore()
+	losses := make(chan LeaseLoss, 4)
+	options := opts(store, t.TempDir())
+	options.OnLeaseLost = func(loss LeaseLoss) { losses <- loss }
+
+	m, err := Acquire(context.Background(), options)
+	if err != nil {
+		t.Fatalf("Acquire() error = %v", err)
+	}
+	defer m.Release()
+
+	writeForeignLease(t, store, "other-host-9999")
+
+	select {
+	case loss := <-losses:
+		if loss.Reason != "taken" || loss.TakenBy == nil || loss.TakenBy.HolderID != "other-host-9999" {
+			t.Fatalf("loss = %+v, want it taken by other-host-9999", loss)
+		}
+		if desc := loss.Description(); !strings.Contains(desc, "other-host-9999") {
+			t.Errorf("Description() = %q, want it to name the holder", desc)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("losing the lease to another gateway was not reported")
+	}
+
+	// Reported once, not on every heartbeat after it.
+	select {
+	case loss := <-losses:
+		t.Fatalf("the loss was reported twice: %+v", loss)
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// Heartbeats failing for longer than the lease timeout mean a standby may
+// have promoted, so this node can no longer claim the bucket either.
+func TestUnrenewableLeaseIsReported(t *testing.T) {
+	store := newMemStore()
+	losses := make(chan LeaseLoss, 4)
+	options := opts(store, t.TempDir())
+	options.OnLeaseLost = func(loss LeaseLoss) { losses <- loss }
+
+	m, err := Acquire(context.Background(), options)
+	if err != nil {
+		t.Fatalf("Acquire() error = %v", err)
+	}
+	defer m.Release()
+
+	store.mu.Lock()
+	store.failAll = true
+	store.mu.Unlock()
+
+	select {
+	case loss := <-losses:
+		if loss.Reason != "unreachable" || loss.Since < options.LeaseTimeout {
+			t.Fatalf("loss = %+v, want it unreachable for at least the lease timeout", loss)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("a lease that could not be renewed past its timeout was not reported")
+	}
+}
+
+// A healthy gateway is never fenced.
+func TestHealthyLeaseIsNotReportedLost(t *testing.T) {
+	store := newMemStore()
+	losses := make(chan LeaseLoss, 4)
+	options := opts(store, t.TempDir())
+	options.OnLeaseLost = func(loss LeaseLoss) { losses <- loss }
+
+	m, err := Acquire(context.Background(), options)
+	if err != nil {
+		t.Fatalf("Acquire() error = %v", err)
+	}
+	defer m.Release()
+
+	select {
+	case loss := <-losses:
+		t.Fatalf("a healthy gateway was fenced: %+v", loss)
+	case <-time.After(500 * time.Millisecond):
+	}
+}
+
+// After a takeover the lease belongs to the gateway now serving the bucket:
+// releasing must not delete it, or a third gateway could start.
+func TestReleaseKeepsAnotherHoldersLease(t *testing.T) {
+	store := newMemStore()
+	m, err := Acquire(context.Background(), opts(store, t.TempDir()))
+	if err != nil {
+		t.Fatalf("Acquire() error = %v", err)
+	}
+	writeForeignLease(t, store, "other-host-1234")
+
+	m.Release()
+
+	current := store.currentLease(t)
+	if current == nil {
+		t.Fatal("Release() deleted a lease held by another gateway")
+	}
+	if current.HolderID != "other-host-1234" {
+		t.Fatalf("lease holder = %q, want the other gateway's", current.HolderID)
+	}
+}

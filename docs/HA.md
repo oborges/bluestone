@@ -21,6 +21,19 @@ down.
   fatally. Fresh means renewed within `ha.lease_timeout` (default 60s).
 - A *stale* lease (holder crashed) is taken over automatically, incrementing
   the lease epoch.
+- An active gateway that loses the lease stops serving and exits 3. It loses
+  the lease when another gateway holds it (a takeover, forced or after this
+  one went silent), or when the lease cannot be renewed for longer than
+  `ha.lease_timeout`, after which a standby is entitled to promote. It stops
+  without draining, since finishing a client's copy would mean writing to a
+  bucket it no longer holds, and it does not delete the lease: that belongs
+  to the gateway that took it. A supervisor restarting the process is
+  harmless, because a gateway that finds a fresh foreign lease at startup
+  refuses to serve.
+- `ha.on_lease_lost: "warn"` keeps the older behaviour of logging and
+  serving on. It risks two gateways writing one bucket, which is what the
+  lease exists to prevent, and is only sensible while diagnosing the lease
+  itself.
 - Graceful shutdown deletes the lease, so planned failover is immediate.
 - Crash recovery on the same node works during a COS outage via a local
   holder marker in the staging root; a standby that never held the lease
@@ -36,7 +49,11 @@ ha:
   enabled: true
   heartbeat_interval: "15s"
   lease_timeout: "60s"   # crash-failover RTO is dominated by this value
+  on_lease_lost: "stop"  # stop serving and exit 3; "warn" logs and serves on
 ```
+
+Exit status 3 means the gateway stopped because it lost the lease, as
+opposed to a clean stop (0) or a failure to start (1).
 
 `lease_timeout` must be more than twice `heartbeat_interval`.
 
