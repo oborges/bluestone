@@ -53,6 +53,7 @@ type Server struct {
 
 	mu       sync.Mutex
 	listener net.Listener
+	conns    map[*conn]struct{}
 }
 
 type Option func(*Server)
@@ -182,6 +183,93 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	}
 }
 
+func (s *Server) addConn(c *conn) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.conns == nil {
+		s.conns = make(map[*conn]struct{})
+	}
+	s.conns[c] = struct{}{}
+}
+
+func (s *Server) removeConn(c *conn) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.conns, c)
+}
+
+func (s *Server) activeConns() []*conn {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	conns := make([]*conn, 0, len(s.conns))
+	for c := range s.conns {
+		conns = append(conns, c)
+	}
+	return conns
+}
+
+// Drain stops accepting connections and closes each one once it has nothing
+// in flight and has been quiet for idleFor, so a client in the middle of a
+// copy finishes it rather than seeing the transfer fail. A copy is many
+// requests in a row, so waiting only for a gap between two of them would
+// close the connection mid-copy; idleFor is how long a connection must have
+// nothing to do before it counts as finished.
+//
+// Connections still busy when ctx is done are closed anyway, and Drain
+// returns ctx's error; otherwise it returns nil once every connection has
+// gone. It does not wait for clients to disconnect by themselves: an SMB
+// connection lives as long as the share is mounted, so that would never
+// finish.
+func (s *Server) Drain(ctx context.Context, idleFor time.Duration) error {
+	if err := s.Shutdown(); err != nil {
+		return err
+	}
+
+	const pollInterval = 20 * time.Millisecond
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+	for {
+		remaining := 0
+		for _, c := range s.activeConns() {
+			// Nothing being handled, nothing waiting to be written (closing
+			// on a queued reply would lose it), and quiet for long enough
+			// that the client is not between two requests of one copy.
+			idle := c.running.Load() == 0 && c.queued.Load() == 0
+			if idle && time.Since(c.lastActiveAt()) >= idleFor {
+				c.close()
+				continue
+			}
+			remaining++
+		}
+		if remaining == 0 && len(s.activeConns()) == 0 {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			for _, c := range s.activeConns() {
+				c.close()
+			}
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+// lastActiveAt is when the connection last finished a request.
+func (c *conn) lastActiveAt() time.Time {
+	return time.Unix(0, c.lastActive.Load())
+}
+
+// close ends the connection, which stops its read loop and releases what it
+// holds.
+func (c *conn) close() {
+	if underlying := c.fc.Underlying(); underlying != nil {
+		_ = underlying.Close()
+	}
+}
+
+// Shutdown stops the server accepting new connections, leaving the ones it
+// has. Drain is the graceful form.
 func (s *Server) Shutdown() error {
 	s.mu.Lock()
 	ln := s.listener
@@ -317,6 +405,16 @@ type conn struct {
 	// so the connection waits for them before closing its open files.
 	inflight chan struct{}
 	handlers sync.WaitGroup
+	// running counts requests being handled right now, and queued counts
+	// replies waiting for the writer, so a draining server can tell a
+	// connection in the middle of a copy from an idle one, and does not
+	// close one whose reply has not reached the wire yet.
+	running atomic.Int64
+	queued  atomic.Int64
+	// lastActive is when this connection last finished a request, so a
+	// drain can tell a client in the middle of a copy, which is sending
+	// requests back to back, from a mount that is merely open.
+	lastActive atomic.Int64
 
 	preauthHash []byte
 
@@ -350,6 +448,8 @@ func (s *Server) serveConn(ctx context.Context, c net.Conn) {
 		inflight:      make(chan struct{}, s.concurrentRequests()),
 		preauthHash:   sha.Sum(nil),
 	}
+	s.addConn(cn)
+	defer s.removeConn(cn)
 	defer cn.cleanup()
 	go cn.writeLoop()
 
@@ -413,8 +513,10 @@ func (s *Server) serveConn(ctx context.Context, c net.Conn) {
 				return
 			}
 			cn.handlers.Add(1)
+			cn.running.Add(1)
 			go func() {
 				defer cn.handlers.Done()
+				defer cn.running.Add(-1)
 				defer func() { <-cn.inflight }()
 				r := &request{conn: cn}
 				r.handleMessage(connCtx, queued)
@@ -423,9 +525,11 @@ func (s *Server) serveConn(ctx context.Context, c net.Conn) {
 			continue
 		}
 
+		cn.running.Add(1)
 		r := &request{conn: cn}
 		r.handleMessage(connCtx, msg)
 		cn.send(r.out)
+		cn.running.Add(-1)
 	}
 }
 
@@ -507,7 +611,9 @@ func (c *conn) writeLoop() {
 			if sealed, ok := c.maybeSealResponse(resp); ok {
 				resp = sealed
 			}
-			if err := c.fc.WriteMessage(resp); err != nil {
+			err := c.fc.WriteMessage(resp)
+			c.queued.Add(-1)
+			if err != nil {
 				c.log.Debug("write error", "err", err)
 				_ = c.fc.Underlying().Close()
 				return
@@ -520,9 +626,11 @@ func (c *conn) writeLoop() {
 
 // send queues a response. The buffer must not be modified afterwards.
 func (c *conn) send(resp []byte) {
+	c.queued.Add(1)
 	select {
 	case c.outbox <- resp:
 	case <-c.connDone:
+		c.queued.Add(-1)
 	}
 }
 
@@ -632,6 +740,7 @@ func (c *request) handleMessage(ctx context.Context, msg []byte) {
 			status = c.dispatch(ctx, sub, &hdr, &lastFileId, related)
 		}
 		c.srv.obs().RequestCompleted(hdr.Command, status, time.Since(started))
+		c.lastActive.Store(time.Now().UnixNano())
 		lastStatus = status
 		if status != wire.StatusSuccess && status != wire.StatusMoreProcessingRequired {
 			chainFailed = true

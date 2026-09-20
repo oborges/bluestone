@@ -164,3 +164,45 @@ func TestNTLMHashWinsOverPassword(t *testing.T) {
 		t.Fatal("the stale password was accepted")
 	}
 }
+
+// Stopping the server lets a write that is already in flight finish, rather
+// than failing it: a client copying a file sees the copy complete.
+func TestStopDrainsRequestsInFlight(t *testing.T) {
+	g := startGateway(t, func(opts *ServerOptions) {})
+	share, err := g.mount(t, "alice", "secret", "BLUESTONE")
+	if err != nil {
+		t.Fatalf("mount: %v", err)
+	}
+
+	f, err := share.Create("draining.bin")
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	defer f.Close()
+
+	// A write large enough to still be running when the stop begins.
+	payload := make([]byte, 4<<20)
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+	wrote := make(chan error, 1)
+	go func() {
+		_, err := f.Write(payload)
+		wrote <- err
+	}()
+
+	// Give the write a moment to start, then stop the server under it.
+	time.Sleep(50 * time.Millisecond)
+	stopped := make(chan error, 1)
+	go func() { stopped <- g.server.Stop() }()
+
+	if err := <-wrote; err != nil {
+		t.Fatalf("a write in flight failed during the drain: %v", err)
+	}
+	if err := <-stopped; err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+	if g.server.Running() {
+		t.Fatal("the server is still serving after Stop()")
+	}
+}

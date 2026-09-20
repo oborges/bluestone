@@ -358,6 +358,10 @@ func main() {
 		smbFilesystem := vfs.NewFilesystem(operations, logging.NewKVLogger(zapLogger), "/", &cfg.Performance, stagingManager, syncWorker, featureFlags).
 			WithWindowsNames().
 			ForProtocol(metrics.ProtocolSMB)
+		drainTimeout, err := cfg.SMB.GetDrainTimeout()
+		if err != nil {
+			logging.Fatal("Invalid smb.drain_timeout", zap.Error(err))
+		}
 		authWindow, err := cfg.SMB.Limits.GetAuthWindow()
 		if err != nil {
 			logging.Fatal("Invalid smb.limits.auth_window", zap.Error(err))
@@ -392,6 +396,7 @@ func main() {
 			Opens:              opens,
 			Locks:              locks,
 			ConcurrentRequests: cfg.SMB.ConcurrentRequests,
+			DrainTimeout:       drainTimeout,
 			Limits: smb.Limits{
 				Connections:           cfg.SMB.Limits.MaxConnections,
 				ConnectionsPerClient:  cfg.SMB.Limits.MaxConnectionsPerClient,
