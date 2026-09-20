@@ -69,6 +69,9 @@ type ServerOptions struct {
 	// AuthLimits slow down repeated authentication failures from one client
 	// address. Zero values select the defaults.
 	AuthLimits AuthLimits
+	// DrainTimeout is how long Stop waits for requests in flight to finish
+	// before closing the connections carrying them. 0 selects the default.
+	DrainTimeout time.Duration
 	// Logger receives server logs; nil discards them.
 	Logger *zap.Logger
 }
@@ -101,7 +104,19 @@ type Server struct {
 	observer *observer
 	opens    *lock.ShareTable
 	gate     *authGate
+	drain    time.Duration
 }
+
+// DefaultDrainTimeout is how long Stop waits for clients to finish. Long
+// enough for a large write to the object store to complete, short enough
+// that a restart is not held up by a client that has stopped responding.
+const DefaultDrainTimeout = 30 * time.Second
+
+// drainIdleFor is how long a connection must have nothing to do before the
+// drain counts it as finished. A client copying a file sends requests back
+// to back with small gaps; closing during one of those gaps would fail the
+// copy, which is what draining is meant to avoid.
+const drainIdleFor = time.Second
 
 // NewServer creates an SMB server for fs and binds its listener. Give it a
 // view with Windows naming, labelled for SMB metrics.
@@ -126,6 +141,10 @@ func NewServer(fs *vfs.Filesystem, opts ServerOptions) (*Server, error) {
 
 	obs := &observer{}
 	gate := newAuthGate(opts.AuthLimits, logger)
+	drainTimeout := opts.DrainTimeout
+	if drainTimeout <= 0 {
+		drainTimeout = DefaultDrainTimeout
+	}
 	serverOpts := []server.Option{
 		server.WithShares(smbvfs.NewDiskShare(opts.ShareName, NewBackend(fs, opts.Opens))),
 		server.WithAuth(ntlmssp.NewServer(newCredentials(opts.Users), opts.Domain)),
@@ -168,6 +187,7 @@ func NewServer(fs *vfs.Filesystem, opts ServerOptions) (*Server, error) {
 		observer: obs,
 		opens:    opts.Opens,
 		gate:     gate,
+		drain:    drainTimeout,
 		ctx:      ctx,
 		cancel:   cancel,
 		done:     make(chan struct{}),
@@ -190,20 +210,39 @@ func (s *Server) Start() error {
 	return nil
 }
 
-// Stop stops accepting clients, closes open connections, and waits for
-// their requests to finish. It is safe to call more than once.
+// Stop drains the server: it stops accepting clients, lets requests already
+// in flight finish, and closes each connection as soon as it is idle. A
+// client copying a file finishes the copy rather than seeing it fail.
+// Connections still busy after DrainTimeout are closed anyway, so a client
+// that has stopped responding cannot hold up a restart. It is safe to call
+// more than once.
 func (s *Server) Stop() error {
 	s.stopOnce.Do(func() {
-		s.logger.Info("Stopping SMB server")
+		s.logger.Info("Stopping SMB server", zap.Duration("drain_timeout", s.drain))
+
+		// Drain stops the listener itself, so it runs before anything else
+		// closes it: a closed listener would make the drain give up at once
+		// and cut off the clients it is meant to let finish.
+		started := time.Now()
+		ctx, cancel := context.WithTimeout(context.Background(), s.drain)
+		defer cancel()
+		if err := s.srv.Drain(ctx, drainIdleFor); err != nil {
+			stats := s.Stats()
+			s.logger.Warn("SMB clients were still busy when the drain timed out; closing their connections",
+				zap.Duration("waited", time.Since(started)),
+				zap.Int("connections", stats.Connections))
+		}
+
+		// The drain closes the connections; cancelling stops the accept loop
+		// and anything still waiting on the connection context, and the
+		// listener close covers a server that was never started.
 		s.cancel()
 		_ = s.listener.Close()
-		// Closing the context does not interrupt a connection waiting for
-		// its next request, so close the connections too.
 		s.listener.closeConns()
 		if s.started.Load() {
 			<-s.done
 		}
-		s.logger.Info("SMB server stopped")
+		s.logger.Info("SMB server stopped", zap.Duration("took", time.Since(started)))
 	})
 	return nil
 }

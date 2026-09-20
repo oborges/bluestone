@@ -197,6 +197,14 @@ proposed upstream.
   tested before the io/fs sentinels, because Go reports some errnos as those
   sentinels (ENOTEMPTY reads as fs.ErrExist).
 
+- `smb/server`: `Drain(ctx, idleFor)` shuts a server down gracefully, the way
+  `http.Server.Shutdown` does: it stops accepting, then closes each
+  connection once it has no request in flight, no reply waiting to be
+  written, and has been quiet for `idleFor`. The quiet period matters
+  because a client copying a file sends requests back to back, so closing in
+  a gap between two of them fails the copy. Connections still busy when ctx
+  is done are closed anyway. `Shutdown` remains the abrupt form.
+
 ## Known gaps to close in Bluestone
 
 Tracked with the rest of the SMB work in `docs/SMB_ROADMAP.md`.

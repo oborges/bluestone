@@ -135,6 +135,13 @@ func validateSMB(config *SMBConfig) error {
 	if config.ConcurrentRequests < 0 {
 		return fmt.Errorf("invalid concurrent_requests: %d (must be 0 or more)", config.ConcurrentRequests)
 	}
+	drain, err := config.GetDrainTimeout()
+	if err != nil {
+		return fmt.Errorf("invalid drain_timeout %q: %w", config.DrainTimeout, err)
+	}
+	if drain <= 0 {
+		return fmt.Errorf("invalid drain_timeout: %s (must be positive)", drain)
+	}
 	if err := validateSMBLimits(&config.Limits); err != nil {
 		return err
 	}

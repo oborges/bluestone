@@ -382,3 +382,33 @@ func TestSMBUserHashAndPlaintextReporting(t *testing.T) {
 		t.Fatalf("UsesPlaintextPasswords() with only hashes = %v, want none", got)
 	}
 }
+
+func TestSMBDrainTimeout(t *testing.T) {
+	setRequiredTestEnv(t)
+
+	cfg, err := Load(writeTestConfig(t, "staging:\n  enabled: false\n"))
+	if err != nil {
+		t.Fatalf("Load() returned error: %v", err)
+	}
+	if drain, err := cfg.SMB.GetDrainTimeout(); err != nil || drain != 30*time.Second {
+		t.Fatalf("drain_timeout default = %s, %v; want 30s", drain, err)
+	}
+
+	cfg, err = Load(writeTestConfig(t, "staging:\n  enabled: false\nsmb:\n  drain_timeout: 5s\n"))
+	if err != nil {
+		t.Fatalf("Load() with drain_timeout returned error: %v", err)
+	}
+	if drain, err := cfg.SMB.GetDrainTimeout(); err != nil || drain != 5*time.Second {
+		t.Fatalf("drain_timeout = %s, %v; want 5s", drain, err)
+	}
+
+	valid := SMBConfig{Enabled: true, Port: 445, ShareName: "bluestone", Domain: "BLUESTONE",
+		Users: []SMBUser{{Username: "alice", Password: "secret"}}}
+	for _, bad := range []string{"soon", "0s", "-5s"} {
+		cfg := valid
+		cfg.DrainTimeout = bad
+		if err := validateSMB(&cfg); err == nil {
+			t.Errorf("validateSMB() with drain_timeout %q = nil, want an error", bad)
+		}
+	}
+}

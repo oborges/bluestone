@@ -56,6 +56,9 @@ type SMBConfig struct {
 	// handles at once. 0 selects the built-in default (64); 1 handles every
 	// request in turn.
 	ConcurrentRequests int `mapstructure:"concurrent_requests"`
+	// DrainTimeout is how long a shutdown waits for requests in flight
+	// before closing the connections carrying them.
+	DrainTimeout string `mapstructure:"drain_timeout"`
 	// Limits bound what clients can make the server hold. 0 means no limit.
 	Limits SMBLimits `mapstructure:"limits"`
 	// Users are the accounts allowed to connect, authenticated with NTLM.
@@ -141,6 +144,12 @@ type HAConfig struct {
 	// only (set BLUESTONE_HA_FORCE_TAKEOVER=true); never leave enabled in
 	// a config file.
 	ForceTakeover bool `mapstructure:"force_takeover"`
+}
+
+// GetDrainTimeout parses how long a shutdown waits for requests in flight,
+// defaulting to 30 seconds.
+func (c *SMBConfig) GetDrainTimeout() (time.Duration, error) {
+	return smbDuration(c.DrainTimeout, 30*time.Second)
 }
 
 // GetAuthWindow parses how long authentication failures are remembered,
@@ -444,6 +453,7 @@ func bindEnvOverrides(v *viper.Viper) error {
 		"smb.domain",
 		"smb.encryption_required",
 		"smb.concurrent_requests",
+		"smb.drain_timeout",
 		"smb.limits.max_connections",
 		"smb.limits.max_connections_per_client",
 		"smb.limits.max_sessions_per_connection",
@@ -602,6 +612,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("smb.domain", "BLUESTONE")
 	v.SetDefault("smb.encryption_required", false)
 	v.SetDefault("smb.concurrent_requests", 0)
+	v.SetDefault("smb.drain_timeout", "30s")
 	// Limits are generous enough that no ordinary client meets them, and
 	// small enough that one client cannot exhaust the gateway.
 	v.SetDefault("smb.limits.max_connections", 256)

@@ -229,6 +229,7 @@ smb:
   domain: "BLUESTONE"
   encryption_required: false
   concurrent_requests: 0 # reads/writes at once per connection; 0 = default (64), 1 = serial
+  drain_timeout: "30s"   # how long a shutdown waits for clients to finish
   limits:
     max_connections: 256
     max_connections_per_client: 64
@@ -308,6 +309,14 @@ by default: a client waits on the object store far more than on the gateway,
 so handling requests in turn would cost it a round trip each. Requests that
 create or destroy state, such as opening and closing files, stay ordered.
 `concurrent_requests: 1` restores the older serial behaviour.
+
+Shutting the gateway down drains the SMB server: it stops accepting clients,
+lets the requests already in flight finish, and closes each connection once
+its client has been quiet for a moment, so a copy in progress completes
+instead of failing. A client still busy after `smb.drain_timeout` has its
+connection closed anyway, so one that has stopped responding cannot hold up a
+restart; the gateway logs how long it waited and how many clients were still
+busy.
 
 Failures are reported as the status a client acts on, rather than as a
 permissions error: a full staging area or bucket quota reaches Windows as
