@@ -13,6 +13,10 @@ EnvironmentFile=-/etc/default/bluestone
 ExecStart=/usr/local/bin/bluestone --config ${BLUESTONE_CONFIG}
 Restart=on-failure
 RestartSec=5s
+# Exit 3 means the gateway lost the bucket lease and fenced itself. Another
+# gateway is serving the bucket, so restarting only produces a refusal every
+# RestartSec until an operator intervenes: stay down instead.
+RestartPreventExitStatus=3
 TimeoutStopSec=45s
 KillSignal=SIGTERM
 LimitNOFILE=1048576

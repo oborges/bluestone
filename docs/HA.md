@@ -11,6 +11,21 @@ via the standby — including files that were dirty (unsynced) at the moment of
 the kill — and the dead primary refused re-entry until the standby stepped
 down.
 
+Re-run on 2026-09-20 against a two-node pair to exercise runtime fencing as
+well (`ha.on_lease_lost: "stop"`):
+
+- A standby forcing a takeover while the primary was healthy fenced the
+  primary about 5s later: it logged the loss, stopped without draining, and
+  exited 3. It stopped listening on 2049 and 445, and each restart was
+  refused because the standby held the lease.
+- `SIGKILL` on the primary: promotion refused while the lease was fresh,
+  granted 63s after the kill, and 25/25 checksums verified through the
+  standby. The dead primary refused re-entry while the standby served.
+- Writes issued seconds before the kill, before they had synced to COS or
+  been replicated, were lost: the files kept their previous contents. That
+  is the documented RPO, and the reason the RPO section below says to wait
+  for sync before depending on data.
+
 ## How fencing works
 
 - The active gateway writes `.nfs-gateway.lease` (hidden from the NFS
@@ -85,6 +100,14 @@ OnBootSec=30
 OnUnitActiveSec=15
 ```
 
+The gateway must run as the user that owns the staging directory. The unit
+in `deployments/systemd/` runs as `bluestone`, which is why the replication
+unit and `ha-promote.sh` chown the staged state to `bluestone`. A unit
+edited to run as root instead will fail to read that state: the unit keeps
+only `CAP_NET_BIND_SERVICE`, so root has no `CAP_DAC_OVERRIDE` and is
+refused like any other user. The symptom is a gateway that serves reads from
+COS but fails every write with a permission error.
+
 `--exclude=ha-holder-marker` is required: the marker must never move
 between nodes. `SuccessExitStatus=24` tolerates files vanishing mid-copy
 under live churn. The replication interval bounds the failover RPO for data
@@ -104,11 +127,26 @@ the promotion step so clients remount to a stable name.
 
 ## Failback
 
+Replication is one-way, so anything the standby staged while it was active
+exists only on the standby. Re-enabling replication runs `rsync --delete`
+against the primary's staging and deletes exactly those files, so the
+standby must finish syncing them to COS before it steps down.
+`ha-stepdown.sh` waits for that, then stops the gateway and resumes
+replication:
+
 ```
-standby# systemctl disable --now bluestone        # releases the lease
-standby# systemctl enable --now bluestone-replicate.timer
+standby# ha-stepdown.sh                           # drains, then releases the lease
 primary# systemctl start bluestone                # acquires immediately
 client#  remount to the primary
+```
+
+Stepping down by hand loses those writes unless the staging area is drained
+first:
+
+```
+standby# find /var/staging/bluestone/active -name '*.data' | wc -l   # must be 0
+standby# systemctl disable --now bluestone        # releases the lease
+standby# systemctl enable --now bluestone-replicate.timer
 ```
 
 ## RPO / RTO
