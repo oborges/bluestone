@@ -146,8 +146,15 @@ func validateSMB(config *SMBConfig) error {
 		if strings.TrimSpace(user.Username) == "" {
 			return fmt.Errorf("users[%d]: username must not be empty", i)
 		}
-		if user.Password == "" {
-			return fmt.Errorf("users[%d] (%s): password must not be empty", i, user.Username)
+		hash, err := user.NTHashBytes()
+		if err != nil {
+			return fmt.Errorf("users[%d] (%s): %w", i, user.Username, err)
+		}
+		switch {
+		case len(hash) == 0 && user.Password == "":
+			return fmt.Errorf("users[%d] (%s): set ntlm_hash (from \"bluestone -smb-hash\") or password", i, user.Username)
+		case len(hash) > 0 && user.Password != "":
+			return fmt.Errorf("users[%d] (%s): set ntlm_hash or password, not both", i, user.Username)
 		}
 		key := strings.ToLower(user.Username)
 		if seen[key] {

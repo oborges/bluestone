@@ -23,10 +23,16 @@ import (
 	"go.uber.org/zap/zapcore"
 )
 
-// User is an account allowed to connect to the share.
+// User is an account allowed to connect to the share. Give it either an NT
+// hash or a password; the hash keeps the password itself out of the
+// gateway's configuration.
 type User struct {
-	Name     string
+	Name string
+	// Password is the account's password. Prefer NTLMHash.
 	Password string
+	// NTLMHash is the account's NT hash (16 bytes), as
+	// bluestone -smb-hash prints it. When set, Password is ignored.
+	NTLMHash []byte
 }
 
 // ServerOptions configures an SMB server.
@@ -248,25 +254,33 @@ func (s *Server) Address() string {
 // in the username and domain the client sent, so it is derived per login:
 // usernames match case-insensitively and any client domain is accepted, as
 // Windows clients send their own workgroup or domain name.
+//
+// Only the NT hash of each password is kept, so the configured password is
+// not held in memory for the life of the process. The hash still
+// authenticates as the password does, so it is no less of a secret.
 type credentials struct {
-	passwords map[string]string
+	hashes map[string][]byte
 }
 
 func newCredentials(users []User) credentials {
-	passwords := make(map[string]string, len(users))
+	hashes := make(map[string][]byte, len(users))
 	for _, user := range users {
-		passwords[strings.ToLower(user.Name)] = user.Password
+		hash := user.NTLMHash
+		if len(hash) == 0 {
+			hash = ntlmssp.NTHash(user.Password)
+		}
+		hashes[strings.ToLower(user.Name)] = hash
 	}
-	return credentials{passwords: passwords}
+	return credentials{hashes: hashes}
 }
 
 // LookupNTOWFv2 implements ntlmssp.CredentialLookup.
 func (c credentials) LookupNTOWFv2(_ context.Context, domain, user string) ([]byte, error) {
-	password, ok := c.passwords[strings.ToLower(user)]
+	hash, ok := c.hashes[strings.ToLower(user)]
 	if !ok {
 		return nil, ntlmssp.ErrUnknownUser
 	}
-	return ntlmssp.NTOWFv2(password, user, domain), nil
+	return ntlmssp.NTOWFv2FromHash(hash, user, domain), nil
 }
 
 // connListener drops connections from outside the allowlist at accept, the

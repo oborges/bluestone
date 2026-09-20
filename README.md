@@ -241,7 +241,8 @@ smb:
     auth_max_block: "15m"
   users:
     - username: "alice"
-      password: "change-me"
+      # The account's NT hash, from: bluestone -smb-hash
+      ntlm_hash: "8846f7eaee8fb117ad06bdd830b7586c"
 ```
 
 The SMB server is experimental and disabled by default. It serves the same
@@ -272,8 +273,22 @@ ordinary retries never reach the threshold. Watch `smb_auth_failures_total`,
 `smb_auth_blocked_total` and `smb_auth_blocked_clients` for a client that is
 guessing.
 
-Users authenticate with NTLM against the accounts listed under `users`. Keep
-the configuration file readable only by the gateway's service account.
+Users authenticate with NTLM against the accounts listed under `users`. Give
+each account an `ntlm_hash` rather than a `password`:
+
+```bash
+bluestone -smb-hash
+```
+
+It reads the password from standard input, so it never reaches the process
+list or the shell history, and prints the NT hash to put in the file. The
+hash authenticates exactly as the password does, so it is still a secret to
+protect: what it avoids is writing down a password that its owner may have
+reused elsewhere. It is the same hash Windows and Samba store, so an existing
+one can be pasted in. `password` still works and logs a warning at startup;
+set one or the other, not both.
+
+Keep the configuration file readable only by the gateway's service account.
 `server.allowed_clients` also applies to the SMB port. Binding port 445 on
 Linux needs root or `CAP_NET_BIND_SERVICE`. `smb.enabled`, `smb.port`,
 `smb.share_name`, `smb.domain`, and `smb.encryption_required` can be

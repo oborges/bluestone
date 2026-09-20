@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/hex"
 	"fmt"
 	"os"
 	"sort"
@@ -86,10 +87,48 @@ type SMBLimits struct {
 	AuthMaxBlock string `mapstructure:"auth_max_block"`
 }
 
-// SMBUser is an account allowed to connect to the SMB share.
+// SMBUser is an account allowed to connect to the SMB share. Give it either
+// ntlm_hash or password: the hash keeps the password itself out of the
+// configuration file. Generate one with "bluestone -smb-hash".
 type SMBUser struct {
 	Username string `mapstructure:"username"`
+	// Password is the account's password, in clear. Deprecated: use
+	// NTLMHash. A configuration with passwords still works, and logs a
+	// warning at startup.
 	Password string `mapstructure:"password"`
+	// NTLMHash is the account's NT hash as 32 hex characters. It
+	// authenticates exactly as the password does, so it is still a secret,
+	// but the password itself is not written down and cannot be reused
+	// against other systems where the user picked the same one.
+	NTLMHash string `mapstructure:"ntlm_hash"`
+}
+
+// NTHashBytes returns the configured NT hash, or nil when the account uses a
+// password.
+func (u *SMBUser) NTHashBytes() ([]byte, error) {
+	if strings.TrimSpace(u.NTLMHash) == "" {
+		return nil, nil
+	}
+	hash, err := hex.DecodeString(strings.TrimSpace(u.NTLMHash))
+	if err != nil {
+		return nil, fmt.Errorf("ntlm_hash is not hexadecimal: %w", err)
+	}
+	if len(hash) != 16 {
+		return nil, fmt.Errorf("ntlm_hash is %d bytes, want 16 (32 hex characters)", len(hash))
+	}
+	return hash, nil
+}
+
+// UsesPlaintextPasswords reports whether any account is configured with a
+// password rather than a hash, so startup can warn about it.
+func (c *SMBConfig) UsesPlaintextPasswords() []string {
+	var users []string
+	for _, user := range c.Users {
+		if strings.TrimSpace(user.NTLMHash) == "" && user.Password != "" {
+			users = append(users, user.Username)
+		}
+	}
+	return users
 }
 
 // HAConfig controls active/passive fencing through a bucket lease. Exactly

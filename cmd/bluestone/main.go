@@ -1,14 +1,18 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -27,6 +31,7 @@ import (
 	"github.com/oborges/bluestone/internal/smb"
 	"github.com/oborges/bluestone/internal/staging"
 	"github.com/oborges/bluestone/internal/vfs"
+	"github.com/sonroyaalmerol/go-smb-server/smb/ntlmssp"
 	nfshelper "github.com/willscott/go-nfs/helpers"
 	"go.uber.org/zap"
 )
@@ -38,7 +43,32 @@ var (
 	// Command line flags
 	configPath = flag.String("config", "", "Path to configuration file")
 	version    = flag.Bool("version", false, "Print version and exit")
+	smbHash    = flag.Bool("smb-hash", false, "Read a password from standard input and print its NT hash for smb.users[].ntlm_hash")
 )
+
+// printSMBHash reads a password from standard input and prints its NT hash,
+// so an operator can put the hash in the configuration instead of the
+// password. The password is read from stdin rather than taken as an
+// argument, so it stays out of the process list and the shell history.
+func printSMBHash() int {
+	stat, err := os.Stdin.Stat()
+	if err == nil && stat.Mode()&os.ModeCharDevice != 0 {
+		fmt.Fprint(os.Stderr, "Password: ")
+	}
+	reader := bufio.NewReader(os.Stdin)
+	password, err := reader.ReadString('\n')
+	if err != nil && (!errors.Is(err, io.EOF) || password == "") {
+		fmt.Fprintf(os.Stderr, "Failed to read the password: %v\n", err)
+		return 1
+	}
+	password = strings.TrimRight(password, "\r\n")
+	if password == "" {
+		fmt.Fprintln(os.Stderr, "The password is empty.")
+		return 1
+	}
+	fmt.Printf("%x\n", ntlmssp.NTHash(password))
+	return 0
+}
 
 func main() {
 	flag.Parse()
@@ -47,6 +77,10 @@ func main() {
 	if *version {
 		fmt.Printf("Bluestone v%s\n", Version)
 		os.Exit(0)
+	}
+
+	if *smbHash {
+		os.Exit(printSMBHash())
 	}
 
 	// Load configuration
@@ -338,7 +372,15 @@ func main() {
 		}
 		users := make([]smb.User, 0, len(cfg.SMB.Users))
 		for _, user := range cfg.SMB.Users {
-			users = append(users, smb.User{Name: user.Username, Password: user.Password})
+			hash, err := user.NTHashBytes()
+			if err != nil {
+				logging.Fatal("Invalid smb user", zap.String("username", user.Username), zap.Error(err))
+			}
+			users = append(users, smb.User{Name: user.Username, Password: user.Password, NTLMHash: hash})
+		}
+		if plaintext := cfg.SMB.UsesPlaintextPasswords(); len(plaintext) > 0 {
+			logging.Warn("SMB accounts are configured with passwords in clear; store their NT hash in ntlm_hash instead (bluestone -smb-hash)",
+				zap.Strings("users", plaintext))
 		}
 		smbServer, err = smb.NewServer(smbFilesystem, smb.ServerOptions{
 			Address:            fmt.Sprintf(":%d", cfg.SMB.Port),

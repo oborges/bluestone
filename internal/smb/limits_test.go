@@ -6,6 +6,7 @@ import (
 	"time"
 
 	client "github.com/hirochachacha/go-smb2"
+	"github.com/sonroyaalmerol/go-smb-server/smb/ntlmssp"
 )
 
 // dialShare connects a real SMB client and mounts the share, leaving the
@@ -126,5 +127,40 @@ func TestOccasionalBadPasswordDoesNotBlock(t *testing.T) {
 			t.Fatalf("round %d: the right password was refused: %v", i, err)
 		}
 		conn.Close()
+	}
+}
+
+// An account configured with an NT hash authenticates exactly as one
+// configured with the password it came from.
+func TestNTLMHashAuthenticates(t *testing.T) {
+	g := startGateway(t, func(opts *ServerOptions) {
+		opts.Users = []User{{Name: "hashed", NTLMHash: ntlmssp.NTHash("secret")}}
+	})
+
+	conn, err := dialShare(t, g, "hashed", "secret")
+	if err != nil {
+		t.Fatalf("login with the hashed account: %v", err)
+	}
+	conn.Close()
+
+	if _, err := dialShare(t, g, "hashed", "wrong"); err == nil {
+		t.Fatal("a wrong password was accepted for the hashed account")
+	}
+}
+
+// The hash wins when both are configured, so a stale password left in the
+// file cannot be used to log in.
+func TestNTLMHashWinsOverPassword(t *testing.T) {
+	g := startGateway(t, func(opts *ServerOptions) {
+		opts.Users = []User{{Name: "hashed", Password: "stale", NTLMHash: ntlmssp.NTHash("current")}}
+	})
+
+	conn, err := dialShare(t, g, "hashed", "current")
+	if err != nil {
+		t.Fatalf("login with the hashed password: %v", err)
+	}
+	conn.Close()
+	if _, err := dialShare(t, g, "hashed", "stale"); err == nil {
+		t.Fatal("the stale password was accepted")
 	}
 }

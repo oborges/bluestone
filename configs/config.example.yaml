@@ -127,7 +127,10 @@ smb:
     auth_max_block: "15m"
   # users:
   #   - username: "alice"
-  #     password: "change-me"
+  #     # The account's NT hash, printed by: bluestone -smb-hash
+  #     # (it reads the password from stdin, so it stays out of shell history)
+  #     ntlm_hash: "8846f7eaee8fb117ad06bdd830b7586c"
+  #     # password: "change-me"   # deprecated: use ntlm_hash
 
 logging:
   level: "info"     # debug, info, warn, error

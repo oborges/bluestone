@@ -183,6 +183,11 @@ proposed upstream.
   address, and is told the outcome of each attempt. Both default to off, so a
   server without them behaves as before.
 
+- `smb/ntlmssp`: `NTHash` and `NTOWFv2FromHash` split the NT hash of a
+  password from the per-login NTLMv2 key, so a server can store the hash
+  rather than the password and still accept any user and domain. `NTOWFv2`
+  is now the two called together.
+
 ## Known gaps to close in Bluestone
 
 Tracked with the rest of the SMB work in `docs/SMB_ROADMAP.md`.

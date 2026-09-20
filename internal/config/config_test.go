@@ -309,7 +309,22 @@ func TestValidateSMB(t *testing.T) {
 		{name: "empty domain", mutate: func(c *SMBConfig) { c.Domain = " " }, wantErr: true},
 		{name: "no users", mutate: func(c *SMBConfig) { c.Users = nil }, wantErr: true},
 		{name: "empty username", mutate: func(c *SMBConfig) { c.Users[0].Username = "" }, wantErr: true},
-		{name: "empty password", mutate: func(c *SMBConfig) { c.Users[0].Password = "" }, wantErr: true},
+		{name: "no password or hash", mutate: func(c *SMBConfig) { c.Users[0].Password = "" }, wantErr: true},
+		{name: "hash instead of password", mutate: func(c *SMBConfig) {
+			c.Users[0].Password = ""
+			c.Users[0].NTLMHash = "8846f7eaee8fb117ad06bdd830b7586c"
+		}},
+		{name: "hash and password together", mutate: func(c *SMBConfig) {
+			c.Users[0].NTLMHash = "8846f7eaee8fb117ad06bdd830b7586c"
+		}, wantErr: true},
+		{name: "hash that is not hex", mutate: func(c *SMBConfig) {
+			c.Users[0].Password = ""
+			c.Users[0].NTLMHash = "zzzz6f7eaee8fb117ad06bdd830b7586"
+		}, wantErr: true},
+		{name: "hash of the wrong length", mutate: func(c *SMBConfig) {
+			c.Users[0].Password = ""
+			c.Users[0].NTLMHash = "8846f7ea"
+		}, wantErr: true},
 		{name: "duplicate username", mutate: func(c *SMBConfig) {
 			c.Users = append(c.Users, SMBUser{Username: "Alice", Password: "other"})
 		}, wantErr: true},
@@ -339,5 +354,27 @@ func TestValidateSMB(t *testing.T) {
 				t.Fatalf("validateSMB() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+func TestSMBUserHashAndPlaintextReporting(t *testing.T) {
+	cfg := SMBConfig{Users: []SMBUser{
+		{Username: "hashed", NTLMHash: " 8846F7EAEE8FB117AD06BDD830B7586C "},
+		{Username: "plain", Password: "secret"},
+		{Username: "also-plain", Password: "secret"},
+	}}
+
+	hash, err := cfg.Users[0].NTHashBytes()
+	if err != nil || len(hash) != 16 {
+		t.Fatalf("NTHashBytes() = %x, %v; want 16 bytes from a padded, upper-case hash", hash, err)
+	}
+	if hash, err := cfg.Users[1].NTHashBytes(); hash != nil || err != nil {
+		t.Fatalf("NTHashBytes() for a password account = %x, %v; want nil", hash, err)
+	}
+	if got := cfg.UsesPlaintextPasswords(); !slices.Equal(got, []string{"plain", "also-plain"}) {
+		t.Fatalf("UsesPlaintextPasswords() = %v, want the two password accounts", got)
+	}
+	if got := (&SMBConfig{Users: []SMBUser{{Username: "hashed", NTLMHash: "8846f7eaee8fb117ad06bdd830b7586c"}}}).UsesPlaintextPasswords(); got != nil {
+		t.Fatalf("UsesPlaintextPasswords() with only hashes = %v, want none", got)
 	}
 }
