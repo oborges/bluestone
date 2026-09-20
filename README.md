@@ -242,7 +242,7 @@ smb:
   users:
     - username: "alice"
       # The account's NT hash, from: bluestone -smb-hash
-      ntlm_hash: "8846f7eaee8fb117ad06bdd830b7586c"
+      ntlm_hash: "<32 hex characters>"
 ```
 
 The SMB server is experimental and disabled by default. It serves the same
