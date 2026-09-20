@@ -346,8 +346,8 @@ func (r *QueryInfoRequest) Parse(msg []byte) error {
 	r.InfoType = b[2]
 	r.FileInfoClass = b[3]
 	r.OutputBufferLength = binary.LittleEndian.Uint32(b[4:8])
-	r.AdditionalInfo = binary.LittleEndian.Uint32(b[24:28])
-	r.Flags = binary.LittleEndian.Uint32(b[28:32])
+	r.AdditionalInfo = binary.LittleEndian.Uint32(b[16:20])
+	r.Flags = binary.LittleEndian.Uint32(b[20:24])
 	copy(r.FileId[:], b[24:40])
 	return nil
 }

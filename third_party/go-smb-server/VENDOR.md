@@ -205,6 +205,20 @@ proposed upstream.
   a gap between two of them fails the copy. Connections still busy when ctx
   is done are closed anyway. `Shutdown` remains the abrupt form.
 
+- `smb/server` + `smb/wire`: QUERY_INFO answers a request for a file's
+  security descriptor with a self-relative descriptor (owner
+  BUILTIN\Administrators, group BUILTIN\Users, and a DACL granting everyone
+  full access, inheritable on a directory), honouring the parts named in
+  AdditionalInformation, and answers a buffer that is too small with
+  STATUS_BUFFER_TOO_SMALL and the size to ask for. SET_INFO for security is
+  refused rather than accepted and dropped. Upstream answered
+  STATUS_NOT_SUPPORTED, which Windows reports as being unable to read the
+  file's security information.
+- `smb/wire`: QUERY_INFO reads AdditionalInformation from offset 16 and
+  Flags from 20 (MS-SMB2 2.2.37). Upstream read them from 24 and 28, which
+  are the first bytes of the FileId, so both fields were whatever the handle
+  happened to contain.
+
 ## Known gaps to close in Bluestone
 
 Tracked with the rest of the SMB work in `docs/SMB_ROADMAP.md`.

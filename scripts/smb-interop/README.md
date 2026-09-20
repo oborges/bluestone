@@ -63,6 +63,11 @@ ssh gateway 'sudo sed -n "s/^ *password: \"\(.*\)\"$/\1/p" /etc/bluestone/config
   echo "$password" | ssh windows 'powershell -File windows-lock-test.ps1 -Server 10.0.0.4'
   ```
 
+- `windows-acl-test.ps1` checks what Windows reads from a file's security
+  descriptor: `Get-Acl` on a file and a directory (the Security tab reads the
+  same thing), the inherit flags on a directory's entry, and that `Set-Acl`
+  is refused cleanly rather than appearing to save permissions the gateway
+  does not keep.
 - `windows-sharemode-test.ps1` checks share modes: a file held with
   `FileShare.None` blocks other opens, one held with `FileShare.Read` admits
   readers but not writers, and listing a directory still works while a file
