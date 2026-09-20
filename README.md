@@ -461,6 +461,11 @@ Important metrics include:
 - `nfs_requests_total` (deprecated: the same requests without a `protocol`
   label; use `filesystem_requests_total`)
 - `cos_api_calls_total`
+- `smb_requests_total` (labels `command`, `status`), and
+  `smb_request_duration_seconds` (label `command`): one entry per SMB2
+  command, so a compound request counts once per command in it, and `status`
+  is the NT status the client saw, such as `STATUS_SHARING_VIOLATION`
+- `smb_connections`, `smb_sessions`, `smb_open_files`
 
 Health endpoints are available when `server.health_enabled` is true:
 
@@ -469,6 +474,11 @@ curl http://127.0.0.1:8081/health/live
 curl http://127.0.0.1:8081/health/ready
 curl http://127.0.0.1:8081/health
 ```
+
+`/health` reports a check per subsystem. The `smb` check is healthy while the
+server is serving, and reports its connection, session, and open-file counts;
+it is healthy and says so when SMB is disabled, and unhealthy if the server
+stopped serving while the gateway kept running.
 
 Debug endpoints are available when `server.debug_enabled` is true:
 

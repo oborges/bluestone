@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sonroyaalmerol/go-smb-server/smb/auth"
@@ -38,6 +39,7 @@ type Server struct {
 	shareByName   map[string]vfs.Share
 	dialect       uint16
 	locker        vfs.ByteRangeLocker
+	observer      Observer
 	maxConcurrent int
 	maxTransact   uint32
 	maxRead       uint32
@@ -71,6 +73,15 @@ func WithEncryptionRequired() Option { return func(s *Server) { s.requireEnc = t
 // in-memory table, so locks taken over SMB can share a table with locks taken
 // over other protocols.
 func WithLocker(l vfs.ByteRangeLocker) Option { return func(s *Server) { s.locker = l } }
+
+// obs returns the server's observer, or one that does nothing for a Server
+// built without New.
+func (s *Server) obs() Observer {
+	if s.observer == nil {
+		return noopObserver{}
+	}
+	return s.observer
+}
 
 // WithMaxConcurrentRequests bounds how many reads and writes a single
 // connection handles at once. 0 selects the default; 1 handles every request
@@ -181,9 +192,14 @@ func (s *Server) Shutdown() error {
 }
 
 type session struct {
-	auth           auth.Authenticator
-	identity       *auth.Identity
-	authenticated  bool
+	auth          auth.Authenticator
+	identity      *auth.Identity
+	authenticated bool
+	// counted records that this session was reported to the observer, so
+	// that it is reported once however many SESSION_SETUPs it took, and
+	// balanced by exactly one SessionClosed, whether the client logs off or
+	// its connection ends.
+	counted        atomic.Bool
 	mu             sync.RWMutex
 	trees          map[uint32]*tree
 	nextTreeID     uint32
@@ -304,6 +320,8 @@ type conn struct {
 
 func (s *Server) serveConn(ctx context.Context, c net.Conn) {
 	defer func() { _ = c.Close() }()
+	s.obs().ConnectionOpened()
+	defer s.obs().ConnectionClosed()
 	connCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -595,6 +613,7 @@ func (c *request) handleMessage(ctx context.Context, msg []byte) {
 		c.out = append(c.out, make([]byte, wire.HeaderSize)...)
 
 		var status uint32
+		started := time.Now()
 		switch {
 		case chainFailed:
 			status = lastStatus
@@ -603,6 +622,7 @@ func (c *request) handleMessage(ctx context.Context, msg []byte) {
 		default:
 			status = c.dispatch(ctx, sub, &hdr, &lastFileId, related)
 		}
+		c.srv.obs().RequestCompleted(hdr.Command, status, time.Since(started))
 		lastStatus = status
 		if status != wire.StatusSuccess && status != wire.StatusMoreProcessingRequired {
 			chainFailed = true
@@ -709,8 +729,12 @@ func (c *conn) putSession(id uint64, sess *session) {
 
 func (c *conn) dropSession(id uint64) {
 	c.sessionsMu.Lock()
-	defer c.sessionsMu.Unlock()
+	sess := c.sessions[id]
 	delete(c.sessions, id)
+	c.sessionsMu.Unlock()
+	if sess != nil && sess.counted.CompareAndSwap(true, false) {
+		c.srv.obs().SessionClosed()
+	}
 }
 
 // eachSession calls fn for every session on the connection.
@@ -748,6 +772,10 @@ func (c *conn) cleanup() {
 	c.eachSession(func(sess *session) {
 		for _, tr := range sess.allTrees() {
 			c.closeAllOpens(ctx, tr)
+		}
+		// Sessions the client never logged off from end with the connection.
+		if sess.counted.CompareAndSwap(true, false) {
+			c.srv.obs().SessionClosed()
 		}
 	})
 }

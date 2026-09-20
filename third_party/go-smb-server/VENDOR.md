@@ -171,16 +171,30 @@ proposed upstream.
   HIDDEN (0x02), and macOS hides the AppleDouble files it writes, which then
   could not be deleted.
 
+- `smb/server`: `WithObserver` reports connections, authenticated sessions,
+  and every completed request (command, status, duration), so an application
+  can count what the server does without wrapping the protocol. A compound
+  request reports each of its commands.
+
 ## Known gaps to close in Bluestone
+
+Tracked with the rest of the SMB work in `docs/SMB_ROADMAP.md`.
 
 - Blocking byte-range locks: a lock that cannot be granted is refused even
   when the client did not set SMB2_LOCKFLAG_FAIL_IMMEDIATELY, instead of
   waiting for the conflicting lock to be released.
-
-- Requests on a connection are handled one at a time.
-- CREATE share access is parsed but not enforced (no sharing violations).
-- The CREATE response reports only directory/archive attributes and ignores
-  `vfs.FileInfo.Attributes`.
-- Few QUERY_INFO classes; no leases; AES-CMAC signing and AES-128-CCM
-  encryption only.
-- Not yet tested against Windows clients.
+- No oplocks or leases, so clients cache nothing and every read crosses the
+  wire. Granting them needs working breaks, including breaks caused by writes
+  arriving over NFS.
+- No security descriptors: QUERY_INFO and SET_INFO for security answer
+  STATUS_NOT_SUPPORTED, so Windows cannot show a file's Security tab.
+- No server-side copy (FSCTL_SRV_COPYCHUNK), so copying within a share moves
+  every byte through the client.
+- CHANGE_NOTIFY polls the directory every 500ms per watch and compares
+  listings, which is expensive against object storage.
+- No durable or persistent handles and no multichannel, so a dropped
+  connection loses open handles.
+- The dialect is fixed at 3.0.2: no SMB 3.1.1, so no pre-auth integrity and
+  no AES-GCM. Signing is AES-CMAC and encryption AES-128-CCM.
+- No alternate data streams, so macOS writes AppleDouble files into the
+  bucket.
