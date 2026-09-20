@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLoadUsesNestedEnvironmentOverrides(t *testing.T) {
@@ -243,6 +244,47 @@ func TestLoadSMBDefaultsAndOverrides(t *testing.T) {
 	}
 }
 
+func TestLoadSMBLimitDefaultsAndOverrides(t *testing.T) {
+	setRequiredTestEnv(t)
+
+	cfg, err := Load(writeTestConfig(t, "staging:\n  enabled: false\n"))
+	if err != nil {
+		t.Fatalf("Load() returned error: %v", err)
+	}
+	limits := cfg.SMB.Limits
+	if limits.MaxConnections != 256 || limits.MaxConnectionsPerClient != 64 ||
+		limits.MaxSessionsPerConnection != 32 || limits.MaxTreesPerSession != 64 ||
+		limits.MaxOpensPerSession != 4096 || limits.AuthFailures != 5 {
+		t.Fatalf("SMB limit defaults = %+v", limits)
+	}
+	for _, get := range []struct {
+		name string
+		fn   func() (time.Duration, error)
+		want time.Duration
+	}{
+		{"auth_window", limits.GetAuthWindow, 5 * time.Minute},
+		{"auth_block", limits.GetAuthBlock, 30 * time.Second},
+		{"auth_max_block", limits.GetAuthMaxBlock, 15 * time.Minute},
+	} {
+		got, err := get.fn()
+		if err != nil || got != get.want {
+			t.Fatalf("%s = %s, %v; want %s", get.name, got, err, get.want)
+		}
+	}
+
+	t.Setenv("BLUESTONE_SMB_LIMITS_MAX_CONNECTIONS", "12")
+	cfg, err = Load(writeTestConfig(t, "staging:\n  enabled: false\nsmb:\n  limits:\n    max_opens_per_session: 7\n    auth_block: 2m\n"))
+	if err != nil {
+		t.Fatalf("Load() with limits returned error: %v", err)
+	}
+	if cfg.SMB.Limits.MaxConnections != 12 || cfg.SMB.Limits.MaxOpensPerSession != 7 {
+		t.Fatalf("SMB limits = %+v, want 12 connections and 7 opens", cfg.SMB.Limits)
+	}
+	if block, err := cfg.SMB.Limits.GetAuthBlock(); err != nil || block != 2*time.Minute {
+		t.Fatalf("auth_block = %s, %v; want 2m", block, err)
+	}
+}
+
 func TestValidateSMB(t *testing.T) {
 	valid := func() SMBConfig {
 		return SMBConfig{
@@ -270,6 +312,23 @@ func TestValidateSMB(t *testing.T) {
 		{name: "empty password", mutate: func(c *SMBConfig) { c.Users[0].Password = "" }, wantErr: true},
 		{name: "duplicate username", mutate: func(c *SMBConfig) {
 			c.Users = append(c.Users, SMBUser{Username: "Alice", Password: "other"})
+		}, wantErr: true},
+		{name: "negative limit", mutate: func(c *SMBConfig) { c.Limits.MaxConnections = -1 }, wantErr: true},
+		{name: "limits off", mutate: func(c *SMBConfig) { c.Limits = SMBLimits{} }},
+		{name: "per-client over total", mutate: func(c *SMBConfig) {
+			c.Limits.MaxConnections = 4
+			c.Limits.MaxConnectionsPerClient = 8
+		}, wantErr: true},
+		{name: "per-client under total", mutate: func(c *SMBConfig) {
+			c.Limits.MaxConnections = 8
+			c.Limits.MaxConnectionsPerClient = 4
+		}},
+		{name: "per-client without total", mutate: func(c *SMBConfig) { c.Limits.MaxConnectionsPerClient = 8 }},
+		{name: "unparsable auth window", mutate: func(c *SMBConfig) { c.Limits.AuthWindow = "soon" }, wantErr: true},
+		{name: "zero auth block", mutate: func(c *SMBConfig) { c.Limits.AuthBlock = "0s" }, wantErr: true},
+		{name: "max block under block", mutate: func(c *SMBConfig) {
+			c.Limits.AuthBlock = "10m"
+			c.Limits.AuthMaxBlock = "1m"
 		}, wantErr: true},
 	}
 	for _, tt := range tests {

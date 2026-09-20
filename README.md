@@ -229,6 +229,16 @@ smb:
   domain: "BLUESTONE"
   encryption_required: false
   concurrent_requests: 0 # reads/writes at once per connection; 0 = default (64), 1 = serial
+  limits:
+    max_connections: 256
+    max_connections_per_client: 64
+    max_sessions_per_connection: 32
+    max_trees_per_session: 64
+    max_opens_per_session: 4096
+    auth_failures: 5
+    auth_window: "5m"
+    auth_block: "30s"
+    auth_max_block: "15m"
   users:
     - username: "alice"
       password: "change-me"
@@ -242,6 +252,25 @@ clients get Windows naming: names match case-insensitively, and characters
 Windows cannot use in names are shown as Unicode private-use characters and
 mapped back to the stored key. Creation time and the read-only, hidden,
 system, and archive attributes are stored in object metadata.
+
+`smb.limits` bounds what clients can make the gateway hold, so one client
+cannot exhaust it: connections to the server and from a single address,
+sessions per connection, share connections per session, and files a session
+holds open. A request past a limit is refused with
+`STATUS_INSUFFICIENT_RESOURCES`, and a connection past one is closed at
+accept. `0` turns a limit off. The defaults are generous enough that no
+ordinary client meets them.
+
+Repeated login failures from one address are slowed down: after
+`auth_failures` failures within `auth_window`, that address is refused for
+`auth_block`, and each further failure doubles the wait up to
+`auth_max_block`. A refused attempt is answered as a wrong password, so a
+client cannot tell a block from a bad credential, and a successful login
+clears the record, so a mistyped password costs a user nothing. Blocking is
+by client address, which is blunt behind NAT; the defaults are set so
+ordinary retries never reach the threshold. Watch `smb_auth_failures_total`,
+`smb_auth_blocked_total` and `smb_auth_blocked_clients` for a client that is
+guessing.
 
 Users authenticate with NTLM against the accounts listed under `users`. Keep
 the configuration file readable only by the gateway's service account.
@@ -466,6 +495,9 @@ Important metrics include:
   command, so a compound request counts once per command in it, and `status`
   is the NT status the client saw, such as `STATUS_SHARING_VIOLATION`
 - `smb_connections`, `smb_sessions`, `smb_open_files`
+- `smb_connections_refused_total` (label `reason`: which limit refused them)
+- `smb_auth_failures_total`, `smb_auth_blocked_total`,
+  `smb_auth_blocked_clients`
 
 Health endpoints are available when `server.health_enabled` is true:
 

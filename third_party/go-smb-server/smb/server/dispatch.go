@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"strings"
+	"time"
 
 	"github.com/sonroyaalmerol/go-smb-server/smb/auth"
 	"github.com/sonroyaalmerol/go-smb-server/smb/encryption"
@@ -45,7 +46,7 @@ func (c *request) dispatch(ctx context.Context, msg []byte, hdr *wire.Header, la
 	case wire.CmdTreeDisconnect:
 		return c.handleTreeDisconnect(ctx, hdr, sess, tr)
 	case wire.CmdCreate:
-		return c.handleCreate(ctx, msg, hdr, tr, lastFileId)
+		return c.handleCreate(ctx, msg, hdr, sess, tr, lastFileId)
 	case wire.CmdClose:
 		return c.handleClose(ctx, msg, tr)
 	case wire.CmdRead:
@@ -161,8 +162,19 @@ func (c *request) handleSessionSetup(ctx context.Context, msg []byte, hdr *wire.
 	if err := req.Parse(msg); err != nil {
 		return c.errBody(wire.StatusInvalidParameter)
 	}
+	remote := c.remoteAddr()
+	if !c.srv.gate().Allow(remote) {
+		// Answered as a wrong password, so a caller cannot tell a blocked
+		// client from a bad credential.
+		return c.errBody(wire.StatusLogonFailure)
+	}
+
 	sess := c.getSession(hdr.SessionId)
 	if sess == nil {
+		if max := c.srv.limits.SessionsPerConnection; max > 0 && c.sessionCount() >= max {
+			c.log.Debug("session limit reached", "remote", remote, "limit", max)
+			return c.errBody(wire.StatusInsufficientResources)
+		}
 		sess = &session{
 			auth:  c.srv.authFactory(),
 			trees: make(map[uint32]*tree),
@@ -173,8 +185,10 @@ func (c *request) handleSessionSetup(ctx context.Context, msg []byte, hdr *wire.
 		hdr.SessionId = sessID
 	}
 
+	started := time.Now()
 	result, err := sess.auth.Accept(ctx, req.SecurityBuffer)
 	if err != nil {
+		c.srv.gate().Attempted(remote, false, time.Since(started))
 		if errors.Is(err, auth.ErrLogonFailed) {
 			return c.errBody(wire.StatusLogonFailure)
 		}
@@ -198,6 +212,7 @@ func (c *request) handleSessionSetup(ctx context.Context, msg []byte, hdr *wire.
 	c.out = ssr.Append(c.out)
 	if sess.authenticated {
 		if sess.counted.CompareAndSwap(false, true) {
+			c.srv.gate().Attempted(remote, true, time.Since(started))
 			c.srv.obs().SessionOpened()
 		}
 		return wire.StatusSuccess
@@ -226,6 +241,10 @@ func (c *request) handleTreeConnect(msg []byte, hdr *wire.Header, sess *session)
 	sh, ok := c.srv.shareNamed(shareName)
 	if !ok {
 		return c.errBody(wire.StatusBadNetworkName)
+	}
+
+	if max := c.srv.limits.TreesPerSession; max > 0 && sess.treeCount() >= max {
+		return c.errBody(wire.StatusInsufficientResources)
 	}
 
 	treeID := sess.nextTreeID
@@ -289,10 +308,14 @@ func (c *conn) closeAllOpens(ctx context.Context, tr *tree) {
 	tr.opens = make(map[[16]byte]*openHandle)
 }
 
-func (c *request) handleCreate(ctx context.Context, msg []byte, hdr *wire.Header, tr *tree, lastFileId *[16]byte) uint32 {
+func (c *request) handleCreate(ctx context.Context, msg []byte, hdr *wire.Header, sess *session, tr *tree, lastFileId *[16]byte) uint32 {
 	var req wire.CreateRequest
 	if err := req.Parse(msg); err != nil {
 		return c.errBody(wire.StatusInvalidParameter)
+	}
+	if max := c.srv.limits.OpensPerSession; max > 0 && sess != nil && sess.openCount() >= max {
+		c.log.Debug("open limit reached", "remote", c.remoteAddr(), "limit", max)
+		return c.errBody(wire.StatusInsufficientResources)
 	}
 	name := wire.UTF16FromBytes(req.Name)
 	opts := vfs.OpenOptions{

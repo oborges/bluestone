@@ -108,6 +108,23 @@ smb:
   # Reads and writes handled at once per connection. 0 (default) uses the
   # built-in value (64); 1 handles every request in turn, as an escape hatch.
   concurrent_requests: 0
+  # What one client can make the gateway hold, and how fast it may keep
+  # failing to log in. 0 means no limit; the defaults shown are generous
+  # enough that no ordinary client meets them.
+  limits:
+    max_connections: 256
+    max_connections_per_client: 64
+    max_sessions_per_connection: 32
+    max_trees_per_session: 64
+    max_opens_per_session: 4096
+    # After auth_failures failed logins from one address within auth_window,
+    # that address is refused for auth_block; each further failure doubles
+    # the wait up to auth_max_block. A successful login clears the record,
+    # so a mistyped password costs a user nothing.
+    auth_failures: 5
+    auth_window: "5m"
+    auth_block: "30s"
+    auth_max_block: "15m"
   # users:
   #   - username: "alice"
   #     password: "change-me"

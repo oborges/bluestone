@@ -324,6 +324,18 @@ func main() {
 		smbFilesystem := vfs.NewFilesystem(operations, logging.NewKVLogger(zapLogger), "/", &cfg.Performance, stagingManager, syncWorker, featureFlags).
 			WithWindowsNames().
 			ForProtocol(metrics.ProtocolSMB)
+		authWindow, err := cfg.SMB.Limits.GetAuthWindow()
+		if err != nil {
+			logging.Fatal("Invalid smb.limits.auth_window", zap.Error(err))
+		}
+		authBlock, err := cfg.SMB.Limits.GetAuthBlock()
+		if err != nil {
+			logging.Fatal("Invalid smb.limits.auth_block", zap.Error(err))
+		}
+		authMaxBlock, err := cfg.SMB.Limits.GetAuthMaxBlock()
+		if err != nil {
+			logging.Fatal("Invalid smb.limits.auth_max_block", zap.Error(err))
+		}
 		users := make([]smb.User, 0, len(cfg.SMB.Users))
 		for _, user := range cfg.SMB.Users {
 			users = append(users, smb.User{Name: user.Username, Password: user.Password})
@@ -338,7 +350,20 @@ func main() {
 			Opens:              opens,
 			Locks:              locks,
 			ConcurrentRequests: cfg.SMB.ConcurrentRequests,
-			Logger:             zapLogger,
+			Limits: smb.Limits{
+				Connections:           cfg.SMB.Limits.MaxConnections,
+				ConnectionsPerClient:  cfg.SMB.Limits.MaxConnectionsPerClient,
+				SessionsPerConnection: cfg.SMB.Limits.MaxSessionsPerConnection,
+				TreesPerSession:       cfg.SMB.Limits.MaxTreesPerSession,
+				OpensPerSession:       cfg.SMB.Limits.MaxOpensPerSession,
+			},
+			AuthLimits: smb.AuthLimits{
+				Failures: cfg.SMB.Limits.AuthFailures,
+				Window:   authWindow,
+				Block:    authBlock,
+				MaxBlock: authMaxBlock,
+			},
+			Logger: zapLogger,
 		})
 		if err != nil {
 			logging.Fatal("Failed to create SMB server", zap.Error(err))
