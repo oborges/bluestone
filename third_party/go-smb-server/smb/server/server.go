@@ -44,6 +44,7 @@ type Server struct {
 	authGate      AuthGate
 	resume        *resumeKeys
 	files         *openFiles
+	notify        *notifyHub
 	maxConcurrent int
 	maxTransact   uint32
 	maxRead       uint32
@@ -382,6 +383,14 @@ type openHandle struct {
 	pathMu sync.Mutex
 	path   string
 
+	// watch is the handle's change notification, set up by its first
+	// CHANGE_NOTIFY.
+	watchMu sync.Mutex
+	watch   *watch
+	// wrote records that a change to the file has been reported for this
+	// handle's writes, so a burst of writes is reported once.
+	wrote atomic.Bool
+
 	enumDone bool
 	enumMu   sync.Mutex
 
@@ -400,6 +409,19 @@ type openHandle struct {
 type request struct {
 	*conn
 	out []byte
+	// after runs once out is queued: work that must not reach the client
+	// before this response does.
+	after []func()
+}
+
+// finish queues the response and runs what waited for it.
+func (r *request) finish() {
+	if len(r.out) > 0 {
+		r.send(r.out)
+	}
+	for _, fn := range r.after {
+		fn()
+	}
 }
 
 type conn struct {
@@ -538,7 +560,7 @@ func (s *Server) serveConn(ctx context.Context, c net.Conn) {
 				defer func() { <-cn.inflight }()
 				r := &request{conn: cn}
 				r.handleMessage(connCtx, queued)
-				cn.send(r.out)
+				r.finish()
 			}()
 			continue
 		}
@@ -546,7 +568,7 @@ func (s *Server) serveConn(ctx context.Context, c net.Conn) {
 		cn.running.Add(1)
 		r := &request{conn: cn}
 		r.handleMessage(connCtx, msg)
-		cn.send(r.out)
+		r.finish()
 		cn.running.Add(-1)
 	}
 }
@@ -724,6 +746,19 @@ func (c *request) handleMessage(ctx context.Context, msg []byte) {
 			}
 		}
 
+		if hdr.Command == wire.CmdCancel {
+			// CANCEL has no response of its own (MS-SMB2 section
+			// 3.3.5.16): the request it cancels completes instead.
+			c.handleCancel(&hdr)
+			c.srv.obs().RequestCompleted(hdr.Command, wire.StatusSuccess, 0)
+			first = false
+			if hdr.NextCommand == 0 {
+				break
+			}
+			off += int(hdr.NextCommand)
+			continue
+		}
+
 		if hdr.Command == wire.CmdChangeNotify && !chainFailed {
 			sess := c.getSession(hdr.SessionId)
 			var trCN *tree
@@ -759,8 +794,6 @@ func (c *request) handleMessage(ctx context.Context, msg []byte) {
 			status = lastStatus
 		case related && createErr != wire.StatusSuccess:
 			status = createErr
-		case hdr.Command == wire.CmdCancel:
-			status = c.handleCancel(sub, &hdr)
 		default:
 			status = c.dispatch(ctx, sub, &hdr, &lastFileId, related)
 		}

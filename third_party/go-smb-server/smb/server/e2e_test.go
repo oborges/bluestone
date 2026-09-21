@@ -8,7 +8,6 @@ import (
 	"net"
 
 	"testing"
-	"time"
 
 	"github.com/sonroyaalmerol/go-smb-server/smb/auth"
 	"github.com/sonroyaalmerol/go-smb-server/smb/transport"
@@ -572,55 +571,32 @@ func buildLock(sessID uint64, treeID uint32, fid [16]byte, offset, length uint64
 
 func TestEndToEnd_ChangeNotify(t *testing.T) {
 	backend := newMemBackend()
-	// seed one file so the watched dir exists
-	if _, err := backend.Open(context.Background(), vfs.OpenOptions{Path: "existing.txt", Disposition: vfs.DispositionCreate}); err != nil {
-		t.Fatal(err)
-	}
+	srv := newTestServer(backend)
+	watcher := connectDeleteClient(t, srv)
+	other := connectDeleteClient(t, srv)
 
-	client, srvConn := newPipeConns()
-	defer func() { _ = client.Close() }()
-	defer serveOn(newTestServer(backend), srvConn)()
-
-	fc := transport.NewFramedConn(client)
-	negotiate(t, fc)
-	sessID := sessionSetup(t, fc)
-	treeID := treeConnect(t, fc, sessID)
-
-	// Open the directory root.
-	mustWrite(t, fc, buildCreate(sessID, treeID, "", wire.FileOpen))
-	rh, resp := readReply(t, fc)
-	if rh.Status != wire.StatusSuccess {
-		t.Fatalf("create dir: %x", rh.Status)
-	}
-	var dirFid [16]byte
-	copy(dirFid[:], resp[64+64:64+80])
+	dirFid := watcher.mustOpen("", wire.FileOpen, accessRead, 0)
 
 	// Subscribe to CHANGE_NOTIFY (async).
-	mustWrite(t, fc, buildChangeNotify(sessID, treeID, dirFid, FileNotifyChangeFileName))
-	// Expect the interim STATUS_PENDING response.
-	rh, _ = readReply(t, fc)
+	mustWrite(t, watcher.fc, buildChangeNotify(watcher.sessID, watcher.treeID, dirFid, FileNotifyChangeFileName))
+	rh, _ := readReply(t, watcher.fc)
 	if rh.Status != wire.StatusPending {
 		t.Fatalf("change_notify interim: %x, want pending", rh.Status)
 	}
 	asyncID := rh.AsyncId
 
-	// Trigger a change from the server side via the backend (simulating another
-	// client writing). Wait past the watcher's poll interval.
-	go func() {
-		time.Sleep(700 * time.Millisecond)
-		_, _ = backend.Open(context.Background(), vfs.OpenOptions{Path: "new.txt", Disposition: vfs.DispositionCreate})
-	}()
+	// Another client creates a file.
+	other.close(other.mustOpen("new.txt", wire.FileCreate, genericAll, 0))
 
-	// Expect a final async response with the added-file notification.
-	rh, cnResp := readReply(t, fc)
+	rh, cnResp := readReply(t, watcher.fc)
 	if rh.Status != wire.StatusSuccess {
 		t.Fatalf("change_notify final: %x", rh.Status)
 	}
 	if rh.AsyncId != asyncID {
 		t.Fatalf("async id mismatch: %d != %d", rh.AsyncId, asyncID)
 	}
-	if len(cnResp) <= 64+8 {
-		t.Fatal("change_notify final has no body")
+	if events := notifyEvents(t, cnResp); len(events) != 1 || events[0] != (notifyEvent{fileActionAdded, "new.txt"}) {
+		t.Fatalf("events = %v, want new.txt added", events)
 	}
 }
 

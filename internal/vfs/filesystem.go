@@ -41,6 +41,9 @@ type Filesystem struct {
 	// windowsNames makes the view follow Windows naming (see
 	// WithWindowsNames).
 	windowsNames bool
+	// changes carries every change made through the filesystem to its
+	// subscribers; views share it.
+	changes *changeFeed
 }
 
 // NewFilesystem creates a new COS filesystem with configuration
@@ -82,6 +85,7 @@ func NewFilesystem(ops *posix.OperationsHandler, logger *logging.KVLogger, root 
 		stagingManager: stagingManager,
 		syncWorker:     syncWorker,
 		featureFlags:   featureFlags,
+		changes:        &changeFeed{},
 	}
 }
 
@@ -219,6 +223,7 @@ func (fs *Filesystem) OpenFile(filename string, flag int, perm os.FileMode) (bil
 		syncWorker:     fs.syncWorker,
 		featureFlags:   fs.featureFlags,
 		protocol:       fs.protocol,
+		changes:        fs.changes,
 	}
 
 	// A path with an accepted-but-unconfirmed delete must look nonexistent:
@@ -391,6 +396,12 @@ func (fs *Filesystem) OpenFile(filename string, flag int, perm os.FileMode) (bil
 		}
 	}
 
+	switch {
+	case flag&os.O_CREATE != 0 && !fileExists:
+		fs.changed(Change{Action: ChangeAdded, Path: fullPath})
+	case flag&os.O_TRUNC != 0 && fileExists:
+		fs.changed(Change{Action: ChangeModified, Path: fullPath, Kind: ChangeData})
+	}
 	return file, nil
 }
 
@@ -560,8 +571,7 @@ func (fs *Filesystem) statFromStaging(fullPath string) os.FileInfo {
 	return nil
 }
 
-// Rename renames a file
-// CopyFile copies src to dst inside the bucket, without the bytes passing
+// copyFile copies src to dst inside the bucket, without the bytes passing
 // through the gateway or the client. It is what SMB's server-side copy
 // becomes when a whole file is being copied.
 //
@@ -582,7 +592,7 @@ func (fs *Filesystem) statFromStaging(fullPath string) os.FileInfo {
 // onlyUnwritten restricts the copy to that case, for a caller that knows
 // only that the destination's current bytes are not worth keeping if nobody
 // wrote them.
-func (fs *Filesystem) CopyFile(src, dst string, onlyUnwritten bool) error {
+func (fs *Filesystem) copyFile(src, dst string, onlyUnwritten bool) error {
 	srcFull := fs.keyPath(src)
 	dstFull := fs.keyPath(dst)
 	if isReservedPath(srcFull) || isReservedPath(dstFull) {
@@ -666,7 +676,8 @@ func (fs *Filesystem) IsStaged(name string) bool {
 	return sm.IsDirty(full) || sm.HasPendingDelete(full) || sm.IsConflicted(full)
 }
 
-func (fs *Filesystem) Rename(oldpath, newpath string) error {
+// rename renames a file or directory.
+func (fs *Filesystem) rename(oldpath, newpath string) error {
 	oldFull := fs.keyPath(oldpath)
 	newFull := fs.renameTargetPath(oldFull, newpath)
 	if isReservedPath(oldFull) || isReservedPath(newFull) {
@@ -784,8 +795,8 @@ func (fs *Filesystem) discardStagedDestination(path string) error {
 	return nil
 }
 
-// Remove removes a file or directory
-func (fs *Filesystem) Remove(filename string) error {
+// remove removes a file or directory.
+func (fs *Filesystem) remove(filename string) error {
 	fullPath := fs.keyPath(filename)
 	if isReservedPath(fullPath) {
 		return &os.PathError{Op: "remove", Path: filename, Err: os.ErrPermission}
@@ -1177,8 +1188,8 @@ func (fs *Filesystem) ReadDir(path string) ([]os.FileInfo, error) {
 	return fs.presentEntries(result), nil
 }
 
-// MkdirAll creates a directory and all parent directories
-func (fs *Filesystem) MkdirAll(filename string, perm os.FileMode) error {
+// mkdirAll creates a directory and all parent directories.
+func (fs *Filesystem) mkdirAll(filename string, perm os.FileMode) error {
 	fullPath := fs.keyPath(filename)
 	now := time.Now()
 	attrs := &types.POSIXAttributes{
@@ -1220,6 +1231,7 @@ func (fs *Filesystem) Chroot(path string) (billy.Filesystem, error) {
 		featureFlags:   fs.featureFlags,
 		protocol:       fs.protocol,
 		windowsNames:   fs.windowsNames,
+		changes:        fs.changes,
 	}, nil
 }
 
@@ -1233,11 +1245,11 @@ func (fs *Filesystem) Chmod(name string, mode os.FileMode) error {
 	return fs.SetAttributes(name, posix.AttributeUpdate{Mode: &mode})
 }
 
-// SetAttributes applies an attribute change to the named file or directory. A
+// setAttributes applies an attribute change to the named file or directory. A
 // staged file records the change for its next sync (access and modification
 // times are not staged); anything else gets a metadata-only update in COS
 // that does not rewrite the object's bytes.
-func (fs *Filesystem) SetAttributes(name string, update posix.AttributeUpdate) error {
+func (fs *Filesystem) setAttributes(name string, update posix.AttributeUpdate) error {
 	fullPath := fs.keyPath(name)
 
 	if fs.featureFlags != nil && fs.featureFlags.IsStagingEnabled() && fs.stagingManager != nil {
@@ -1331,6 +1343,11 @@ type File struct {
 	featureFlags   *feature.FeatureFlags
 	// protocol attributes this handle's requests in metrics.
 	protocol string
+
+	// changes receives the handle's writes, and wrote records that one has
+	// been published, so a burst of writes is one change until Close.
+	changes *changeFeed
+	wrote   bool
 
 	// mu guards the mutable handle state above (offset, size, data, loaded,
 	// isNew, writeSession, counters) and closed, so one open file can serve
@@ -1456,6 +1473,7 @@ func (f *File) Write(p []byte) (int, error) {
 	}
 	n, err := f.writeLocked(p, f.offset)
 	f.offset += int64(n)
+	f.noteWrite(n)
 	return n, err
 }
 
@@ -1470,7 +1488,9 @@ func (f *File) WriteAt(p []byte, off int64) (int, error) {
 	if f.closed {
 		return 0, os.ErrClosed
 	}
-	return f.writeLocked(p, off)
+	n, err := f.writeLocked(p, off)
+	f.noteWrite(n)
+	return n, err
 }
 
 // writeLocked writes data at offset with session-based buffering. The caller
@@ -1783,6 +1803,10 @@ func (f *File) Close() error {
 	if f.closed {
 		return nil
 	}
+	if f.wrote {
+		// Watchers saw the first write; this shows them the final size.
+		defer f.changes.publish(Change{Action: ChangeModified, Path: f.path, Kind: ChangeData})
+	}
 	f.closed = true
 
 	// STAGING PATH: Release staging session
@@ -2001,9 +2025,9 @@ func (f *File) ReadAt(p []byte, off int64) (int, error) {
 	return n, nil
 }
 
-// Truncate changes the file size, shrinking or zero-extending it. NFS
+// truncate changes the file size, shrinking or zero-extending it. NFS
 // SETATTR size (truncate(1), ftruncate) arrives here.
-func (f *File) Truncate(size int64) error {
+func (f *File) truncate(size int64) error {
 	if size < 0 {
 		return &os.PathError{Op: "truncate", Path: f.path, Err: os.ErrInvalid}
 	}

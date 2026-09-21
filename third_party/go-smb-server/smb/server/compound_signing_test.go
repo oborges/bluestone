@@ -109,3 +109,71 @@ func TestCompoundResponsesAreEachSigned(t *testing.T) {
 		t.Fatalf("got %d responses, want %d", count+1, len(parts))
 	}
 }
+
+// A change notification completes after its request, outside the response
+// that is signed with it, and is signed on its own: a client that requires
+// signing, as recent Windows does by default, drops an unsigned one and never
+// sees the change.
+func TestAsyncChangeNotifyIsSigned(t *testing.T) {
+	kt := newKerbTestKeytab(t)
+	token, sessionKey := buildKerbToken(t, kt)
+	client, srvConn := newPipeConns()
+	defer func() { _ = client.Close() }()
+	defer serveOn(newKerbTestServer(t, newMemBackend(), kt), srvConn)()
+	fc := transport.NewFramedConn(client)
+
+	negBody := make([]byte, 38)
+	binary.LittleEndian.PutUint16(negBody[0:2], 36)
+	binary.LittleEndian.PutUint16(negBody[2:4], 1)
+	binary.LittleEndian.PutUint16(negBody[36:38], wire.DialectSMB302)
+	hdr := wire.NewHeader(wire.CmdNegotiate)
+	hdr.Credit = 1
+	mustWrite(t, fc, append(hdr.Append(nil), negBody...))
+	readReply(t, fc)
+	mustWrite(t, fc, buildSessionSetup(token))
+	rh, _ := readReply(t, fc)
+	sessID := rh.SessionId
+	key := signing.DeriveSigningKey(sessionKey)
+	mustWrite(t, fc, signedTreeConnect(sessID, 2, `\\server\share`, key))
+	rh, _ = readReply(t, fc)
+	treeID := rh.TreeId
+
+	mustWrite(t, fc, buildCreate(sessID, treeID, "", wire.FileOpen))
+	rh, resp := readReply(t, fc)
+	if rh.Status != wire.StatusSuccess {
+		t.Fatalf("open root: %#x", rh.Status)
+	}
+	var dir [16]byte
+	copy(dir[:], resp[64+64:64+80])
+	mustWrite(t, fc, buildChangeNotify(sessID, treeID, dir, FileNotifyChangeFileName))
+	if rh, _ := readReply(t, fc); rh.Status != wire.StatusPending {
+		t.Fatalf("change_notify interim: %#x", rh.Status)
+	}
+	mustWrite(t, fc, buildCreate(sessID, treeID, "new.txt", wire.FileCreate))
+
+	verifier, err := signing.NewSigner(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		msg, err := fc.ReadMessage()
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		var h wire.Header
+		if err := h.Parse(msg); err != nil {
+			t.Fatal(err)
+		}
+		if h.Command != wire.CmdChangeNotify {
+			continue
+		}
+		if h.Status != wire.StatusSuccess || h.Flags&wire.FlagSigned == 0 {
+			t.Fatalf("change notification: status %#x, flags %#x; want a signed success", h.Status, h.Flags)
+		}
+		if ok, err := verifier.Verify(append([]byte(nil), msg...)); err != nil || !ok {
+			t.Fatal("change notification's signature does not verify")
+		}
+		return
+	}
+	t.Fatal("no change notification")
+}

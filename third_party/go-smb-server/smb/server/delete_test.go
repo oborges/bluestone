@@ -24,6 +24,8 @@ type deleteClient struct {
 	fc     *transport.FramedConn
 	sessID uint64
 	treeID uint32
+	// early holds CHANGE_NOTIFY responses answered at once.
+	early [][]byte
 }
 
 func connectDeleteClient(t *testing.T, srv *Server) *deleteClient {

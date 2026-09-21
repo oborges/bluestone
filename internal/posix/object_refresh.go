@@ -41,6 +41,31 @@ type ObjectRefreshScanner struct {
 	mu               sync.Mutex
 	objects          map[string]objectSignature
 	observed         bool
+	onChange         func(ObjectChange)
+}
+
+// ObjectChangeKind says what a scan found happened to an object.
+type ObjectChangeKind int
+
+const (
+	ObjectAdded ObjectChangeKind = iota + 1
+	ObjectRemoved
+	ObjectModified
+)
+
+// ObjectChange is a change made directly in the bucket, found by a scan.
+type ObjectChange struct {
+	Path  string
+	Kind  ObjectChangeKind
+	IsDir bool
+}
+
+// OnChange calls fn with each change a scan finds, other than to paths with
+// local staged writes. Set it before Start; fn must not block.
+func (s *ObjectRefreshScanner) OnChange(fn func(ObjectChange)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.onChange = fn
 }
 
 type objectSignature struct {
@@ -203,6 +228,18 @@ func (s *ObjectRefreshScanner) runOnce(ctx context.Context) {
 		metadataInvalidations += s.ops.invalidateObjectPath(path)
 		if s.ops.invalidateDataPath(path) {
 			dataInvalidations++
+		}
+		if s.onChange != nil {
+			_, was := s.objects[key]
+			_, is := current[key]
+			kind := ObjectModified
+			switch {
+			case !was:
+				kind = ObjectAdded
+			case !is:
+				kind = ObjectRemoved
+			}
+			s.onChange(ObjectChange{Path: path, Kind: kind, IsDir: strings.HasSuffix(key, "/")})
 		}
 	}
 

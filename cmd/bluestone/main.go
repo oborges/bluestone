@@ -294,8 +294,11 @@ func main() {
 		logging.Info("Staging architecture initialized successfully")
 	}
 
+	var refreshScanner *posix.ObjectRefreshScanner
+	var refreshInterval time.Duration
 	if cfg.ObjectRefresh.Enabled {
-		refreshInterval, err := cfg.ObjectRefresh.GetInterval()
+		var err error
+		refreshInterval, err = cfg.ObjectRefresh.GetInterval()
 		if err != nil {
 			logging.Fatal("Invalid object refresh interval", zap.Error(err))
 		}
@@ -315,11 +318,7 @@ func main() {
 				return err
 			}
 		}
-		refreshScanner := posix.NewObjectRefreshScanner(operations, &cfg.ObjectRefresh, dirtyChecker, conflictRecorder)
-		refreshScanner.Start(ctx, refreshInterval)
-		logging.Info("Object-side refresh scanner started",
-			zap.Duration("interval", refreshInterval),
-			zap.String("prefix", cfg.ObjectRefresh.Prefix))
+		refreshScanner = posix.NewObjectRefreshScanner(operations, &cfg.ObjectRefresh, dirtyChecker, conflictRecorder)
 	} else {
 		logging.Info("Object-side refresh scanner disabled by configuration")
 	}
@@ -333,6 +332,17 @@ func main() {
 	// requests are labelled protocol="nfs" in metrics.
 	cosFilesystem := vfs.NewFilesystem(operations, nfsLogger, "/", &cfg.Performance, stagingManager, syncWorker, featureFlags).
 		ForProtocol(metrics.ProtocolNFS)
+
+	// Changes the scanner finds made directly in the bucket join the
+	// filesystem's change feed, so SMB clients watching a directory hear of
+	// them too.
+	if refreshScanner != nil {
+		refreshScanner.OnChange(cosFilesystem.ReportExternalChange)
+		refreshScanner.Start(ctx, refreshInterval)
+		logging.Info("Object-side refresh scanner started",
+			zap.Duration("interval", refreshInterval),
+			zap.String("prefix", cfg.ObjectRefresh.Prefix))
+	}
 
 	// Wrap with directory caching to work around go-nfs library limitation
 	// The go-nfs library doesn't use CachingHandler for READDIR, so we cache at filesystem level
@@ -373,7 +383,10 @@ func main() {
 	// protocol="smb" in metrics, over the same operations and staging.
 	var smbServer *smb.Server
 	if cfg.SMB.Enabled {
-		smbFilesystem := vfs.NewFilesystem(operations, logging.NewKVLogger(zapLogger), "/", &cfg.Performance, stagingManager, syncWorker, featureFlags).
+		// A view of the NFS filesystem rather than one of its own, so the
+		// two share one change feed: SMB clients watching a directory hear
+		// of changes made over NFS.
+		smbFilesystem := cosFilesystem.
 			WithWindowsNames().
 			ForProtocol(metrics.ProtocolSMB)
 		drainTimeout, err := cfg.SMB.GetDrainTimeout()

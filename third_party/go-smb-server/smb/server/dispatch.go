@@ -304,6 +304,7 @@ func (c *conn) closeAllOpens(ctx context.Context, tr *tree) {
 	for _, oh := range tr.allOpens() {
 		c.srv.lockTable().ReleaseOwner(lockOwner(oh.sessionID, oh.fileId))
 		c.srv.resumeKeyTable().release(oh)
+		c.srv.endWatch(oh)
 		_ = oh.h.Close(ctx)
 		// A client that disconnects still gets its delete-on-close files
 		// deleted, as when a process holding a temporary file exits.
@@ -336,7 +337,13 @@ func (c *conn) releaseOpen(ctx context.Context, tr *tree, oh *openHandle) error 
 			return nil
 		}
 	}
-	return rm.Remove(ctx, path)
+	if err := rm.Remove(ctx, path); err != nil {
+		return err
+	}
+	if !oh.stream {
+		c.srv.selfNotify(tr, vfs.Change{Action: vfs.ChangeRemoved, Path: path, IsDir: oh.isDir})
+	}
+	return nil
 }
 
 // dirNonEmpty reports whether the directory at path lists anything.
@@ -394,6 +401,16 @@ func (c *request) handleCreate(ctx context.Context, msg []byte, hdr *wire.Header
 		ShareAccess:   req.ShareAccess,
 		DeleteOnClose: deleteOnClose,
 	}
+	// A backend that does not report changes has them reported for it,
+	// which needs to know whether this open creates the file.
+	selfNotify := stream == "" && c.srv.wantsSelfNotify(tr)
+	existed := false
+	if selfNotify {
+		if probe, err := backend.Open(ctx, vfs.OpenOptions{Path: base, Disposition: vfs.DispositionOpen}); err == nil {
+			existed = true
+			_ = probe.Close(ctx)
+		}
+	}
 	var h vfs.Handle
 	if stream != "" {
 		h, err = streams.OpenStream(ctx, opts, stream)
@@ -422,6 +439,15 @@ func (c *request) handleCreate(ctx context.Context, msg []byte, hdr *wire.Header
 		access: req.DesiredAccess, deleteOnClose: deleteOnClose, isDir: fi.IsDir, stream: stream != ""}
 	files.add(key, oh)
 	tr.addOpen(oh)
+	if selfNotify {
+		switch {
+		case !existed:
+			c.srv.selfNotify(tr, vfs.Change{Action: vfs.ChangeAdded, Path: name, IsDir: fi.IsDir})
+		case req.CreateDisposition == wire.FileOverwrite || req.CreateDisposition == wire.FileOverwriteIf || req.CreateDisposition == wire.FileSupersede:
+			c.srv.selfNotify(tr, vfs.Change{Action: vfs.ChangeModified, Path: name,
+				Filter: FileNotifyChangeSize | FileNotifyChangeLastWrite})
+		}
+	}
 	*lastFileId = fid
 
 	// CreateAction tells the client what the open actually did (MS-SMB2
@@ -510,6 +536,7 @@ func (c *request) handleClose(ctx context.Context, msg []byte, tr *tree) uint32 
 	}
 	tr.removeOpen(req.FileId)
 	c.srv.resumeKeyTable().release(oh)
+	c.srv.endWatch(oh)
 	if tr.oplocks != nil {
 		tr.oplocks.release(oh.currentPath())
 	}
@@ -569,6 +596,12 @@ func (c *request) handleWrite(ctx context.Context, msg []byte, tr *tree) uint32 
 	n, err := oh.h.Write(ctx, int64(req.Offset), req.Data)
 	if err != nil {
 		return c.errBody(osErrToStatus(err))
+	}
+	if n > 0 && !oh.stream && !oh.wrote.Swap(true) {
+		// Reported once per handle: a client watching does not need a
+		// notification for every piece of a file being written.
+		c.srv.selfNotify(tr, vfs.Change{Action: vfs.ChangeModified, Path: oh.currentPath(),
+			Filter: FileNotifyChangeSize | FileNotifyChangeLastWrite})
 	}
 	c.out = wire.WriteResponseAppend(c.out, uint32(n))
 	return wire.StatusSuccess
