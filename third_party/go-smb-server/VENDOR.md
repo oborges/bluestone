@@ -295,6 +295,14 @@ proposed upstream.
   signature bytes.
 - CANCEL gets no response of its own (MS-SMB2 3.3.5.16), where upstream sent
   one. It finds a request by message id as well as async id.
+- Requests on one handle take effect in the order they arrive. Reads and
+  writes still run alongside other requests. The read loop registers each
+  on its handle before reading the next request, and anything else naming
+  that handle waits for them first. Upstream let a CLOSE sent right behind
+  a WRITE overtake it: the write failed with STATUS_INVALID_HANDLE, which
+  macOS reports as "fcopyfile failed: Bad file descriptor" partway through
+  a copy. A truncate sent right behind a write could also land first, and
+  the file kept the bytes the truncate removed.
 
 ## Known gaps to close in Bluestone
 
