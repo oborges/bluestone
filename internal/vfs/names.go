@@ -99,6 +99,10 @@ func keyName(name string) string {
 	return string(runes)
 }
 
+// KeyPath is the key path a caller's name refers to, resolved the way the
+// view resolves names when opening files.
+func (fs *Filesystem) KeyPath(name string) string { return fs.keyPath(name) }
+
 // keyPath maps a caller's name to the key path it refers to. Views without
 // Windows naming use the name exactly as given. With Windows naming, each
 // component is unmapped and then matched case-insensitively against its

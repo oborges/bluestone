@@ -99,6 +99,13 @@ ssh gateway 'sudo sed -n "s/^ *password: \"\(.*\)\"$/\1/p" /etc/bluestone/config
   on and off. `handle` reads a file and closes it, leaving a cached handle:
   writing it from another client (macOS) afterwards must succeed.
   `smb_lease_breaks_total` shows the breaks.
+- `windows-durable-test.ps1 -Unc \\SERVER\SHARE -User NAME` writes to a file and
+  locks bytes 0-9 through one handle, then waits (`-Wait`, 25 s) while you
+  cut the connection on the gateway, for instance with
+  `ss -K "( sport = :445 )" dst CLIENT`. It then writes, reads, unlocks and
+  closes through the same handle, which all succeed when durable handles
+  work. During the wait, an NFS lock on the same bytes
+  (`nfs-try-lock.py FILE 0 10`) must be refused.
 - `windows-space-test.ps1` checks the share's size as Windows reads it
   (`DriveInfo` and `fsutil volume diskfree`), that free space falls as data
   is staged, and that a write past the staging quota fails with "not enough

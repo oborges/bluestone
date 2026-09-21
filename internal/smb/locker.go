@@ -2,6 +2,7 @@ package smb
 
 import (
 	"github.com/oborges/bluestone/internal/lock"
+	"github.com/oborges/bluestone/internal/vfs"
 	smbvfs "github.com/sonroyaalmerol/go-smb-server/smb/vfs"
 )
 
@@ -9,6 +10,9 @@ import (
 // taken over SMB conflicts with one taken over NFS on the same bytes.
 type locker struct {
 	locks *lock.Manager
+	// fs resolves SMB names to the keys they name, as the backend does;
+	// nil takes names as keys.
+	fs *vfs.Filesystem
 }
 
 // NewLocker returns an SMB byte-range locker backed by the shared table.
@@ -16,10 +20,26 @@ func NewLocker(locks *lock.Manager) smbvfs.ByteRangeLocker {
 	return locker{locks: locks}
 }
 
+// NewLockerFor returns an SMB byte-range locker that locks the files SMB
+// names refer to in fs: a name in any case, with backslashes, locks the same
+// key an NFS client locks, so the two conflict.
+func NewLockerFor(locks *lock.Manager, fs *vfs.Filesystem) smbvfs.ByteRangeLocker {
+	return locker{locks: locks, fs: fs}
+}
+
+// key is the lock table's key for an SMB path.
+func (l locker) key(name string) string {
+	p := sharePath(name)
+	if l.fs != nil {
+		p = l.fs.KeyPath(p)
+	}
+	return lock.Key(p)
+}
+
 func (l locker) Lock(owner smbvfs.LockOwner, path string, r smbvfs.LockRange) (*smbvfs.LockConflict, error) {
 	// A reached cap or an invalid range returns an error, which the server
 	// answers with STATUS_LOCK_NOT_GRANTED, the same as a conflict.
-	conflict, err := l.locks.Lock(lockOwner(owner), path, lockRange(r), lockMode(r))
+	conflict, err := l.locks.Lock(lockOwner(owner), l.key(path), lockRange(r), lockMode(r))
 	if err != nil {
 		return nil, err
 	}
@@ -27,7 +47,7 @@ func (l locker) Lock(owner smbvfs.LockOwner, path string, r smbvfs.LockRange) (*
 }
 
 func (l locker) Unlock(owner smbvfs.LockOwner, path string, r smbvfs.LockRange) error {
-	return l.locks.Unlock(lockOwner(owner), path, lockRange(r))
+	return l.locks.Unlock(lockOwner(owner), l.key(path), lockRange(r))
 }
 
 func (l locker) ReleaseOwner(owner smbvfs.LockOwner) {

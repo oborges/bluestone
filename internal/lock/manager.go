@@ -11,7 +11,9 @@ package lock
 import (
 	"errors"
 	"math"
+	pathpkg "path"
 	"sort"
+	"strings"
 	"sync"
 )
 
@@ -117,6 +119,15 @@ func NewManager(opts Options) *Manager {
 // are replaced, so a holder can upgrade, downgrade, or split its locks. If
 // another owner holds a conflicting range, Lock returns that lock and grants
 // nothing. Granting is atomic: on ErrLimit the owner's ranges are unchanged.
+// Key is the form paths take in the lock table: the file's key path, from
+// the bucket root, without a leading slash. Protocols name files their own
+// way (SMB with backslashes and any case, NFS relative to its root), and
+// convert to this form so a lock taken over one conflicts with one taken over
+// the other on the same file.
+func Key(p string) string {
+	return strings.TrimPrefix(pathpkg.Clean("/"+p), "/")
+}
+
 func (m *Manager) Lock(owner Owner, path string, r Range, mode Mode) (*Lock, error) {
 	if err := validate(r, mode); err != nil {
 		return nil, err

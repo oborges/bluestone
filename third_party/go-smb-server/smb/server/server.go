@@ -49,14 +49,25 @@ type Server struct {
 	// leasesEnabled grants leases and level II oplocks (WithLeases).
 	leasesEnabled     bool
 	leaseBreakTimeout time.Duration
-	maxConcurrent     int
-	maxTransact       uint32
-	maxRead           uint32
-	maxWrite          uint32
-	maxCredits        uint32
-	requireEnc        bool
-	log               *slog.Logger
-	guid              [16]byte
+	durable           *durableTable
+	// nextSessionID hands out session ids, and nextOpenID the persistent
+	// half of file ids, both unique across connections.
+	nextSessionID atomic.Uint64
+	nextOpenID    atomic.Uint64
+	// durableEnabled makes opens that cache a handle durable
+	// (WithDurableHandles).
+	durableEnabled bool
+	// stopping is set once the server is shutting down: connections it
+	// closes then do not leave durable opens behind.
+	stopping      atomic.Bool
+	maxConcurrent int
+	maxTransact   uint32
+	maxRead       uint32
+	maxWrite      uint32
+	maxCredits    uint32
+	requireEnc    bool
+	log           *slog.Logger
+	guid          [16]byte
 
 	mu       sync.Mutex
 	listener net.Listener
@@ -276,8 +287,11 @@ func (c *conn) close() {
 }
 
 // Shutdown stops the server accepting new connections, leaving the ones it
-// has. Drain is the graceful form.
+// has. Drain is the graceful form. Durable opens waiting for a client to
+// reconnect are closed, and connections closed from now on do not leave any.
 func (s *Server) Shutdown() error {
+	s.stopping.Store(true)
+	s.closeAllPreserved()
 	s.mu.Lock()
 	ln := s.listener
 	s.listener = nil
@@ -380,6 +394,8 @@ type openHandle struct {
 	// lease is the lease or oplock the open caches under, if any; the
 	// lease table's lock guards it.
 	lease *lease
+	// durable is set when the open survives its connection dropping.
+	durable *durableInfo
 	// key names the file in the server's table of open files, and changes
 	// when the file is renamed. The table's lock guards it.
 	key fileKey
@@ -446,12 +462,12 @@ func (r *request) finish() {
 }
 
 type conn struct {
-	srv           *Server
-	fc            *transport.FramedConn
-	log           *slog.Logger
-	sessionsMu    sync.RWMutex
-	sessions      map[uint64]*session
-	nextSess      uint64
+	srv        *Server
+	fc         *transport.FramedConn
+	log        *slog.Logger
+	sessionsMu sync.RWMutex
+	sessions   map[uint64]*session
+
 	creditMu      sync.Mutex
 	creditBalance uint32
 
@@ -752,6 +768,29 @@ func (c *request) handleMessage(ctx context.Context, msg []byte) {
 			c.log.Debug("bad header in compound", "err", err)
 			return
 		}
+		// Verified before the related FileId is filled in below, which
+		// changes the bytes the client signed.
+		if sess := c.getSession(hdr.SessionId); sess != nil && sess.signer != nil {
+			if hdr.Flags&wire.FlagSigned != 0 {
+				// Each request in a compound is signed over its own bytes,
+				// up to where the next one starts (MS-SMB2 3.2.4.1.4).
+				// Verifying over the rest of the chain failed every signed
+				// compound but its last request.
+				signed := sub
+				if hdr.NextCommand != 0 && int(hdr.NextCommand) <= len(sub) {
+					signed = sub[:hdr.NextCommand]
+				}
+				ok, vErr := sess.signer.Verify(signed)
+				if vErr != nil || !ok {
+					chainFailed = true
+					lastStatus = wire.StatusAccessDenied
+				}
+			} else if sess.requireSign {
+				chainFailed = true
+				lastStatus = wire.StatusAccessDenied
+			}
+		}
+
 		related := hdr.Flags&wire.FlagRelatedOps != 0 && !first
 		if related {
 			if fo := fileIdOffset(hdr.Command); fo >= 0 && fo+16 <= len(sub) {
@@ -769,19 +808,6 @@ func (c *request) handleMessage(ctx context.Context, msg []byte) {
 		if !c.concurrent {
 			if oh := c.handleOf(&hdr, sub); oh != nil {
 				oh.io.Wait()
-			}
-		}
-
-		if sess := c.getSession(hdr.SessionId); sess != nil && sess.signer != nil {
-			if hdr.Flags&wire.FlagSigned != 0 {
-				ok, vErr := sess.signer.Verify(sub)
-				if vErr != nil || !ok {
-					chainFailed = true
-					lastStatus = wire.StatusAccessDenied
-				}
-			} else if sess.requireSign {
-				chainFailed = true
-				lastStatus = wire.StatusAccessDenied
 			}
 		}
 
@@ -838,6 +864,10 @@ func (c *request) handleMessage(ctx context.Context, msg []byte) {
 			status = c.dispatch(ctx, sub, &hdr, &lastFileId, related)
 		}
 		c.srv.obs().RequestCompleted(hdr.Command, status, time.Since(started))
+		if status != wire.StatusSuccess && status != wire.StatusMoreProcessingRequired && status != wire.StatusPending {
+			c.log.Debug("request failed", "command", hdr.Command, "status", status, "session", hdr.SessionId,
+				"message", hdr.MessageId, "signed", hdr.Flags&wire.FlagSigned != 0, "chain_failed", chainFailed)
+		}
 		c.lastActive.Store(time.Now().UnixNano())
 		lastStatus = status
 		if hdr.Command == wire.CmdCreate && status != wire.StatusPending {
@@ -1061,7 +1091,7 @@ func (c *conn) cleanup() {
 	defer cancel()
 	c.eachSession(func(sess *session) {
 		for _, tr := range sess.allTrees() {
-			c.closeAllOpens(ctx, tr)
+			c.closeAllOpens(ctx, tr, true)
 		}
 		// Sessions the client never logged off from end with the connection.
 		if sess.counted.CompareAndSwap(true, false) {

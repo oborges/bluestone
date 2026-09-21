@@ -19,7 +19,7 @@ func NewLocker(locks *lock.Manager) nfs.ByteRangeLocker {
 }
 
 func (l locker) Lock(owner nfs.LockOwner, path string, r nfs.LockRange) (*nfs.LockConflict, error) {
-	conflict, err := l.locks.Lock(lockOwner(owner), path, lockRange(r), lockMode(r))
+	conflict, err := l.locks.Lock(lockOwner(owner), lock.Key(path), lockRange(r), lockMode(r))
 	if errors.Is(err, lock.ErrLimit) {
 		return nil, nfs.ErrLockLimit
 	}
@@ -30,11 +30,11 @@ func (l locker) Lock(owner nfs.LockOwner, path string, r nfs.LockRange) (*nfs.Lo
 }
 
 func (l locker) Unlock(owner nfs.LockOwner, path string, r nfs.LockRange) error {
-	return l.locks.Unlock(lockOwner(owner), path, lockRange(r))
+	return l.locks.Unlock(lockOwner(owner), lock.Key(path), lockRange(r))
 }
 
 func (l locker) Test(owner nfs.LockOwner, path string, r nfs.LockRange) (*nfs.LockConflict, error) {
-	conflict, err := l.locks.Test(lockOwner(owner), path, lockRange(r), lockMode(r))
+	conflict, err := l.locks.Test(lockOwner(owner), lock.Key(path), lockRange(r), lockMode(r))
 	if err != nil {
 		return nil, err
 	}

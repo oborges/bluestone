@@ -3,6 +3,7 @@ package wire
 import (
 	"encoding/binary"
 	"fmt"
+	"time"
 )
 
 // CreateContext is one SMB2_CREATE_CONTEXT of a CREATE request or response
@@ -144,4 +145,74 @@ func (r LeaseRequest) Encode() []byte {
 		binary.LittleEndian.PutUint16(b[48:50], r.Epoch)
 	}
 	return b
+}
+
+// Durable handle create contexts (MS-SMB2 sections 2.2.13.2.3 to
+// 2.2.13.2.12). A durable open survives its connection dropping: the client
+// reconnects and names it to carry on.
+const (
+	CreateContextDurableV1          = "DHnQ"
+	CreateContextDurableV1Reconnect = "DHnC"
+	CreateContextDurableV2          = "DH2Q"
+	CreateContextDurableV2Reconnect = "DH2C"
+)
+
+// DurableV2Persistent in a DH2Q request asks for a persistent handle, which
+// survives the server failing over too.
+const DurableV2Persistent uint32 = 0x02
+
+// DurableV2Request is SMB2_CREATE_DURABLE_HANDLE_REQUEST_V2: how long the
+// client would like the open kept, and the GUID it names this create by.
+type DurableV2Request struct {
+	Timeout    uint32 // milliseconds; 0 lets the server choose
+	Flags      uint32
+	CreateGUID [16]byte
+}
+
+func ParseDurableV2Request(data []byte) (DurableV2Request, error) {
+	var r DurableV2Request
+	if len(data) < 32 {
+		return r, fmt.Errorf("wire: DH2Q is %d bytes", len(data))
+	}
+	r.Timeout = binary.LittleEndian.Uint32(data[0:4])
+	r.Flags = binary.LittleEndian.Uint32(data[4:8])
+	copy(r.CreateGUID[:], data[16:32])
+	return r, nil
+}
+
+// DurableV2Response is the DH2Q response: the timeout granted, and flags.
+func DurableV2Response(timeout time.Duration) []byte {
+	b := make([]byte, 8)
+	binary.LittleEndian.PutUint32(b[0:4], uint32(timeout/time.Millisecond))
+	return b
+}
+
+// DurableV1Response is the DHnQ response, eight reserved bytes.
+func DurableV1Response() []byte { return make([]byte, 8) }
+
+// DurableReconnect is what DHnC or DH2C names: the open to reclaim, and for
+// V2 the GUID it was created with.
+type DurableReconnect struct {
+	FileID     [16]byte
+	CreateGUID [16]byte
+	V2         bool
+}
+
+func ParseDurableV1Reconnect(data []byte) (DurableReconnect, error) {
+	var r DurableReconnect
+	if len(data) < 16 {
+		return r, fmt.Errorf("wire: DHnC is %d bytes", len(data))
+	}
+	copy(r.FileID[:], data[0:16])
+	return r, nil
+}
+
+func ParseDurableV2Reconnect(data []byte) (DurableReconnect, error) {
+	r := DurableReconnect{V2: true}
+	if len(data) < 36 {
+		return r, fmt.Errorf("wire: DH2C is %d bytes", len(data))
+	}
+	copy(r.FileID[:], data[0:16])
+	copy(r.CreateGUID[:], data[16:32])
+	return r, nil
 }

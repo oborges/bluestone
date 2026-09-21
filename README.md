@@ -232,6 +232,7 @@ smb:
   drain_timeout: "30s"   # how long a shutdown waits for clients to finish
   max_stream_bytes: 2048 # cap on a file's named streams, kept in object metadata
   leases: true           # let clients cache the files they read
+  durable_handles: true  # keep open files through a dropped connection
   limits:
     max_connections: 256
     max_connections_per_client: 64
@@ -415,6 +416,16 @@ finds made directly in the bucket. Without the scanner, a client can keep
 serving its cached copy of a file changed behind the gateway's back, until
 it closes the file. Turn the scanner on, or leases off, if other tools write
 to the bucket.
+
+Files a client has open survive its connection dropping
+(`smb.durable_handles`, on by default). When a connection is lost rather
+than closed, the gateway keeps the client's open files for up to a minute
+(or the time the client asks for, at most five), with their byte-range
+locks, and the client reclaims them when it reconnects: an application in
+the middle of writing a file carries on, and nobody else can take its locks
+meanwhile. A client that does not come back loses them when the time runs
+out, and another client that needs one of those files sooner gets it. Open
+files do not survive the gateway itself restarting or failing over.
 
 A client caching a handle keeps the file open after the application closes
 it. When another client's open would conflict with that handle, the gateway

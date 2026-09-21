@@ -433,6 +433,7 @@ func main() {
 			DrainTimeout:       drainTimeout,
 			MaxStreamBytes:     cfg.SMB.MaxStreamBytes,
 			Leases:             cfg.SMB.Leases,
+			DurableHandles:     cfg.SMB.DurableHandles,
 			Limits: smb.Limits{
 				Connections:           cfg.SMB.Limits.MaxConnections,
 				ConnectionsPerClient:  cfg.SMB.Limits.MaxConnectionsPerClient,

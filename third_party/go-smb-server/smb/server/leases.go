@@ -69,11 +69,14 @@ type lease struct {
 }
 
 type leaseTable struct {
-	obs     LeaseObserver
-	mu      sync.Mutex
-	byID    map[leaseID]*lease
-	byFile  map[fileKey]map[*lease]struct{}
-	timeout time.Duration
+	obs LeaseObserver
+	// onDisconnected closes the durable opens of a client that has gone,
+	// for a break it cannot acknowledge.
+	onDisconnected func([]*openHandle) chan struct{}
+	mu             sync.Mutex
+	byID           map[leaseID]*lease
+	byFile         map[fileKey]map[*lease]struct{}
+	timeout        time.Duration
 	// feeds are the backend subscriptions that carry changes made outside
 	// the server, one per share.
 	feeds map[string]func()
@@ -88,11 +91,12 @@ func (s *Server) leaseTable() *leaseTable {
 			timeout = DefaultLeaseBreakTimeout
 		}
 		s.leases = &leaseTable{
-			obs:     s.leaseObs(),
-			byID:    map[leaseID]*lease{},
-			byFile:  map[fileKey]map[*lease]struct{}{},
-			timeout: timeout,
-			feeds:   map[string]func(){},
+			obs:            s.leaseObs(),
+			onDisconnected: s.closePreservedOpens,
+			byID:           map[leaseID]*lease{},
+			byFile:         map[fileKey]map[*lease]struct{}{},
+			timeout:        timeout,
+			feeds:          map[string]func(){},
 		}
 	}
 	return s.leases
@@ -119,11 +123,11 @@ func (t *leaseTable) leaseConflict(id leaseID, file fileKey) bool {
 
 // grantCaching decides what caching a new open gets, and returns the
 // oplock level and create context for the CREATE response.
-func (c *request) grantCaching(req *wire.CreateRequest, sess *session, tr *tree, oh *openHandle, fi vfs.FileInfo) (uint8, []wire.CreateContext) {
+func (c *request) grantCaching(req *wire.CreateRequest, sess *session, tr *tree, oh *openHandle, fi vfs.FileInfo) (uint8, []wire.CreateContext, uint32) {
 	if !c.srv.leasesEnabled || fi.IsDir || oh.stream || sess == nil || sess.requireEncrypt {
 		// Break notifications are sent outside any session, so they could
 		// not be encrypted.
-		return wire.OplockLevelNone, nil
+		return wire.OplockLevelNone, nil, 0
 	}
 	t := c.srv.leaseTable()
 	t.watchShare(c.srv, tr.share)
@@ -133,11 +137,11 @@ func (c *request) grantCaching(req *wire.CreateRequest, sess *session, tr *tree,
 	case wire.OplockLevelLease:
 		data, ok := req.Context(wire.CreateContextLease)
 		if !ok {
-			return wire.OplockLevelNone, nil
+			return wire.OplockLevelNone, nil, 0
 		}
 		asked, err := wire.ParseLeaseRequest(data)
 		if err != nil {
-			return wire.OplockLevelNone, nil
+			return wire.OplockLevelNone, nil, 0
 		}
 		granted, flags, epoch := t.grantLease(c.conn, oh, key, asked)
 		if t.obs != nil && granted != 0 {
@@ -145,15 +149,54 @@ func (c *request) grantCaching(req *wire.CreateRequest, sess *session, tr *tree,
 		}
 		resp := wire.LeaseRequest{Key: asked.Key, State: granted, Flags: flags, V2: asked.V2,
 			ParentKey: asked.ParentKey, Epoch: epoch}
-		return wire.OplockLevelLease, []wire.CreateContext{{Name: wire.CreateContextLease, Data: resp.Encode()}}
+		return wire.OplockLevelLease, []wire.CreateContext{{Name: wire.CreateContextLease, Data: resp.Encode()}}, granted
 	case 0x01, 0x08, 0x09: // level II, exclusive, batch
 		t.grantOplock(c.conn, oh, key)
 		if t.obs != nil {
 			t.obs.LeaseGranted("oplock", wire.LeaseRead)
 		}
+		return wire.OplockLevelII, nil, wire.LeaseRead
+	}
+	return wire.OplockLevelNone, nil, 0
+}
+
+// reconnectMatches reports whether a durable reconnect names the lease the
+// open had: the same key from the same client (section 3.3.5.9.7).
+func (t *leaseTable) reconnectMatches(oh *openHandle, client [16]byte, req *wire.CreateRequest) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	l := oh.lease
+	if l == nil || l.oplock {
+		return true
+	}
+	data, ok := req.Context(wire.CreateContextLease)
+	if !ok || req.RequestedOplockLevel != wire.OplockLevelLease {
+		return false
+	}
+	asked, err := wire.ParseLeaseRequest(data)
+	return err == nil && asked.Key == l.id.key && client == l.id.client
+}
+
+// reattach gives a reclaimed durable open's lease its client's new
+// connection, and returns what to tell the client about it: the state it
+// holds now, lower than before if it was broken meanwhile.
+func (t *leaseTable) reattach(oh *openHandle, c *conn) (uint8, []wire.CreateContext) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	l := oh.lease
+	if l == nil {
+		return wire.OplockLevelNone, nil
+	}
+	l.conn = c
+	if l.oplock {
 		return wire.OplockLevelII, nil
 	}
-	return wire.OplockLevelNone, nil
+	flags := l.flags
+	if l.breaking {
+		flags |= wire.LeaseFlagBreakInProgress
+	}
+	resp := wire.LeaseRequest{Key: l.id.key, State: l.state, Flags: flags, V2: l.v2, ParentKey: l.parent, Epoch: l.epoch}
+	return wire.OplockLevelLease, []wire.CreateContext{{Name: wire.CreateContextLease, Data: resp.Encode()}}
 }
 
 // grantLease adds the open to its lease, creating or upgrading it. Only
@@ -352,6 +395,22 @@ func (t *leaseTable) breakLocked(l *lease, target uint32) chan struct{} {
 	}
 	l.epoch++
 	ackRequired := l.state&(wire.LeaseHandle|wire.LeaseWrite) != 0
+	if l.conn.isClosed() {
+		// The client is gone, and any of its opens still here are durable
+		// ones waiting for it to reconnect. It cannot acknowledge, so a
+		// break that needs acknowledging closes those opens instead, and
+		// whoever needed the break gets the file (section 3.3.4.7). A
+		// reconnecting client learns the lower state.
+		l.state = newState
+		if !ackRequired || t.onDisconnected == nil {
+			return nil
+		}
+		opens := make([]*openHandle, 0, len(l.opens))
+		for oh := range l.opens {
+			opens = append(opens, oh)
+		}
+		return t.onDisconnected(opens)
+	}
 	l.conn.sendNotification(leaseBreakNotification(l, newState, ackRequired))
 	if !ackRequired {
 		l.state = newState
@@ -453,6 +512,19 @@ func oplockBreakNotification(l *lease) []byte {
 	b[2] = wire.OplockLevelNone
 	copy(b[8:24], l.fileID[:])
 	return append(notificationHeader(l.sessID, 0), b...)
+}
+
+// isClosed reports whether the connection has ended.
+func (c *conn) isClosed() bool {
+	if c == nil {
+		return true
+	}
+	select {
+	case <-c.connDone:
+		return true
+	default:
+		return false
+	}
 }
 
 // sendNotification queues an unsolicited message without blocking the

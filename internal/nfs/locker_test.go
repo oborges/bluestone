@@ -14,7 +14,7 @@ func TestLockerSharesLocksAcrossProtocols(t *testing.T) {
 
 	// Another protocol server holds an exclusive range on the same file.
 	smbOwner := lock.Owner{Client: "smb/session-1", ID: "handle-7"}
-	if conflict, err := locks.Lock(smbOwner, "/f", lock.Range{Start: 0, End: 100}, lock.Exclusive); err != nil || conflict != nil {
+	if conflict, err := locks.Lock(smbOwner, lock.Key("/f"), lock.Range{Start: 0, End: 100}, lock.Exclusive); err != nil || conflict != nil {
 		t.Fatalf("SMB-side Lock() = %+v, %v", conflict, err)
 	}
 
@@ -35,7 +35,7 @@ func TestLockerSharesLocksAcrossProtocols(t *testing.T) {
 	if conflict, err := nfsLocker.Lock(nfsOwner, "/f", nfs.LockRange{Start: 100, End: 200, Exclusive: true}); err != nil || conflict != nil {
 		t.Fatalf("NFS disjoint Lock() = %+v, %v", conflict, err)
 	}
-	if conflict, _ := locks.Test(smbOwner, "/f", lock.Range{Start: 150, End: 151}, lock.Shared); conflict == nil || conflict.Owner != (lock.Owner{Client: "nfs4/1", ID: "o"}) {
+	if conflict, _ := locks.Test(smbOwner, lock.Key("/f"), lock.Range{Start: 150, End: 151}, lock.Shared); conflict == nil || conflict.Owner != (lock.Owner{Client: "nfs4/1", ID: "o"}) {
 		t.Fatalf("SMB-side Test() = %+v, want the NFS lock", conflict)
 	}
 
@@ -48,7 +48,7 @@ func TestLockerSharesLocksAcrossProtocols(t *testing.T) {
 	if err := nfsLocker.Unlock(nfsOwner, "/f", nfs.LockRange{Start: 0, End: 1000}); err != nil {
 		t.Fatalf("NFS Unlock() error = %v", err)
 	}
-	if got := locks.Locks("/f"); len(got) != 0 {
+	if got := locks.Locks(lock.Key("/f")); len(got) != 0 {
 		t.Fatalf("locks after unlock = %+v, want none", got)
 	}
 }

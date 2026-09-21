@@ -183,14 +183,18 @@ func (h *notifyHub) publish(share string, c vfs.Change) {
 // do not report changes themselves. A backend that does sees these changes
 // too, and reports them.
 func (s *Server) selfNotify(tr *tree, c vfs.Change) {
-	if _, ok := tr.share.Backend().(vfs.ChangeNotifier); ok {
+	s.selfNotifyShare(tr.share, c)
+}
+
+func (s *Server) selfNotifyShare(share vfs.Share, c vfs.Change) {
+	if _, ok := share.Backend().(vfs.ChangeNotifier); ok {
 		return
 	}
 	hub := s.notifyHub()
-	if !hub.watching(tr.share.Name()) {
+	if !hub.watching(share.Name()) {
 		return
 	}
-	hub.publish(strings.ToLower(tr.share.Name()), c)
+	hub.publish(strings.ToLower(share.Name()), c)
 }
 
 // wantsSelfNotify reports whether the server should describe its own
