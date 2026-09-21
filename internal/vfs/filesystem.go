@@ -486,6 +486,13 @@ func (s *stagingDirInfo) Attributes() types.POSIXAttributes {
 	return attrs
 }
 
+// NFSOwner reports the staged file's owner to the NFS server.
+func (s *stagingFileInfo) NFSOwner() (uid, gid uint32) { return posix.OwnerIDs(s.Attributes()) }
+
+// NFSOwner reports the synthetic directory's (default) owner to the NFS
+// server.
+func (s *stagingDirInfo) NFSOwner() (uid, gid uint32) { return posix.OwnerIDs(s.Attributes()) }
+
 // FileAttributes returns the attributes the filesystem reports for an entry
 // from Stat or ReadDir: mode, owner, times, creation time, and Windows
 // attribute flags. Entries without stored attributes report defaults, with

@@ -120,6 +120,12 @@ func ToFileAttribute(info os.FileInfo, filePath string) *FileAttribute {
 		_, _ = hasher.Write([]byte(filePath))
 		f.Fileid = hasher.Sum64()
 	}
+	// A filesystem that keeps owners itself reports them here; without
+	// this, such files all showed as owned by root. The file id is left as
+	// computed above.
+	if o, ok := info.(file.Owner); ok {
+		f.UID, f.GID = o.NFSOwner()
+	}
 
 	f.Filesize = uint64(info.Size())
 	f.Used = uint64(info.Size())

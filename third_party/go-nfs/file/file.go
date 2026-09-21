@@ -11,6 +11,13 @@ type FileInfo struct {
 	Fileid uint64
 }
 
+// Owner is implemented by an os.FileInfo that knows its file's owner
+// without a platform stat structure from Sys(), such as a file whose owner
+// is kept in object metadata. ToFileAttribute reports what it returns.
+type Owner interface {
+	NFSOwner() (uid, gid uint32)
+}
+
 // GetInfo extracts some non-standardized items from the result of a Stat call.
 func GetInfo(fi os.FileInfo) *FileInfo {
 	sys := fi.Sys()
