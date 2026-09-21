@@ -45,6 +45,15 @@ well (`ha.on_lease_lost: "stop"`):
   to the gateway that took it. A supervisor restarting the process is
   harmless, because a gateway that finds a fresh foreign lease at startup
   refuses to serve.
+- A bucket over its hard quota refuses the lease renewal too. That does not
+  fence the gateway: the bucket would refuse a standby's takeover just the
+  same, so the gateway keeps serving (clients can still read, and delete to
+  make room), as long as a read shows no other gateway has written a newer
+  lease. It checks every 2 seconds while the bucket stays full, because a
+  standby may take over the moment there is room. If one does, this gateway
+  stops at its next check. A gateway restarted while the bucket is full
+  cannot replace its previous lease; one from the same host with an older
+  epoch is recognised as its own and is not taken for a takeover.
 - `ha.on_lease_lost: "warn"` keeps the older behaviour of logging and
   serving on. It risks two gateways writing one bucket, which is what the
   lease exists to prevent, and is only sensible while diagnosing the lease

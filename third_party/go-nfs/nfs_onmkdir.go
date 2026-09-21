@@ -3,7 +3,9 @@ package nfs
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
+	"syscall"
 
 	"github.com/go-git/go-billy/v5"
 	"github.com/willscott/go-nfs-client/nfs/xdr"
@@ -56,6 +58,11 @@ func onMkdir(ctx context.Context, w *response, userHandle Handler) error {
 	}
 
 	if err := fs.MkdirAll(newFolderPath, attrs.Mode(mkdirDefaultMode)); err != nil {
+		// A full filesystem is reported as such, not as a permissions
+		// problem the client would send its user looking into.
+		if errors.Is(err, syscall.ENOSPC) {
+			return &NFSStatusError{NFSStatusNoSPC, err}
+		}
 		return &NFSStatusError{NFSStatusAccess, err}
 	}
 

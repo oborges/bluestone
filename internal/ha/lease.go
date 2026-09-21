@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/oborges/bluestone/internal/logging"
@@ -240,44 +241,90 @@ func (m *Manager) writeLease(ctx context.Context) error {
 	return nil
 }
 
+// quotaRecheckInterval is how often, at most, the lease is checked while the
+// bucket refuses the renewal for its quota: often, since a standby can take over the
+// moment the bucket has room and this node must stop as soon as it has.
+const quotaRecheckInterval = 2 * time.Second
+
 func (m *Manager) heartbeatLoop(ctx context.Context) {
 	defer close(m.done)
-	ticker := time.NewTicker(m.heartbeatInterval)
-	defer ticker.Stop()
+	timer := time.NewTimer(m.heartbeatInterval)
+	defer timer.Stop()
+	quotaHeld := false
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			hbCtx, cancel := context.WithTimeout(ctx, m.heartbeatInterval)
-			// Theft: another holder owns the lease, so this node must stop
-			// serving the bucket. Two gateways writing one bucket is what
-			// the lease exists to prevent.
-			if current, err := m.readLease(hbCtx); err == nil && current.HolderID != m.holderID {
-				logging.Error("HA LEASE LOST: another gateway took over this bucket",
-					zap.String("taken_by", current.HolderID),
-					zap.String("taken_by_host", current.Hostname))
-				taken := *current
-				m.reportLoss(LeaseLoss{Reason: "taken", TakenBy: &taken})
-				cancel()
-				continue
-			}
-			if err := m.writeLease(hbCtx); err != nil {
-				failingFor := m.renewFailingFor()
-				logging.Error("HA lease heartbeat failed; standby may take over after the lease timeout",
-					zap.Error(err),
-					zap.Duration("failing_for", failingFor),
-					zap.Duration("lease_timeout", m.leaseTimeout))
-				// Past the lease timeout a standby is entitled to promote,
-				// so this node can no longer claim the bucket is its own.
-				if failingFor > m.leaseTimeout {
-					m.reportLoss(LeaseLoss{Reason: "unreachable", Since: failingFor, Err: err})
-				}
-			}
-			cancel()
+		case <-timer.C:
 		}
+		next := m.heartbeatInterval
+		hbCtx, cancel := context.WithTimeout(ctx, m.heartbeatInterval)
+		current, readErr := m.readLease(hbCtx)
+		// Theft: another holder owns the lease, so this node must stop
+		// serving the bucket. Two gateways writing one bucket is what the
+		// lease exists to prevent.
+		if readErr == nil && m.takenBy(current) {
+			logging.Error("HA LEASE LOST: another gateway took over this bucket",
+				zap.String("taken_by", current.HolderID),
+				zap.String("taken_by_host", current.Hostname))
+			taken := *current
+			m.reportLoss(LeaseLoss{Reason: "taken", TakenBy: &taken})
+			cancel()
+			timer.Reset(next)
+			continue
+		}
+		err := m.writeLease(hbCtx)
+		switch {
+		case err == nil:
+			if quotaHeld {
+				logging.Info("HA lease renewed again: the bucket has room")
+				quotaHeld = false
+			}
+		case errors.Is(err, syscall.ENOSPC) && (readErr == nil || errors.Is(readErr, os.ErrNotExist)):
+			// The bucket is over its hard quota and refuses the renewal,
+			// but it refuses a standby's takeover just the same, and the
+			// read above shows the lease has not been taken (or was never
+			// written, which no one else can do either). Keep serving,
+			// so clients can still read and delete to free space, and
+			// check often: a standby may take over once there is room.
+			m.mu.Lock()
+			m.lastRenewed = m.now()
+			m.mu.Unlock()
+			if !quotaHeld {
+				logging.Warn("HA lease cannot be renewed: the bucket is over its hard quota; still holding it, as no other gateway can take it over either")
+				quotaHeld = true
+			}
+			next = min(quotaRecheckInterval, m.heartbeatInterval)
+		default:
+			failingFor := m.renewFailingFor()
+			logging.Error("HA lease heartbeat failed; standby may take over after the lease timeout",
+				zap.Error(err),
+				zap.Duration("failing_for", failingFor),
+				zap.Duration("lease_timeout", m.leaseTimeout))
+			// Past the lease timeout a standby is entitled to promote,
+			// so this node can no longer claim the bucket is its own.
+			if failingFor > m.leaseTimeout {
+				m.reportLoss(LeaseLoss{Reason: "unreachable", Since: failingFor, Err: err})
+			}
+		}
+		cancel()
+		timer.Reset(next)
 	}
+}
+
+// takenBy reports whether the lease in the bucket shows another gateway has
+// taken over. A lease from this same host with an older epoch is not a
+// takeover: it is this node's own lease from before a restart, which the
+// bucket has refused to let it replace.
+func (m *Manager) takenBy(current *Lease) bool {
+	if current.HolderID == m.holderID {
+		return false
+	}
+	m.mu.Lock()
+	epoch := m.lease.Epoch
+	m.mu.Unlock()
+	return !(current.Hostname == m.hostname && current.Epoch < epoch)
 }
 
 // renewFailingFor reports how long it has been since the lease was last

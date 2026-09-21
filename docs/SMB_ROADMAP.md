@@ -69,8 +69,11 @@ The visible "this is not a real file server" failures.
   it back.
 - Disk full and quota reporting, so Windows warns before a write fails.
   Done: the share reports the staging area's size and the room below its
-  high watermark, and a write past it is `STATUS_DISK_FULL`. A bucket quota
-  is not detected directly; it shows up as staging filling.
+  high watermark, and a write past it is `STATUS_DISK_FULL`. A bucket over
+  its hard quota is detected from COS's `BucketQuotaExceeded` (checked
+  against a real bucket with a 1 MiB quota). Writes then fail as disk full
+  at once over SMB and NFS, the share shows no free space, and the gateway
+  keeps its HA lease instead of fencing itself.
 - Delete-on-close and delete-pending semantics, and the rename and delete
   edge cases around open handles.
   Done: matches Windows' own server scenario for scenario

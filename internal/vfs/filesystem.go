@@ -138,6 +138,17 @@ func (fs *Filesystem) Capacity() Capacity {
 		TotalFiles:     1 << 32,
 		AvailableFiles: 1 << 32,
 	}
+	if fs.ops != nil && fs.ops.BucketFull() {
+		// The bucket refuses writes, so nothing more fits whatever
+		// staging has free.
+		capacity.AvailableBytes = 0
+		if fs.stagingManager != nil {
+			if quota := fs.stagingManager.CurrentPressure().QuotaBytes; quota > 0 {
+				capacity.TotalBytes = uint64(quota)
+			}
+		}
+		return capacity
+	}
 	if fs.featureFlags == nil || !fs.featureFlags.IsStagingEnabled() || fs.stagingManager == nil {
 		return capacity
 	}
