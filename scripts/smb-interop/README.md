@@ -63,6 +63,11 @@ ssh gateway 'sudo sed -n "s/^ *password: \"\(.*\)\"$/\1/p" /etc/bluestone/config
   echo "$password" | ssh windows 'powershell -File windows-lock-test.ps1 -Server 10.0.0.4'
   ```
 
+- `windows-space-test.ps1` checks the share's size as Windows reads it
+  (`DriveInfo` and `fsutil volume diskfree`), that free space falls as data
+  is staged, and that a write past the staging quota fails with "not enough
+  space on the disk". It writes 64 MiB, and a sparse write 12 GiB into a
+  file, so the staging quota has to be below 12 GiB.
 - `windows-acl-test.ps1` checks what Windows reads from a file's security
   descriptor: `Get-Acl` on a file and a directory (the Security tab reads the
   same thing), the inherit flags on a directory's entry, and that `Set-Acl`
