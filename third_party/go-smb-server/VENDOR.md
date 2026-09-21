@@ -325,6 +325,29 @@ proposed upstream.
     message with the wrong MessageId and level.
 - Async interim responses can come from any handler (`request.asyncID`),
   not only CHANGE_NOTIFY, and are not signed.
+- Durable handles, V1 (DHnQ/DHnC) and V2 (DH2Q/DH2C), with
+  `WithDurableHandles`.
+  - An open with a handle-caching lease that asks is made durable, for the
+    timeout asked (60s by default, 300s at most). A persistent request gets
+    a durable handle.
+  - When its connection is lost, not on logoff or tree disconnect, the open
+    is kept with its locks, lease and share modes.
+  - A reconnect names it by the persistent half of its file id. It must
+    match the create GUID, client GUID, user, share and lease key.
+  - A break the disconnected client cannot acknowledge closes its kept open
+    instead of waiting. Unclaimed opens close when their timeout runs out,
+    and all close on shutdown.
+  - Byte-range locks are owned by the open rather than the requesting
+    session, so a reclaimed open keeps its locks.
+- Session ids are unique across the server, and the persistent half of a
+  file id is a server-wide open counter. Upstream numbered sessions per
+  connection, so two clients' opens got the same file ids and lock owners:
+  both could hold an exclusive byte-range lock on the same range.
+- Each request in a signed compound is verified over its own bytes, before
+  a related request's FileId is filled in. Upstream verified over the rest of
+  the chain, after changing the FileId, so every signed compound request but
+  the last failed with ACCESS_DENIED. Windows reclaims durable handles with a
+  signed compound.
 
 ## Known gaps to close in Bluestone
 
@@ -333,8 +356,7 @@ Tracked with the rest of the SMB work in `docs/SMB_ROADMAP.md`.
 - Blocking byte-range locks: a lock that cannot be granted is refused even
   when the client did not set SMB2_LOCKFLAG_FAIL_IMMEDIATELY, instead of
   waiting for the conflicting lock to be released.
-- No durable or persistent handles and no multichannel, so a dropped
-  connection loses open handles.
+- No persistent handles and no multichannel.
 - The dialect is fixed at 3.0.2: no SMB 3.1.1, so no pre-auth integrity and
   no AES-GCM. Signing is AES-CMAC and encryption AES-128-CCM.
 - Byte-range locks are keyed by path in the lock table, and are not moved

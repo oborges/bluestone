@@ -80,10 +80,19 @@ func osErrToStatus(err error) uint32 {
 	return wire.StatusUnexpectedIOError
 }
 
-func makeFileID(sessID uint64, treeID uint32, counter uint64) [16]byte {
+// makeFileID builds an SMB2_FILEID (MS-SMB2 section 2.2.14.1): a persistent
+// half unique to the open across the server, which is what a client names
+// to reclaim a durable open after reconnecting, and a volatile half from
+// the tree and its open counter.
+func makeFileID(openID uint64, treeID uint32, counter uint64) [16]byte {
 	var fid [16]byte
-	binary.LittleEndian.PutUint64(fid[0:8], sessID)
+	binary.LittleEndian.PutUint64(fid[0:8], openID)
 	binary.LittleEndian.PutUint32(fid[8:12], treeID)
 	binary.LittleEndian.PutUint32(fid[12:16], uint32(counter))
 	return fid
+}
+
+// persistentID is the persistent half of a file id.
+func persistentID(fid [16]byte) uint64 {
+	return binary.LittleEndian.Uint64(fid[0:8])
 }

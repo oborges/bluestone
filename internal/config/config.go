@@ -72,6 +72,10 @@ type SMBConfig struct {
 	// bucket; without the scanner, a client may keep serving its cached
 	// copy of a file changed behind the gateway's back until it closes it.
 	Leases bool `mapstructure:"leases"`
+	// DurableHandles keeps a client's open files for up to five minutes
+	// when its connection drops, so it can reconnect and carry on. It
+	// applies to files opened with a read-handle lease, so it needs Leases.
+	DurableHandles bool `mapstructure:"durable_handles"`
 	// Limits bound what clients can make the server hold. 0 means no limit.
 	Limits SMBLimits `mapstructure:"limits"`
 	// Users are the accounts allowed to connect, authenticated with NTLM.
@@ -504,6 +508,7 @@ func bindEnvOverrides(v *viper.Viper) error {
 		"smb.drain_timeout",
 		"smb.max_stream_bytes",
 		"smb.leases",
+		"smb.durable_handles",
 		"smb.limits.max_connections",
 		"smb.limits.max_connections_per_client",
 		"smb.limits.max_sessions_per_connection",
@@ -666,6 +671,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("smb.drain_timeout", "30s")
 	v.SetDefault("smb.max_stream_bytes", DefaultMaxStreamBytes)
 	v.SetDefault("smb.leases", true)
+	v.SetDefault("smb.durable_handles", true)
 	// Limits are generous enough that no ordinary client meets them, and
 	// small enough that one client cannot exhaust the gateway.
 	v.SetDefault("smb.limits.max_connections", 256)

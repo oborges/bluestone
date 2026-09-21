@@ -18,7 +18,9 @@ func (c *request) handleLock(_ context.Context, msg []byte, hdr *wire.Header, tr
 	}
 
 	locker := c.srv.lockTable()
-	owner := lockOwner(hdr.SessionId, req.FileId)
+	// Owned by the open, not the session sending the request: a durable
+	// open reclaimed on a new session keeps the locks it took.
+	owner := lockOwner(oh.sessionID, oh.fileId)
 	// Locks granted in this request are undone if a later element in the
 	// same request fails, so a rejected request changes nothing.
 	var granted []vfs.LockRange
@@ -49,6 +51,7 @@ func (c *request) handleLock(_ context.Context, msg []byte, hdr *wire.Header, tr
 			continue
 		}
 		conflict, err := locker.Lock(owner, oh.currentPath(), r)
+		c.log.Debug("lock", "path", oh.currentPath(), "offset", l.Offset, "length", l.Length, "conflict", conflict, "err", err)
 		if err != nil {
 			unwind()
 			c.log.Debug("lock failed", "path", oh.currentPath(), "err", err)

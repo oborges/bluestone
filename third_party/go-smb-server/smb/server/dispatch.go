@@ -180,8 +180,11 @@ func (c *request) handleSessionSetup(ctx context.Context, msg []byte, hdr *wire.
 			auth:  c.srv.authFactory(),
 			trees: make(map[uint32]*tree),
 		}
-		c.nextSess++
-		sessID := c.nextSess
+		// Unique across the server, not only this connection (MS-SMB2
+		// section 3.3.5.5.1): file ids and lock owners are built from it,
+		// and with every connection counting from 1 two clients' opens got
+		// the same ids, so their byte-range locks did not conflict.
+		sessID := c.srv.nextSessionID.Add(1)
 		c.putSession(sessID, sess)
 		hdr.SessionId = sessID
 	}
@@ -224,7 +227,7 @@ func (c *request) handleSessionSetup(ctx context.Context, msg []byte, hdr *wire.
 func (c *request) handleLogoff(ctx context.Context, hdr *wire.Header, sess *session) uint32 {
 	if sess != nil {
 		for _, t := range sess.allTrees() {
-			c.closeAllOpens(ctx, t)
+			c.closeAllOpens(ctx, t, false)
 		}
 		c.dropSession(hdr.SessionId)
 	}
@@ -293,7 +296,7 @@ func parseShareName(unc string) string {
 
 func (c *request) handleTreeDisconnect(ctx context.Context, hdr *wire.Header, sess *session, tr *tree) uint32 {
 	if tr != nil {
-		c.closeAllOpens(ctx, tr)
+		c.closeAllOpens(ctx, tr, false)
 		sess.dropTree(hdr.TreeId)
 	}
 	var r wire.TreeDisconnectResponse
@@ -301,8 +304,17 @@ func (c *request) handleTreeDisconnect(ctx context.Context, hdr *wire.Header, se
 	return wire.StatusSuccess
 }
 
-func (c *conn) closeAllOpens(ctx context.Context, tr *tree) {
+// closeAllOpens closes a tree's opens. When the connection was lost rather
+// than closed, durable opens are kept for their client to reconnect to
+// instead, with their locks, lease and share modes.
+func (c *conn) closeAllOpens(ctx context.Context, tr *tree, connectionLost bool) {
 	for _, oh := range tr.allOpens() {
+		if connectionLost && oh.durable != nil && !c.srv.stopping.Load() {
+			c.srv.resumeKeyTable().release(oh)
+			c.srv.endWatch(oh)
+			c.srv.preserve(tr.share, oh)
+			continue
+		}
 		c.srv.lockTable().ReleaseOwner(lockOwner(oh.sessionID, oh.fileId))
 		c.srv.resumeKeyTable().release(oh)
 		c.srv.leaseTable().release(oh)
@@ -322,11 +334,17 @@ func (c *conn) closeAllOpens(ctx context.Context, tr *tree) {
 // releaseOpen forgets a closed handle and, when it was the file's last open
 // and the file is delete-pending, deletes the file under its current name.
 func (c *conn) releaseOpen(ctx context.Context, tr *tree, oh *openHandle) error {
-	remove, path := c.srv.fileTable().release(oh)
+	return c.srv.releaseOpen(ctx, tr.share, oh)
+}
+
+// releaseOpen is releaseOpen for an open no longer on any tree, as a
+// durable open whose client never came back.
+func (s *Server) releaseOpen(ctx context.Context, share vfs.Share, oh *openHandle) error {
+	remove, path := s.fileTable().release(oh)
 	if !remove {
 		return nil
 	}
-	rm, ok := tr.share.Backend().(vfs.Remover)
+	rm, ok := share.Backend().(vfs.Remover)
 	if !ok {
 		return nil
 	}
@@ -334,8 +352,8 @@ func (c *conn) releaseOpen(ctx context.Context, tr *tree, oh *openHandle) error 
 		// A directory is only deleted once it is empty. One opened
 		// delete-on-close while it had entries stays, and its handle
 		// closes without error, as on Windows.
-		if nonEmpty, err := c.dirNonEmpty(ctx, tr, path); err != nil || nonEmpty {
-			c.log.Debug("not deleting a non-empty directory", "path", path, "err", err)
+		if nonEmpty, err := dirNonEmpty(ctx, share, path); err != nil || nonEmpty {
+			s.log.Debug("not deleting a non-empty directory", "path", path, "err", err)
 			return nil
 		}
 	}
@@ -343,14 +361,14 @@ func (c *conn) releaseOpen(ctx context.Context, tr *tree, oh *openHandle) error 
 		return err
 	}
 	if !oh.stream {
-		c.srv.selfNotify(tr, vfs.Change{Action: vfs.ChangeRemoved, Path: path, IsDir: oh.isDir})
+		s.selfNotifyShare(share, vfs.Change{Action: vfs.ChangeRemoved, Path: path, IsDir: oh.isDir})
 	}
 	return nil
 }
 
 // dirNonEmpty reports whether the directory at path lists anything.
-func (c *conn) dirNonEmpty(ctx context.Context, tr *tree, path string) (bool, error) {
-	h, err := tr.share.Backend().Open(ctx, vfs.OpenOptions{Path: path, Disposition: vfs.DispositionOpen, CreateDir: true})
+func dirNonEmpty(ctx context.Context, share vfs.Share, path string) (bool, error) {
+	h, err := share.Backend().Open(ctx, vfs.OpenOptions{Path: path, Disposition: vfs.DispositionOpen, CreateDir: true})
 	if err != nil {
 		return false, err
 	}
@@ -366,6 +384,9 @@ func (c *request) handleCreate(ctx context.Context, msg []byte, hdr *wire.Header
 	if max := c.srv.limits.OpensPerSession; max > 0 && sess != nil && sess.openCount() >= max {
 		c.log.Debug("open limit reached", "remote", c.remoteAddr(), "limit", max)
 		return c.errBody(wire.StatusInsufficientResources)
+	}
+	if rc, ok := durableReconnect(&req); ok {
+		return c.reconnectDurable(ctx, &req, rc, sess, tr, lastFileId)
 	}
 	name := wire.UTF16FromBytes(req.Name)
 	base, stream, err := splitStream(name)
@@ -460,9 +481,10 @@ func (c *request) handleCreate(ctx context.Context, msg []byte, hdr *wire.Header
 		return c.errBody(wire.StatusCannotDelete)
 	}
 
-	fid := makeFileID(hdr.SessionId, hdr.TreeId, tr.nextFileID())
+	fid := makeFileID(c.srv.nextOpenID.Add(1), hdr.TreeId, tr.nextFileID())
 	c.log.Debug("create", "path", name, "disposition", req.CreateDisposition,
-		"desired_access", req.DesiredAccess, "options", req.CreateOptions)
+		"desired_access", req.DesiredAccess, "options", req.CreateOptions,
+		"oplock", req.RequestedOplockLevel, "contexts", contextNames(&req))
 	oh := &openHandle{h: h, fileId: fid, sessionID: hdr.SessionId, path: name,
 		access: req.DesiredAccess, deleteOnClose: deleteOnClose, isDir: fi.IsDir, stream: stream != ""}
 	files.add(key, oh)
@@ -501,7 +523,8 @@ func (c *request) handleCreate(ctx context.Context, msg []byte, hdr *wire.Header
 	// let it do with exclusive and batch oplocks, and which made Windows
 	// PowerShell's Set-Content flush stale cached content and silently
 	// append to files instead of replacing them.
-	oplock, contexts := c.grantCaching(&req, sess, tr, oh, fi)
+	oplock, contexts, leaseState := c.grantCaching(&req, sess, tr, oh, fi)
+	contexts = append(contexts, c.grantDurable(&req, sess, tr, oh, leaseState)...)
 
 	resp := wire.CreateResponse{
 		Contexts:       contexts,
@@ -804,4 +827,13 @@ func (c *request) createAfterBreaks(ctx context.Context, msg []byte, hdr *wire.H
 // an interim response carries.
 func errorBody() []byte {
 	return []byte{9, 0, 0, 0, 0, 0, 0, 0, 0}
+}
+
+// contextNames lists a request's create contexts, for the debug log.
+func contextNames(req *wire.CreateRequest) []string {
+	names := make([]string, 0, len(req.Contexts))
+	for _, c := range req.Contexts {
+		names = append(names, c.Name)
+	}
+	return names
 }

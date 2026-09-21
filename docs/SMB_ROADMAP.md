@@ -126,6 +126,11 @@ file before that write is acknowledged.
   markedly slower.
 - Durable handles v2, so a dropped connection pauses a client rather than
   failing its open files.
+  Done (`windows-durable-test.ps1`). Windows held a file open with a
+  byte-range lock and its connection was cut. An NFS lock on the same bytes
+  was refused during the outage. Windows then reconnected, reclaimed the
+  handle, wrote through it, and released its lock. With durable handles off,
+  every operation on the handle failed and the lock was lost.
 - Multichannel, optionally, once durable handles exist.
 
 **Done when:** Windows negotiates 3.1.1 with GCM, and a client survives a

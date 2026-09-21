@@ -78,6 +78,9 @@ type ServerOptions struct {
 	// Leases lets clients cache the files they read (see
 	// config.SMBConfig.Leases).
 	Leases bool
+	// DurableHandles keeps open files through a dropped connection (see
+	// config.SMBConfig.DurableHandles).
+	DurableHandles bool
 	// Logger receives server logs; nil discards them.
 	Logger *zap.Logger
 }
@@ -170,9 +173,12 @@ func NewServer(fs *vfs.Filesystem, opts ServerOptions) (*Server, error) {
 	}
 	if opts.Leases {
 		serverOpts = append(serverOpts, server.WithLeases(0))
+		if opts.DurableHandles {
+			serverOpts = append(serverOpts, server.WithDurableHandles())
+		}
 	}
 	if opts.Locks != nil {
-		serverOpts = append(serverOpts, server.WithLocker(NewLocker(opts.Locks)))
+		serverOpts = append(serverOpts, server.WithLocker(NewLockerFor(opts.Locks, fs)))
 	}
 	if opts.ConcurrentRequests > 0 {
 		serverOpts = append(serverOpts, server.WithMaxConcurrentRequests(opts.ConcurrentRequests))

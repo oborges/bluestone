@@ -177,3 +177,83 @@ func TestAsyncChangeNotifyIsSigned(t *testing.T) {
 	}
 	t.Fatal("no change notification")
 }
+
+// A signed compound request is signed request by request, each over its own
+// bytes. Windows sends one to reclaim a durable handle (CREATE and WRITE);
+// verifying each signature over the rest of the chain refused all but the
+// last with ACCESS_DENIED.
+func TestSignedCompoundRequestsVerify(t *testing.T) {
+	kt := newKerbTestKeytab(t)
+	token, sessionKey := buildKerbToken(t, kt)
+	client, srvConn := newPipeConns()
+	defer func() { _ = client.Close() }()
+	defer serveOn(newKerbTestServer(t, newMemBackend(), kt), srvConn)()
+	fc := transport.NewFramedConn(client)
+
+	negBody := make([]byte, 38)
+	binary.LittleEndian.PutUint16(negBody[0:2], 36)
+	binary.LittleEndian.PutUint16(negBody[2:4], 1)
+	binary.LittleEndian.PutUint16(negBody[36:38], wire.DialectSMB302)
+	hdr := wire.NewHeader(wire.CmdNegotiate)
+	hdr.Credit = 1
+	mustWrite(t, fc, append(hdr.Append(nil), negBody...))
+	readReply(t, fc)
+	mustWrite(t, fc, buildSessionSetup(token))
+	rh, _ := readReply(t, fc)
+	sessID := rh.SessionId
+	key := signing.DeriveSigningKey(sessionKey)
+	mustWrite(t, fc, signedTreeConnect(sessID, 2, `\\server\share`, key))
+	rh, _ = readReply(t, fc)
+	treeID := rh.TreeId
+	signer, err := signing.NewSigner(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var chained [16]byte
+	for i := range chained {
+		chained[i] = 0xFF
+	}
+	parts := [][]byte{
+		buildCreate(sessID, treeID, "signed.txt", wire.FileOpenIf),
+		buildWrite(sessID, treeID, chained, 0, []byte("signed")),
+		buildClose(sessID, treeID, chained),
+	}
+	var compound []byte
+	for i, p := range parts {
+		binary.LittleEndian.PutUint64(p[24:32], uint64(10+i))
+		flags := binary.LittleEndian.Uint32(p[16:20]) | wire.FlagSigned
+		if i > 0 {
+			flags |= wire.FlagRelatedOps
+		}
+		binary.LittleEndian.PutUint32(p[16:20], flags)
+		if i < len(parts)-1 {
+			for len(p)%8 != 0 {
+				p = append(p, 0)
+			}
+			binary.LittleEndian.PutUint32(p[20:24], uint32(len(p)))
+		}
+		if err := signer.Sign(p); err != nil {
+			t.Fatal(err)
+		}
+		compound = append(compound, p...)
+	}
+	mustWrite(t, fc, compound)
+	reply, err := fc.ReadMessage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for off, i := 0, 0; ; i++ {
+		var h wire.Header
+		if err := h.Parse(reply[off:]); err != nil {
+			t.Fatal(err)
+		}
+		if h.Status != wire.StatusSuccess {
+			t.Errorf("request %d (command %d) of a signed compound: %#x, want success", i, h.Command, h.Status)
+		}
+		if h.NextCommand == 0 {
+			break
+		}
+		off += int(h.NextCommand)
+	}
+}

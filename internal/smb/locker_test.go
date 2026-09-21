@@ -143,3 +143,29 @@ func TestSMBLockerLocksToEndOfFile(t *testing.T) {
 		t.Fatalf("Lock() before the locked region = %v, %v; want it granted", conflict, err)
 	}
 }
+
+// Locks meet on the file, however each protocol spells it: NFS names
+// "docs/Report.txt" relative to its root, SMB "DOCS\report.TXT" with
+// backslashes and in any case. Keyed by the raw names, locks on files in
+// subdirectories never conflicted across the protocols.
+func TestSMBAndNFSLocksMeetOnTheFile(t *testing.T) {
+	g := startGateway(t)
+	if err := g.share.MkdirAll(`docs`, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.share.WriteFile(`docs\Report.txt`, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	locks := lock.NewManager(lock.Options{})
+	overSMB := NewLockerFor(locks, g.filesystem)
+	overNFS := nfs.NewLocker(locks)
+
+	nfsOwner := gonfs.LockOwner{Client: "nfs4/01", Owner: "owner-a"}
+	if conflict, err := overNFS.Lock(nfsOwner, "docs/Report.txt", gonfs.LockRange{Start: 0, End: 10, Exclusive: true}); err != nil || conflict != nil {
+		t.Fatalf("NFS Lock() = %v, %v", conflict, err)
+	}
+	conflict, err := overSMB.Lock(smbOwner("smb/7", "handle-1"), `DOCS\report.TXT`, smbvfs.LockRange{Start: 0, End: 10, Exclusive: true})
+	if err != nil || conflict == nil {
+		t.Fatalf("SMB Lock() on the same file, spelled the SMB way = %v, %v; want a conflict with the NFS lock", conflict, err)
+	}
+}
