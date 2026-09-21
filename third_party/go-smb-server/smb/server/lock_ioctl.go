@@ -24,15 +24,15 @@ func (c *request) handleLock(_ context.Context, msg []byte, hdr *wire.Header, tr
 	var granted []vfs.LockRange
 	unwind := func() {
 		for _, r := range granted {
-			_ = locker.Unlock(owner, oh.path, r)
+			_ = locker.Unlock(owner, oh.currentPath(), r)
 		}
 	}
 
 	for _, l := range req.Locks {
 		if l.Flags&wire.LockFlagUnlock != 0 {
-			if err := locker.Unlock(owner, oh.path, lockRange(l.Offset, l.Length, false)); err != nil {
+			if err := locker.Unlock(owner, oh.currentPath(), lockRange(l.Offset, l.Length, false)); err != nil {
 				unwind()
-				c.log.Debug("unlock failed", "path", oh.path, "err", err)
+				c.log.Debug("unlock failed", "path", oh.currentPath(), "err", err)
 				return c.errBody(wire.StatusInvalidParameter)
 			}
 			continue
@@ -48,10 +48,10 @@ func (c *request) handleLock(_ context.Context, msg []byte, hdr *wire.Header, tr
 			// A zero-length lock covers no bytes and conflicts with nothing.
 			continue
 		}
-		conflict, err := locker.Lock(owner, oh.path, r)
+		conflict, err := locker.Lock(owner, oh.currentPath(), r)
 		if err != nil {
 			unwind()
-			c.log.Debug("lock failed", "path", oh.path, "err", err)
+			c.log.Debug("lock failed", "path", oh.currentPath(), "err", err)
 			return c.errBody(wire.StatusLockNotGranted)
 		}
 		if conflict != nil {

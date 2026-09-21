@@ -73,6 +73,9 @@ The visible "this is not a real file server" failures.
   is not detected directly; it shows up as staging filling.
 - Delete-on-close and delete-pending semantics, and the rename and delete
   edge cases around open handles.
+  Done: matches Windows' own server scenario for scenario
+  (`windows-delete-test.ps1`), apart from one query the Windows client
+  answers from its cache without leases.
 - Alternate data streams, at least enough that macOS stops writing
   AppleDouble `._` files into the bucket and Windows can keep its
   "downloaded from the internet" mark.

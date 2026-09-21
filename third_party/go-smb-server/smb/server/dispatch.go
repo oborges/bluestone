@@ -305,8 +305,48 @@ func (c *conn) closeAllOpens(ctx context.Context, tr *tree) {
 		c.srv.lockTable().ReleaseOwner(lockOwner(oh.sessionID, oh.fileId))
 		c.srv.resumeKeyTable().release(oh)
 		_ = oh.h.Close(ctx)
+		// A client that disconnects still gets its delete-on-close files
+		// deleted, as when a process holding a temporary file exits.
+		if err := c.releaseOpen(ctx, tr, oh); err != nil {
+			c.log.Debug("delete on disconnect failed", "path", oh.currentPath(), "err", err)
+		}
 	}
+	tr.mu.Lock()
 	tr.opens = make(map[[16]byte]*openHandle)
+	tr.mu.Unlock()
+}
+
+// releaseOpen forgets a closed handle and, when it was the file's last open
+// and the file is delete-pending, deletes the file under its current name.
+func (c *conn) releaseOpen(ctx context.Context, tr *tree, oh *openHandle) error {
+	remove, path := c.srv.fileTable().release(oh)
+	if !remove {
+		return nil
+	}
+	rm, ok := tr.share.Backend().(vfs.Remover)
+	if !ok {
+		return nil
+	}
+	if oh.isDir {
+		// A directory is only deleted once it is empty. One opened
+		// delete-on-close while it had entries stays, and its handle
+		// closes without error, as on Windows.
+		if nonEmpty, err := c.dirNonEmpty(ctx, tr, path); err != nil || nonEmpty {
+			c.log.Debug("not deleting a non-empty directory", "path", path, "err", err)
+			return nil
+		}
+	}
+	return rm.Remove(ctx, path)
+}
+
+// dirNonEmpty reports whether the directory at path lists anything.
+func (c *conn) dirNonEmpty(ctx context.Context, tr *tree, path string) (bool, error) {
+	h, err := tr.share.Backend().Open(ctx, vfs.OpenOptions{Path: path, Disposition: vfs.DispositionOpen, CreateDir: true})
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = h.Close(ctx) }()
+	return dirHasEntries(ctx, h)
 }
 
 func (c *request) handleCreate(ctx context.Context, msg []byte, hdr *wire.Header, sess *session, tr *tree, lastFileId *[16]byte) uint32 {
@@ -319,13 +359,28 @@ func (c *request) handleCreate(ctx context.Context, msg []byte, hdr *wire.Header
 		return c.errBody(wire.StatusInsufficientResources)
 	}
 	name := wire.UTF16FromBytes(req.Name)
+	deleteOnClose := req.CreateOptions&wire.FileDeleteOnClose != 0
+	if deleteOnClose && req.DesiredAccess&(accessDelete|accessGenericAll|accessMaximumAllowed) == 0 {
+		// Deleting on close is deleting, which the open has to ask for
+		// (MS-SMB2 section 3.3.5.9).
+		return c.errBody(wire.StatusAccessDenied)
+	}
+	key := keyFor(tr.share.Name(), name)
+	files := c.srv.fileTable()
+	if files.deletePending(key) {
+		// The file is waiting for its last handle to close before it goes;
+		// Windows refuses every open of it meanwhile, including ones that
+		// would overwrite it. Checked before the backend opens it, so an
+		// overwrite does not truncate a file on its way out.
+		return c.errBody(wire.StatusDeletePending)
+	}
 	opts := vfs.OpenOptions{
 		Path:          name,
 		Disposition:   req.CreateDisposition,
 		CreateDir:     req.CreateOptions&wire.FileDirectoryFile != 0,
 		DesiredAccess: req.DesiredAccess,
 		ShareAccess:   req.ShareAccess,
-		DeleteOnClose: req.CreateOptions&wire.FileDeleteOnClose != 0,
+		DeleteOnClose: deleteOnClose,
 	}
 	h, err := tr.share.Backend().Open(ctx, opts)
 	if err != nil {
@@ -336,12 +391,19 @@ func (c *request) handleCreate(ctx context.Context, msg []byte, hdr *wire.Header
 		_ = h.Close(ctx)
 		return c.errBody(osErrToStatus(err))
 	}
+	if deleteOnClose && !fi.IsDir && fi.Attributes&attrReadOnly != 0 {
+		// A read-only file cannot be deleted until the attribute is
+		// cleared (MS-FSA section 2.1.5.1.2.1).
+		_ = h.Close(ctx)
+		return c.errBody(wire.StatusCannotDelete)
+	}
 
 	fid := makeFileID(hdr.SessionId, hdr.TreeId, tr.nextFileID())
 	c.log.Debug("create", "path", name, "disposition", req.CreateDisposition,
 		"desired_access", req.DesiredAccess, "options", req.CreateOptions)
 	oh := &openHandle{h: h, fileId: fid, sessionID: hdr.SessionId, path: name,
-		deletePending: req.CreateOptions&wire.FileDeleteOnClose != 0}
+		access: req.DesiredAccess, deleteOnClose: deleteOnClose, isDir: fi.IsDir}
+	files.add(key, oh)
 	tr.addOpen(oh)
 	*lastFileId = fid
 
@@ -382,6 +444,14 @@ func (c *request) handleCreate(ctx context.Context, msg []byte, hdr *wire.Header
 	c.out = resp.Append(c.out)
 	return wire.StatusSuccess
 }
+
+// Access bits an open asks for that decide whether it may delete (MS-SMB2
+// section 2.2.13.1).
+const (
+	accessDelete         uint32 = 0x00010000
+	accessMaximumAllowed uint32 = 0x02000000
+	accessGenericAll     uint32 = 0x10000000
+)
 
 // DOS attribute bits (MS-FSCC section 2.6).
 const (
@@ -424,15 +494,11 @@ func (c *request) handleClose(ctx context.Context, msg []byte, tr *tree) uint32 
 	tr.removeOpen(req.FileId)
 	c.srv.resumeKeyTable().release(oh)
 	if tr.oplocks != nil {
-		tr.oplocks.release(oh.path)
+		tr.oplocks.release(oh.currentPath())
 	}
 
-	if oh.deletePending {
-		if rm, ok := tr.share.Backend().(vfs.Remover); ok {
-			if rmErr := rm.Remove(ctx, oh.path); rmErr != nil {
-				return c.errBody(osErrToStatus(rmErr))
-			}
-		}
+	if rmErr := c.releaseOpen(ctx, tr, oh); rmErr != nil {
+		return c.errBody(osErrToStatus(rmErr))
 	}
 
 	resp := wire.CloseResponse{Flags: req.Flags & wire.CloseFlagPostQueryAttrib}
@@ -482,7 +548,7 @@ func (c *request) handleWrite(ctx context.Context, msg []byte, tr *tree) uint32 
 	if !ok {
 		return c.errBody(wire.StatusInvalidHandle)
 	}
-	c.log.Debug("write", "path", oh.path, "offset", req.Offset, "len", len(req.Data))
+	c.log.Debug("write", "path", oh.currentPath(), "offset", req.Offset, "len", len(req.Data))
 	n, err := oh.h.Write(ctx, int64(req.Offset), req.Data)
 	if err != nil {
 		return c.errBody(osErrToStatus(err))
@@ -570,7 +636,7 @@ func (c *request) handleQueryDirectory(ctx context.Context, msg []byte, tr *tree
 		}
 		encFi := wire.FileInfo{
 			Name:   fi.Name,
-			FileId: pathIndexNumber(oh.path + "/" + fi.Name),
+			FileId: pathIndexNumber(oh.currentPath() + "/" + fi.Name),
 			// (pathIndexNumber normalizes separators, so this matches the
 			// index a QUERY_INFO on the same file reports.)
 			EndOfFile:      uint64(fi.Size),

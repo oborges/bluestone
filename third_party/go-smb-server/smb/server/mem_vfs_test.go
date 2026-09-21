@@ -24,6 +24,7 @@ type memNode struct {
 	data     []byte
 	children map[string]*memNode
 	modTime  time.Time
+	attrs    uint32
 }
 
 func newMemBackend() *memBackend {
@@ -33,7 +34,7 @@ func newMemBackend() *memBackend {
 func (b *memBackend) Open(_ context.Context, opts vfs.OpenOptions) (vfs.Handle, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	clean := path.Clean("/" + opts.Path)
+	clean := memClean(opts.Path)
 	if clean == "/" {
 		return &memHandle{n: b.root, b: b}, nil
 	}
@@ -65,6 +66,31 @@ func (b *memBackend) Open(_ context.Context, opts vfs.OpenOptions) (vfs.Handle, 
 	}
 }
 
+// memClean turns a client path, backslash-separated, into the backend's
+// slash-separated form.
+func memClean(p string) string {
+	return path.Clean("/" + strings.ReplaceAll(p, "\\", "/"))
+}
+
+// parentOf finds the directory holding n.
+func (b *memBackend) parentOf(n *memNode) *memNode {
+	var walk func(dir *memNode) *memNode
+	walk = func(dir *memNode) *memNode {
+		for _, c := range dir.children {
+			if c == n {
+				return dir
+			}
+			if c.isDir {
+				if p := walk(c); p != nil {
+					return p
+				}
+			}
+		}
+		return nil
+	}
+	return walk(b.root)
+}
+
 func splitDir(clean string) (dir, base string) {
 	if clean == "/" || clean == "" {
 		return "", ""
@@ -78,7 +104,7 @@ func splitDir(clean string) (dir, base string) {
 func (b *memBackend) Remove(_ context.Context, p string) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	clean := path.Clean("/" + p)
+	clean := memClean(p)
 	dir, base := splitDir(clean)
 	parent := b.mustDir(dir)
 	if _, ok := parent.children[base]; !ok {
@@ -148,13 +174,16 @@ func (h *memHandle) SetInfo(_ context.Context, req *vfs.SetInfoRequest) error {
 	if req.LastWriteTime != nil {
 		h.n.modTime = *req.LastWriteTime
 	}
+	if req.Attributes != nil {
+		h.n.attrs = *req.Attributes
+	}
 	return nil
 }
 
 func (h *memHandle) Rename(_ context.Context, newPath string, replaceIfExists bool) error {
 	h.b.mu.Lock()
 	defer h.b.mu.Unlock()
-	clean := path.Clean("/" + newPath)
+	clean := memClean(newPath)
 	dir, base := splitDir(clean)
 	parent := h.b.mustDir(dir)
 	if !replaceIfExists {
@@ -163,7 +192,9 @@ func (h *memHandle) Rename(_ context.Context, newPath string, replaceIfExists bo
 		}
 	}
 	n := h.n
-	delete(parent.children, n.name)
+	if old := h.b.parentOf(n); old != nil {
+		delete(old.children, n.name)
+	}
 	n.name = base
 	parent.children[base] = n
 	return nil
@@ -176,6 +207,7 @@ func (h *memHandle) Stat(_ context.Context) (vfs.FileInfo, error) {
 		Name:         h.n.name,
 		Size:         int64(len(h.n.data)),
 		IsDir:        h.n.isDir,
+		Attributes:   h.n.attrs,
 		CreationTime: h.n.modTime,
 		LastAccess:   h.n.modTime,
 		LastWrite:    h.n.modTime,

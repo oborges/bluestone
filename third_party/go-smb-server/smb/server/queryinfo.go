@@ -36,7 +36,7 @@ func (c *request) handleQueryInfo(ctx context.Context, msg []byte, tr *tree) uin
 			AllocationSize: uint64(fi.Size),
 			EndOfFile:      uint64(fi.Size),
 			NumberOfLinks:  1,
-			DeletePending:  boolToU8(oh.deletePending),
+			DeletePending:  boolToU8(c.srv.fileTable().isDeletePending(oh)),
 			Directory:      boolToU8(fi.IsDir),
 		}
 		var info []byte
@@ -47,7 +47,7 @@ func (c *request) handleQueryInfo(ctx context.Context, msg []byte, tr *tree) uin
 			info = standard.Append(nil)
 		case wire.FileInternalInformation:
 			info = make([]byte, 8)
-			put64LE(info, pathIndexNumber(oh.path))
+			put64LE(info, pathIndexNumber(oh.currentPath()))
 		case wire.FileEaInformation:
 			info = make([]byte, 4)
 		case wire.FilePositionInformation:
@@ -56,12 +56,12 @@ func (c *request) handleQueryInfo(ctx context.Context, msg []byte, tr *tree) uin
 			info = make([]byte, 4)
 		case wire.FileAlternateNameInformation:
 			// No 8.3 aliases are kept, so the name itself is the answer.
-			name := wire.UTF16ToBytes(pathBase(oh.path))
+			name := wire.UTF16ToBytes(pathBase(oh.currentPath()))
 			info = make([]byte, 4+len(name))
 			putLE32(info[0:4], uint32(len(name)))
 			copy(info[4:], name)
 		case wire.FileNameInformation, wire.FileNormalizedNameInformation:
-			name := wire.UTF16ToBytes(smbPath(oh.path))
+			name := wire.UTF16ToBytes(smbPath(oh.currentPath()))
 			info = make([]byte, 4+len(name))
 			putLE32(info[0:4], uint32(len(name)))
 			copy(info[4:], name)
@@ -82,7 +82,7 @@ func (c *request) handleQueryInfo(ctx context.Context, msg []byte, tr *tree) uin
 			put64LE(info[16:24], uint64(fi.Size))
 			copy(info[24:], streamName)
 		case wire.FileAllInformation:
-			info = wire.FileAllInformationAppend(nil, basic, standard, pathIndexNumber(oh.path), smbPath(oh.path))
+			info = wire.FileAllInformationAppend(nil, basic, standard, pathIndexNumber(oh.currentPath()), smbPath(oh.currentPath()))
 		case wire.FileNetworkOpenInformation:
 			info = networkOpenInfo(basic, fi.Size)
 		default:
@@ -303,7 +303,9 @@ func (c *request) handleSetInfo(ctx context.Context, msg []byte, tr *tree) uint3
 			if len(req.Buffer) < 1 {
 				return c.errBody(wire.StatusInvalidParameter)
 			}
-			oh.deletePending = req.Buffer[0] != 0
+			if status := c.setDisposition(ctx, oh, req.Buffer[0] != 0); status != wire.StatusSuccess {
+				return c.errBody(status)
+			}
 
 		case wire.FileBasicInfoClass:
 			var bi wire.FileBasicInformation
@@ -351,7 +353,7 @@ func (c *request) handleSetInfo(ctx context.Context, msg []byte, tr *tree) uint3
 			}
 			if allocation < fi.Size {
 				size := allocation
-				c.log.Debug("truncate for allocation size", "path", oh.path, "size", size)
+				c.log.Debug("truncate for allocation size", "path", oh.currentPath(), "size", size)
 				if si, ok := oh.h.(vfs.SetInfoer); ok {
 					if err := si.SetInfo(ctx, &vfs.SetInfoRequest{EndOfFile: &size}); err != nil {
 						return c.errBody(osErrToStatus(err))
@@ -368,7 +370,7 @@ func (c *request) handleSetInfo(ctx context.Context, msg []byte, tr *tree) uint3
 				return c.errBody(wire.StatusInvalidParameter)
 			}
 			newSize := readLE64(req.Buffer[0:8])
-			c.log.Debug("set end of file", "path", oh.path, "size", newSize)
+			c.log.Debug("set end of file", "path", oh.currentPath(), "size", newSize)
 			if si, ok := oh.h.(vfs.SetInfoer); ok {
 				if err := si.SetInfo(ctx, &vfs.SetInfoRequest{EndOfFile: &newSize}); err != nil {
 					return c.errBody(osErrToStatus(err))
@@ -385,13 +387,26 @@ func (c *request) handleSetInfo(ctx context.Context, msg []byte, tr *tree) uint3
 				return c.errBody(wire.StatusInvalidParameter)
 			}
 			newName := wire.UTF16FromBytes(req.Buffer[20 : 20+fnLen])
-			if rn, ok := oh.h.(vfs.Renamer); ok {
-				if err := rn.Rename(ctx, newName, replaceIfExist); err != nil {
-					return c.errBody(osErrToStatus(err))
-				}
-			} else {
+			rn, ok := oh.h.(vfs.Renamer)
+			if !ok {
 				return c.errBody(wire.StatusNotSupported)
 			}
+			files := c.srv.fileTable()
+			if pending, busy := files.checkRename(oh, newName); pending {
+				return c.errBody(wire.StatusDeletePending)
+			} else if busy {
+				// A directory with files open inside it, or a target
+				// someone has open: Windows refuses both, and renaming
+				// either would leave those handles naming the wrong file.
+				return c.errBody(wire.StatusAccessDenied)
+			}
+			if err := rn.Rename(ctx, newName, replaceIfExist); err != nil {
+				return c.errBody(osErrToStatus(err))
+			}
+			// Every handle to the file now names it where it is, so a
+			// delete through one of them removes this file and not
+			// whatever takes the old name next.
+			files.renamed(oh, newName)
 
 		default:
 			c.log.Debug("unsupported set-info class", "class", req.FileInfoClass)
@@ -404,7 +419,7 @@ func (c *request) handleSetInfo(ctx context.Context, msg []byte, tr *tree) uint3
 		// Refused rather than accepted and dropped: the gateway keeps no
 		// Windows ACLs, and a client told its change was saved would show
 		// permissions that are not enforced anywhere.
-		c.log.Debug("refusing to set a security descriptor", "path", oh.path)
+		c.log.Debug("refusing to set a security descriptor", "path", oh.currentPath())
 		return c.errBody(wire.StatusNotSupported)
 	}
 	c.log.Debug("unsupported set-info type", "info_type", req.InfoType, "class", req.FileInfoClass)
@@ -438,4 +453,36 @@ func putLE64(dst []byte, v uint64) {
 func readLE64(b []byte) int64 {
 	return int64(uint64(b[0]) | uint64(b[1])<<8 | uint64(b[2])<<16 | uint64(b[3])<<24 |
 		uint64(b[4])<<32 | uint64(b[5])<<40 | uint64(b[6])<<48 | uint64(b[7])<<56)
+}
+
+// setDisposition sets or clears the delete-pending state of oh's file, as
+// FileDispositionInformation asks (MS-FSA section 2.1.5.14.3). Deleting
+// needs delete access, and is refused for a read-only file and a directory
+// with anything in it; clearing is always allowed.
+func (c *request) setDisposition(ctx context.Context, oh *openHandle, pending bool) uint32 {
+	files := c.srv.fileTable()
+	if !pending {
+		files.setDeletePending(oh, false)
+		return wire.StatusSuccess
+	}
+	if oh.access&(accessDelete|accessGenericAll|accessMaximumAllowed) == 0 {
+		return wire.StatusAccessDenied
+	}
+	fi, err := oh.h.Stat(ctx)
+	if err != nil {
+		return osErrToStatus(err)
+	}
+	if fi.IsDir {
+		nonEmpty, err := dirHasEntries(ctx, oh.h)
+		if err != nil {
+			return osErrToStatus(err)
+		}
+		if nonEmpty {
+			return wire.StatusDirectoryNotEmpty
+		}
+	} else if fi.Attributes&attrReadOnly != 0 {
+		return wire.StatusCannotDelete
+	}
+	files.setDeletePending(oh, true)
+	return wire.StatusSuccess
 }

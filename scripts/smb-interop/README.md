@@ -63,6 +63,13 @@ ssh gateway 'sudo sed -n "s/^ *password: \"\(.*\)\"$/\1/p" /etc/bluestone/config
   echo "$password" | ssh windows 'powershell -File windows-lock-test.ps1 -Server 10.0.0.4'
   ```
 
+- `windows-delete-test.ps1` checks delete-on-close and delete-pending
+  semantics, and renames around open handles, through the Win32 calls
+  applications use. Run it against a share on Windows itself for reference
+  (`-Unc \\localhost\<share>`, no `-User`) and against the gateway, then
+  diff the two. One line is expected to differ: without leases the Windows
+  client answers a second handle's "delete pending" query from its own
+  cache instead of asking the server.
 - `windows-space-test.ps1` checks the share's size as Windows reads it
   (`DriveInfo` and `fsutil volume diskfree`), that free space falls as data
   is staged, and that a write past the staging quota fails with "not enough

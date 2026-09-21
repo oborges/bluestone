@@ -238,6 +238,22 @@ proposed upstream.
   half free, so Explorer started copies that could not fit and they failed
   partway with STATUS_DISK_FULL. A backend without the interface still gets
   the nominal size.
+- Delete semantics follow the file, not the handle (MS-FSA 2.1.5.4 and
+  2.1.5.14.3). A table of open files across every connection holds each
+  file's delete-pending state: the file is removed when its last handle
+  closes, every handle reports it pending, and new opens get
+  STATUS_DELETE_PENDING. A disposition needs delete access and is refused
+  for a read-only file (STATUS_CANNOT_DELETE) and a non-empty directory
+  (STATUS_DIRECTORY_NOT_EMPTY); FILE_DELETE_ON_CLOSE needs delete access,
+  and a non-empty directory opened with it is left in place. Delete-on-close
+  also applies when a client disconnects. Renames update every handle to
+  the file, and are refused for a delete-pending file, a directory with
+  anything open inside it, and a target someone has open. Upstream kept the
+  disposition per handle and deleted on that handle's close, even with other
+  handles open, and never updated a handle's path on rename: deleting
+  through a handle after renaming its file removed whatever had the old
+  name, which lost the new version of a file saved by renaming the old one
+  aside.
 
 ## Known gaps to close in Bluestone
 
@@ -255,5 +271,9 @@ Tracked with the rest of the SMB work in `docs/SMB_ROADMAP.md`.
   connection loses open handles.
 - The dialect is fixed at 3.0.2: no SMB 3.1.1, so no pre-auth integrity and
   no AES-GCM. Signing is AES-CMAC and encryption AES-128-CCM.
+- Byte-range locks are keyed by path in the lock table, and are not moved
+  when their file is renamed. They are still released when the handle
+  closes, but a lock taken before a rename does not conflict with NFS locks
+  on the new name.
 - No alternate data streams, so macOS writes AppleDouble files into the
   bucket.
