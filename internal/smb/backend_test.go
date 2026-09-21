@@ -1154,3 +1154,70 @@ func TestServerSideCopyRestoresDestinationWhenCopyFails(t *testing.T) {
 		t.Fatalf("destination is %d bytes after the failed copy, want %d", info.Size(), size)
 	}
 }
+
+// Windows checks the share's free space before a copy, so the share reports
+// the staging area writes land in: its size, and the room left before the
+// high watermark, which shrinks as unsynced data piles up.
+func TestSMBReportsStagingSpace(t *testing.T) {
+	g := startGateway(t)
+
+	before, err := g.share.Statfs("")
+	if err != nil {
+		t.Fatalf("Statfs() error = %v", err)
+	}
+	const gib = 1 << 30
+	if total := before.TotalBlockCount() * before.BlockSize(); total != gib {
+		t.Fatalf("share size = %d bytes, want the 1 GiB staging quota", total)
+	}
+	// The default high watermark is 80%: past it, writes wait on uploads.
+	freeBefore := before.AvailableBlockCount() * before.BlockSize()
+	if limit := uint64(gib) * 80 / 100; freeBefore > limit || freeBefore < limit-4096 {
+		t.Fatalf("free space = %d bytes, want the room below the high watermark (%d)", freeBefore, limit)
+	}
+
+	const written = 8 << 20
+	f, err := g.share.Create("big.bin")
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	if _, err := f.Write(make([]byte, written)); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	after, err := g.share.Statfs("")
+	if err != nil {
+		t.Fatalf("Statfs() error = %v", err)
+	}
+	freeAfter := after.AvailableBlockCount() * after.BlockSize()
+	if freeBefore-freeAfter < written {
+		t.Fatalf("free space fell by %d bytes after staging %d, want at least that much", freeBefore-freeAfter, written)
+	}
+}
+
+// A write the staging area has no room for reaches Windows as
+// STATUS_DISK_FULL, which it reports as "there is not enough space", rather
+// than as a permissions or generic I/O failure.
+func TestSMBWritePastStagingQuotaIsDiskFull(t *testing.T) {
+	g := startGateway(t)
+
+	f, err := g.share.Create("huge.bin")
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	defer func() { _ = f.Close() }()
+
+	// Writing past the end grows the file to the offset: 2 GiB against a
+	// 1 GiB staging quota, without the test having to stage that much.
+	_, err = f.WriteAt([]byte("x"), 2<<30)
+	var respErr *client.ResponseError
+	if !errors.As(err, &respErr) {
+		t.Fatalf("WriteAt() error = %v, want an SMB error status", err)
+	}
+	const statusDiskFull = 0xC000007F
+	if respErr.Code != statusDiskFull {
+		t.Fatalf("WriteAt() status = %#x, want STATUS_DISK_FULL", respErr.Code)
+	}
+}

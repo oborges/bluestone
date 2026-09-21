@@ -96,7 +96,11 @@ func (c *request) handleQueryInfo(ctx context.Context, msg []byte, tr *tree) uin
 		return wire.StatusSuccess
 
 	case wire.InfoFilesystem:
-		info := c.filesystemInfo(req.FileInfoClass)
+		space, err := shareSpace(ctx, tr.share.Backend())
+		if err != nil {
+			return c.errBody(osErrToStatus(err))
+		}
+		info := filesystemInfo(req.FileInfoClass, space)
 		if info == nil {
 			c.log.Debug("unsupported filesystem info class", "class", req.FileInfoClass)
 			return c.errBody(wire.StatusInvalidParameter)
@@ -150,16 +154,41 @@ func networkOpenInfo(basic wire.FileBasicInformation, size int64) []byte {
 	return out
 }
 
-// Reported geometry of the share. The numbers are nominal: the backing store
-// has no fixed size, so a large capacity is advertised.
+// Reported geometry of the share.
 const (
 	bytesPerSector           = 4096
 	sectorsPerAllocationUnit = 1
-	totalAllocationUnits     = uint64(1<<40) / bytesPerSector
-	availableAllocationUnits = totalAllocationUnits / 2
 )
 
-func (c *conn) filesystemInfo(class uint8) []byte {
+// nominalSpace is reported for a backend that does not say how much room it
+// has: a large share with plenty free.
+var nominalSpace = vfs.Space{TotalBytes: 1 << 40, AvailableBytes: 1 << 39}
+
+// shareSpace asks the backend how much room the share has, so a client
+// checking before a copy sees a share that is filling up rather than a
+// fixed number that only turns into STATUS_DISK_FULL partway through.
+func shareSpace(ctx context.Context, backend vfs.Backend) (vfs.Space, error) {
+	reporter, ok := backend.(vfs.SpaceReporter)
+	if !ok {
+		return nominalSpace, nil
+	}
+	space, err := reporter.Space(ctx)
+	if err != nil {
+		return vfs.Space{}, err
+	}
+	if space.AvailableBytes > space.TotalBytes {
+		// Windows shows used space as the difference, so free space past
+		// the total would show a negative used amount.
+		space.TotalBytes = space.AvailableBytes
+	}
+	return space, nil
+}
+
+func filesystemInfo(class uint8, space vfs.Space) []byte {
+	const unitBytes = bytesPerSector * sectorsPerAllocationUnit
+	totalUnits := space.TotalBytes / unitBytes
+	availableUnits := space.AvailableBytes / unitBytes
+
 	switch class {
 	case wire.FileFsAttributeInformation:
 		// Case-preserving but not case-sensitive, which is how the share
@@ -173,16 +202,18 @@ func (c *conn) filesystemInfo(class uint8) []byte {
 		return out
 	case wire.FileFsSizeInformation:
 		out := make([]byte, 24)
-		put64LE(out[0:8], totalAllocationUnits)
-		put64LE(out[8:16], availableAllocationUnits)
+		put64LE(out[0:8], totalUnits)
+		put64LE(out[8:16], availableUnits)
 		putLE32(out[16:20], sectorsPerAllocationUnit)
 		putLE32(out[20:24], bytesPerSector)
 		return out
 	case wire.FileFsFullSizeInformation:
+		// Caller and actual available are the same: the gateway keeps no
+		// per-user quotas that would make them differ.
 		out := make([]byte, 32)
-		put64LE(out[0:8], totalAllocationUnits)
-		put64LE(out[8:16], availableAllocationUnits)
-		put64LE(out[16:24], availableAllocationUnits)
+		put64LE(out[0:8], totalUnits)
+		put64LE(out[8:16], availableUnits)
+		put64LE(out[16:24], availableUnits)
 		putLE32(out[24:28], sectorsPerAllocationUnit)
 		putLE32(out[28:32], bytesPerSector)
 		return out
