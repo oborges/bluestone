@@ -68,6 +68,9 @@ The visible "this is not a real file server" failures.
   clean. Today Explorer and robocopy pull every byte to the client and push
   it back.
 - Disk full and quota reporting, so Windows warns before a write fails.
+  Done: the share reports the staging area's size and the room below its
+  high watermark, and a write past it is `STATUS_DISK_FULL`. A bucket quota
+  is not detected directly; it shows up as staging filling.
 - Delete-on-close and delete-pending semantics, and the rename and delete
   edge cases around open handles.
 - Alternate data streams, at least enough that macOS stops writing

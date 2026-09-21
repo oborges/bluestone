@@ -366,3 +366,19 @@ func statToFileInfo(name string, fi fs.FileInfo) FileInfo {
 type ChunkCopier interface {
 	CopyChunk(ctx context.Context, src Handle, srcOffset, dstOffset, length int64) (int64, error)
 }
+
+// Space is the capacity a share reports to clients: its size, and how much
+// of it a write can still use.
+type Space struct {
+	TotalBytes     uint64
+	AvailableBytes uint64
+}
+
+// SpaceReporter is a backend that knows how much room it has. Clients read
+// this before a copy (Explorer refuses one that will not fit) and to show
+// the share's free space, so a backend that fills up should implement it
+// and report the space that writes can really use. A backend without it is
+// reported as a large share with plenty free.
+type SpaceReporter interface {
+	Space(ctx context.Context) (Space, error)
+}

@@ -231,6 +231,13 @@ proposed upstream.
   returning errors.ErrUnsupported for a particular copy falls back to the
   server moving them. Upstream answered STATUS_NOT_SUPPORTED to both
   controls, so every copy went out to the client and back.
+- Filesystem size queries ask the backend. FILE_FS_SIZE_INFORMATION and
+  FILE_FS_FULL_SIZE_INFORMATION report what a backend implementing
+  `vfs.SpaceReporter` returns, keeping free space within the total, and an
+  error from it as the matching status. Upstream always reported 1 TiB with
+  half free, so Explorer started copies that could not fit and they failed
+  partway with STATUS_DISK_FULL. A backend without the interface still gets
+  the nominal size.
 
 ## Known gaps to close in Bluestone
 
@@ -242,10 +249,6 @@ Tracked with the rest of the SMB work in `docs/SMB_ROADMAP.md`.
 - No oplocks or leases, so clients cache nothing and every read crosses the
   wire. Granting them needs working breaks, including breaks caused by writes
   arriving over NFS.
-- No security descriptors: QUERY_INFO and SET_INFO for security answer
-  STATUS_NOT_SUPPORTED, so Windows cannot show a file's Security tab.
-- No server-side copy (FSCTL_SRV_COPYCHUNK), so copying within a share moves
-  every byte through the client.
 - CHANGE_NOTIFY polls the directory every 500ms per watch and compares
   listings, which is expensive against object storage.
 - No durable or persistent handles and no multichannel, so a dropped

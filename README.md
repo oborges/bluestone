@@ -319,12 +319,25 @@ restart; the gateway logs how long it waited and how many clients were still
 busy.
 
 Failures are reported as the status a client acts on, rather than as a
-permissions error: a full staging area or bucket quota reaches Windows as
-"there is not enough space on the disk", a read-only backend as a
+permissions error: a full staging area reaches Windows as "there is not
+enough space on the disk", a read-only backend as a
 write-protected disk, an operation that timed out as an I/O timeout, and a
 backend failure the gateway does not recognise as an I/O device error.
 `smb_requests_total{status="..."}` counts them, so a rise in
 `STATUS_DISK_FULL` is visible before users report it.
+
+The share reports the size of the staging area, the same capacity NFS
+clients see: every write lands there before it is uploaded, so it bounds
+what a copy can hold. Free space is the room left below the staging high
+watermark, where writes start waiting on uploads, and it shrinks as unsynced
+data piles up. Explorer checks it before a copy and refuses one that will
+not fit, rather than failing partway through. The flip side is that a
+single copy larger than the free staging space is refused up front even
+though uploads would drain staging while it ran; size staging for the
+largest copy users make, or copy in parts. A bucket quota is not reported:
+writes are accepted into staging before they reach COS, so a bucket that
+refuses them leaves the files dirty in staging, which then fills and
+reports disk full.
 
 Byte-range locks taken over SMB go into the same table as NFS locks, so the
 two protocols conflict with each other on the same bytes. A lock belongs to

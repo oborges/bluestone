@@ -220,6 +220,16 @@ func (b *Backend) Remove(_ context.Context, name string) error {
 	return b.fs.Remove(sharePath(name))
 }
 
+// Space implements smbvfs.SpaceReporter with the capacity NFS also reports:
+// the share is as large as the staging area, since every write lands there
+// before it reaches the bucket, and free space stops at the staging high
+// watermark, where writes start waiting on uploads. Windows refuses a copy
+// that will not fit rather than failing partway with STATUS_DISK_FULL.
+func (b *Backend) Space(context.Context) (smbvfs.Space, error) {
+	capacity := b.fs.Capacity()
+	return smbvfs.Space{TotalBytes: capacity.TotalBytes, AvailableBytes: capacity.AvailableBytes}, nil
+}
+
 // handle is an open SMB file or directory. Files that already exist are
 // opened read-only and upgraded to read-write on the first write, truncate,
 // or attribute change: SMB CREATE carries no access intent to the backend,
