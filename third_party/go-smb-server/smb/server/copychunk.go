@@ -128,6 +128,7 @@ func (c *request) handleCopyChunk(ctx context.Context, req *wire.IoctlRequest, d
 		}
 	}
 
+	c.srv.dataChanged(dst)
 	c.log.Debug("copychunk", "source", src.currentPath(), "target", dst.currentPath(),
 		"chunks", len(copyReq.Chunks), "bytes", total)
 	resp := wire.CopyChunkResponse{ChunksWritten: uint32(len(copyReq.Chunks)), TotalBytesWritten: total}

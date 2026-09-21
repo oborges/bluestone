@@ -303,6 +303,25 @@ proposed upstream.
   macOS reports as "fcopyfile failed: Bad file descriptor" partway through
   a copy. A truncate sent right behind a write could also land first, and
   the file kept the bytes the truncate removed.
+- Leases and oplocks (`WithLeases`). Read and read-handle leases are
+  granted, V1 and V2, and level II oplocks to clients asking for an
+  oplock. Write caching never is. NEGOTIATE advertises SMB2_GLOBAL_CAP_LEASING.
+  - CREATE parses create contexts, which upstream ignored, and answers with
+    the RqLs context. A lease key may name only one file.
+  - A write, truncate, overwrite or server-side copy breaks read caching for
+    every lease but the writer's. So do external changes a backend reports
+    (`vfs.Change.External`). None of these wait: breaking read caching needs
+    no acknowledgement.
+  - A CREATE that meets a sharing violation while others cache handles to
+    the file breaks their handle caching and goes async. It waits for the
+    acknowledgement (or a timeout, 35s by default), then tries again.
+  - Break acknowledgements are handled, a lower break wanted during one is
+    sent after it, and leases follow renames and end with their last open.
+  - `LeaseObserver` reports grants, breaks and timeouts.
+  - Upstream kept a stub oplock table that nothing granted from, and a break
+    message with the wrong MessageId and level.
+- Async interim responses can come from any handler (`request.asyncID`),
+  not only CHANGE_NOTIFY, and are not signed.
 
 ## Known gaps to close in Bluestone
 
@@ -311,9 +330,6 @@ Tracked with the rest of the SMB work in `docs/SMB_ROADMAP.md`.
 - Blocking byte-range locks: a lock that cannot be granted is refused even
   when the client did not set SMB2_LOCKFLAG_FAIL_IMMEDIATELY, instead of
   waiting for the conflicting lock to be released.
-- No oplocks or leases, so clients cache nothing and every read crosses the
-  wire. Granting them needs working breaks, including breaks caused by writes
-  arriving over NFS.
 - No durable or persistent handles and no multichannel, so a dropped
   connection loses open handles.
 - The dialect is fixed at 3.0.2: no SMB 3.1.1, so no pre-auth integrity and

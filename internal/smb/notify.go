@@ -3,6 +3,7 @@ package smb
 import (
 	"strings"
 
+	"github.com/oborges/bluestone/internal/metrics"
 	"github.com/oborges/bluestone/internal/vfs"
 	smbvfs "github.com/sonroyaalmerol/go-smb-server/smb/vfs"
 )
@@ -35,7 +36,8 @@ func (b *Backend) NotifyChanges(fn func(smbvfs.Change)) func() {
 		if !ok || path == "" {
 			return
 		}
-		change := smbvfs.Change{Path: toSMBPath(path), IsDir: c.IsDir}
+		change := smbvfs.Change{Path: toSMBPath(path), IsDir: c.IsDir,
+			External: c.Protocol != metrics.ProtocolSMB}
 		switch c.Action {
 		case vfs.ChangeAdded:
 			change.Action = smbvfs.ChangeAdded

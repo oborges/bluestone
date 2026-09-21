@@ -37,6 +37,36 @@ func (o *observer) RequestCompleted(command uint16, status uint32, took time.Dur
 	metrics.RecordSMBRequest(commandName(command), statusName(status), took)
 }
 
+func (o *observer) LeaseGranted(kind string, state uint32) {
+	metrics.RecordSMBLeaseGranted(kind, leaseStateName(state))
+}
+
+func (o *observer) LeaseBroken(kind string, from, to uint32) {
+	metrics.RecordSMBLeaseBreak(kind, leaseStateName(from), leaseStateName(to))
+}
+
+func (o *observer) LeaseBreakTimedOut() {
+	metrics.RecordSMBLeaseBreakTimeout()
+}
+
+// leaseStateName writes lease state bits the way Windows tools do: R, RH,
+// and "none".
+func leaseStateName(state uint32) string {
+	name := ""
+	for _, bit := range []struct {
+		mask   uint32
+		letter string
+	}{{wire.LeaseRead, "R"}, {wire.LeaseWrite, "W"}, {wire.LeaseHandle, "H"}} {
+		if state&bit.mask != 0 {
+			name += bit.letter
+		}
+	}
+	if name == "" {
+		return "none"
+	}
+	return name
+}
+
 // Stats is what the SMB server is currently carrying.
 type Stats struct {
 	// Connections is the number of connected clients.

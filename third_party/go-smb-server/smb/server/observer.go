@@ -21,6 +21,26 @@ type Observer interface {
 	RequestCompleted(command uint16, status uint32, took time.Duration)
 }
 
+// LeaseObserver is an Observer that also hears about client caching. kind
+// is "lease" or "oplock"; states are lease state bits (read, handle), with
+// a level II oplock reported as read.
+type LeaseObserver interface {
+	// LeaseGranted reports caching granted to an open.
+	LeaseGranted(kind string, state uint32)
+	// LeaseBroken reports a break sent, from one state to a lower one.
+	LeaseBroken(kind string, from, to uint32)
+	// LeaseBreakTimedOut reports a break the client never acknowledged.
+	LeaseBreakTimedOut()
+}
+
+// leaseObs returns the observer's lease reporting, if it has any.
+func (s *Server) leaseObs() LeaseObserver {
+	if o, ok := s.observer.(LeaseObserver); ok {
+		return o
+	}
+	return nil
+}
+
 // WithObserver sends what the server does to o.
 func WithObserver(o Observer) Option { return func(s *Server) { s.observer = o } }
 

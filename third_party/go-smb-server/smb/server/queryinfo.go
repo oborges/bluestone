@@ -414,7 +414,11 @@ func (c *request) handleSetInfo(ctx context.Context, msg []byte, tr *tree) uint3
 			// delete through one of them removes this file and not
 			// whatever takes the old name next.
 			oldPath := oh.currentPath()
+			oldKey := files.keyOf(oh)
 			files.renamed(oh, newName)
+			if c.srv.leasesEnabled {
+				c.srv.leaseTable().renamed(oldKey, files.keyOf(oh))
+			}
 			c.srv.selfNotify(tr, vfs.Change{Action: vfs.ChangeRenamed, Path: newName, OldPath: oldPath, IsDir: oh.isDir})
 
 		default:
@@ -427,6 +431,7 @@ func (c *request) handleSetInfo(ctx context.Context, msg []byte, tr *tree) uint3
 			changed = FileNotifyChangeAttributes | FileNotifyChangeLastWrite | FileNotifyChangeLastAccess | FileNotifyChangeCreation
 		case wire.FileAllocationInformation, wire.FileEndOfFileInformation:
 			changed = FileNotifyChangeSize | FileNotifyChangeLastWrite
+			c.srv.dataChanged(oh)
 		}
 		if changed != 0 && !oh.stream {
 			c.srv.selfNotify(tr, vfs.Change{Action: vfs.ChangeModified, Path: oh.currentPath(), IsDir: oh.isDir, Filter: changed})

@@ -58,6 +58,9 @@ func (c *conn) maybeSealResponse(out []byte) ([]byte, bool) {
 
 func (c *conn) negotiateCapabilities() uint32 {
 	caps := wire.CapLargeMTU
+	if c.srv.leasesEnabled {
+		caps |= wire.CapLeasing
+	}
 	if c.srv.requireEnc {
 		caps |= wire.CapEncryption
 	}

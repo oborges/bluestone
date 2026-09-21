@@ -80,6 +80,13 @@ func (t *openFiles) add(key fileKey, oh *openHandle) {
 	oh.key = key
 }
 
+// keyOf is the file an open names now, following renames.
+func (t *openFiles) keyOf(oh *openHandle) fileKey {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return oh.key
+}
+
 // setDeletePending sets or clears the file's disposition on behalf of oh.
 func (t *openFiles) setDeletePending(oh *openHandle, pending bool) {
 	t.mu.Lock()

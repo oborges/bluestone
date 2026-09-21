@@ -66,6 +66,12 @@ type SMBConfig struct {
 	// 1024 for object stores that follow Amazon S3's 2 KB metadata limit.
 	// 0 selects the default.
 	MaxStreamBytes int `mapstructure:"max_stream_bytes"`
+	// Leases lets clients cache files they read: read and read-handle
+	// leases, and level II oplocks. Changes made over NFS break them, and so
+	// do changes the object refresh scanner finds made directly in the
+	// bucket; without the scanner, a client may keep serving its cached
+	// copy of a file changed behind the gateway's back until it closes it.
+	Leases bool `mapstructure:"leases"`
 	// Limits bound what clients can make the server hold. 0 means no limit.
 	Limits SMBLimits `mapstructure:"limits"`
 	// Users are the accounts allowed to connect, authenticated with NTLM.
@@ -497,6 +503,7 @@ func bindEnvOverrides(v *viper.Viper) error {
 		"smb.concurrent_requests",
 		"smb.drain_timeout",
 		"smb.max_stream_bytes",
+		"smb.leases",
 		"smb.limits.max_connections",
 		"smb.limits.max_connections_per_client",
 		"smb.limits.max_sessions_per_connection",
@@ -658,6 +665,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("smb.concurrent_requests", 0)
 	v.SetDefault("smb.drain_timeout", "30s")
 	v.SetDefault("smb.max_stream_bytes", DefaultMaxStreamBytes)
+	v.SetDefault("smb.leases", true)
 	// Limits are generous enough that no ordinary client meets them, and
 	// small enough that one client cannot exhaust the gateway.
 	v.SetDefault("smb.limits.max_connections", 256)

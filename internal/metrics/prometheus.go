@@ -137,6 +137,29 @@ var (
 		[]string{"command", "status"},
 	)
 
+	// SMB client caching: leases and level II oplocks granted, and breaks
+	// sent to take them back when a file changes.
+	smbLeasesGranted = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "smb_leases_granted_total",
+			Help: "SMB leases and oplocks granted, by kind and state",
+		},
+		[]string{"kind", "state"},
+	)
+	smbLeaseBreaks = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "smb_lease_breaks_total",
+			Help: "SMB lease and oplock breaks sent, by kind and the states broken from and to",
+		},
+		[]string{"kind", "from", "to"},
+	)
+	smbLeaseBreakTimeouts = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "smb_lease_break_timeouts_total",
+			Help: "SMB lease breaks a client did not acknowledge in time",
+		},
+	)
+
 	smbRequestDuration = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Name:    "smb_request_duration_seconds",
@@ -384,6 +407,9 @@ func Initialize() {
 		bytesWrittenTotal,
 		activeConnections,
 		smbRequestsTotal,
+		smbLeasesGranted,
+		smbLeaseBreaks,
+		smbLeaseBreakTimeouts,
 		smbRequestDuration,
 		smbConnections,
 		smbSessions,
@@ -482,6 +508,21 @@ func RequestStatus(err error) string {
 func RecordSMBRequest(command, status string, duration time.Duration) {
 	smbRequestsTotal.WithLabelValues(command, status).Inc()
 	smbRequestDuration.WithLabelValues(command).Observe(duration.Seconds())
+}
+
+// RecordSMBLeaseGranted counts caching granted to an SMB open.
+func RecordSMBLeaseGranted(kind, state string) {
+	smbLeasesGranted.WithLabelValues(kind, state).Inc()
+}
+
+// RecordSMBLeaseBreak counts a break sent to an SMB client.
+func RecordSMBLeaseBreak(kind, from, to string) {
+	smbLeaseBreaks.WithLabelValues(kind, from, to).Inc()
+}
+
+// RecordSMBLeaseBreakTimeout counts a break a client never acknowledged.
+func RecordSMBLeaseBreakTimeout() {
+	smbLeaseBreakTimeouts.Inc()
 }
 
 // SetSMBConnections records how many SMB connections are open.

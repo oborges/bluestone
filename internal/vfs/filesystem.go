@@ -1805,7 +1805,7 @@ func (f *File) Close() error {
 	}
 	if f.wrote {
 		// Watchers saw the first write; this shows them the final size.
-		defer f.changes.publish(Change{Action: ChangeModified, Path: f.path, Kind: ChangeData})
+		defer f.changes.publish(Change{Action: ChangeModified, Path: f.path, Kind: ChangeData, Protocol: f.protocol})
 	}
 	f.closed = true
 

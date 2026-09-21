@@ -39,6 +39,17 @@ type CreateRequest struct {
 	CreateDisposition    uint32
 	CreateOptions        uint32
 	Name                 []byte
+	Contexts             []CreateContext
+}
+
+// Context returns the request's create context of that name, if any.
+func (r *CreateRequest) Context(name string) ([]byte, bool) {
+	for _, c := range r.Contexts {
+		if c.Name == name {
+			return c.Data, true
+		}
+	}
+	return nil, false
 }
 
 func (r *CreateRequest) Parse(msg []byte) error {
@@ -60,6 +71,18 @@ func (r *CreateRequest) Parse(msg []byte) error {
 		return fmt.Errorf("wire: create name out of range")
 	}
 	r.Name = msg[nameOff : nameOff+nameLen]
+	ctxOff := int(binary.LittleEndian.Uint32(msg[createBody+48 : createBody+52]))
+	ctxLen := int(binary.LittleEndian.Uint32(msg[createBody+52 : createBody+56]))
+	if ctxLen > 0 {
+		if ctxOff+ctxLen > len(msg) {
+			return fmt.Errorf("wire: create contexts out of range")
+		}
+		contexts, err := parseCreateContexts(msg[ctxOff : ctxOff+ctxLen])
+		if err != nil {
+			return err
+		}
+		r.Contexts = contexts
+	}
 	return nil
 }
 
@@ -75,6 +98,7 @@ type CreateResponse struct {
 	EndOfFile      uint64
 	FileAttributes uint32
 	FileId         [16]byte
+	Contexts       []CreateContext
 }
 
 func (r *CreateResponse) Append(dst []byte) []byte {
@@ -97,6 +121,16 @@ func (r *CreateResponse) Append(dst []byte) []byte {
 	copy(b[64:80], r.FileId[:])
 	put32(b[80:84], 0)
 	put32(b[84:88], 0)
+	if len(r.Contexts) == 0 {
+		return out
+	}
+	// The contexts follow the fixed part, which ends 8-byte aligned; their
+	// offset counts from this response's SMB2 header.
+	out = out[:start+88]
+	ctxStart := len(out)
+	out = appendCreateContexts(out, r.Contexts)
+	put32(out[start+80:start+84], uint32(HeaderSize+88))
+	put32(out[start+84:start+88], uint32(len(out)-ctxStart))
 	return out
 }
 
