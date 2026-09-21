@@ -38,6 +38,11 @@ type WriteSession struct {
 	// attributesSet records that the attributes came from the staged object
 	// or a client rather than the new-session defaults.
 	attributesSet bool
+	// written records that the staged file holds bytes of its own: data a
+	// client wrote, or a staging file found on disk. Growing the file by
+	// truncation only adds zeros and does not set it; truncating to zero
+	// clears it.
+	written bool
 }
 
 // NewWriteSession creates a new write session
@@ -78,6 +83,9 @@ func NewWriteSession(manager *StagingManager, path string, stagingPath string) (
 		Mode:        0600,
 		UID:         1000,
 		GID:         1000,
+		// A staging file that already has bytes, as in recovery, is treated
+		// as data: nothing says it was never written.
+		written: stat.Size() > 0,
 	}, nil
 }
 
@@ -248,6 +256,7 @@ func (ws *WriteSession) Write(data []byte, offset int64) (int, error) {
 
 	now := time.Now()
 	ws.Dirty = true
+	ws.written = true
 	ws.LastWrite = now
 	ws.LastAccess = now
 	// Writing moves the modification time again, so a time a client set
@@ -396,6 +405,9 @@ func (ws *WriteSession) Truncate(size int64) error {
 
 	// Update size and mark as dirty
 	ws.Size = size
+	if size == 0 {
+		ws.written = false
+	}
 	ws.Dirty = true
 	ws.LastWrite = time.Now()
 	ws.LastAccess = time.Now()

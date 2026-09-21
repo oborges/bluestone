@@ -40,6 +40,9 @@ func (downObjectStore) ListObjects(context.Context, string, int) ([]*types.Objec
 	return nil, errBackendDown
 }
 func (downObjectStore) CopyObject(context.Context, string, string) error { return errBackendDown }
+func (downObjectStore) CopyObjectWithMetadata(context.Context, string, string, map[string]string) error {
+	return errBackendDown
+}
 func (downObjectStore) UpdateObjectMetadata(context.Context, string, map[string]string) error {
 	return errBackendDown
 }
@@ -93,6 +96,9 @@ func (s *switchableObjectStore) ListObjects(ctx context.Context, prefix string, 
 }
 func (s *switchableObjectStore) CopyObject(ctx context.Context, sourceKey, destKey string) error {
 	return s.current().CopyObject(ctx, sourceKey, destKey)
+}
+func (s *switchableObjectStore) CopyObjectWithMetadata(ctx context.Context, sourceKey, destKey string, metadata map[string]string) error {
+	return s.current().CopyObjectWithMetadata(ctx, sourceKey, destKey, metadata)
 }
 func (s *switchableObjectStore) UpdateObjectMetadata(ctx context.Context, key string, metadata map[string]string) error {
 	return s.current().UpdateObjectMetadata(ctx, key, metadata)

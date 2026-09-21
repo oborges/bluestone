@@ -792,6 +792,13 @@ func (s *fakeObjectStore) CopyObject(ctx context.Context, sourceKey, destKey str
 	return nil
 }
 
+func (s *fakeObjectStore) CopyObjectWithMetadata(ctx context.Context, sourceKey, destKey string, metadata map[string]string) error {
+	if err := s.CopyObject(ctx, sourceKey, destKey); err != nil {
+		return err
+	}
+	return s.UpdateObjectMetadata(ctx, destKey, metadata)
+}
+
 func (s *fakeObjectStore) UpdateObjectMetadata(ctx context.Context, key string, metadata map[string]string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

@@ -340,10 +340,12 @@ part in it yet.
 
 Copying a file inside the share is done by the gateway: the client asks for
 a server-side copy and the bytes never travel to it and back. When the whole
-file is being copied and neither side is staged, the gateway goes further and
-copies the object inside the bucket, so no bytes move at all. A copy whose
-destination the client created first, which is what Windows Explorer does,
-is staged and so is copied by the gateway rather than inside the bucket.
+file is being copied, the gateway goes further and copies the object inside
+the bucket, so no bytes move at all. That includes the usual Windows copy,
+which creates the destination and sets its length before copying: nothing
+has been written to it, so the gateway drops the empty staged file and
+copies the object in its place. A copy from a file with staged changes, or
+into one something has written to, is copied by the gateway instead.
 
 Windows asks for a file's security descriptor to show its Security tab, and
 some applications ask on open. The gateway answers with everyone having full
