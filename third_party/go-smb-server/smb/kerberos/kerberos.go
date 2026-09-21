@@ -2,17 +2,28 @@ package kerberos
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log"
 	"time"
 
 	goforkasn1 "github.com/jcmturner/gofork/encoding/asn1"
+	"github.com/jcmturner/gokrb5/v8/asn1tools"
+	"github.com/jcmturner/gokrb5/v8/crypto"
 	"github.com/jcmturner/gokrb5/v8/gssapi"
+	"github.com/jcmturner/gokrb5/v8/iana"
+	"github.com/jcmturner/gokrb5/v8/iana/asnAppTag"
+	"github.com/jcmturner/gokrb5/v8/iana/chksumtype"
+	"github.com/jcmturner/gokrb5/v8/iana/flags"
+	"github.com/jcmturner/gokrb5/v8/iana/keyusage"
+	"github.com/jcmturner/gokrb5/v8/iana/msgtype"
 	"github.com/jcmturner/gokrb5/v8/keytab"
 	"github.com/jcmturner/gokrb5/v8/messages"
 	"github.com/jcmturner/gokrb5/v8/service"
 	"github.com/jcmturner/gokrb5/v8/spnego"
+	"github.com/jcmturner/gokrb5/v8/types"
 
 	"github.com/sonroyaalmerol/go-smb-server/smb/auth"
 )
@@ -38,6 +49,34 @@ func WithLogger(l *log.Logger) Option {
 
 func WithoutPAC() Option {
 	return func(c *config) { c.noPAC = true }
+}
+
+// LoadKeytab reads a keytab file, as ktpass or "net ads keytab" writes it.
+func LoadKeytab(path string) (*keytab.Keytab, error) {
+	kt, err := keytab.Load(path)
+	if err != nil {
+		return nil, fmt.Errorf("kerberos: load keytab %s: %w", path, err)
+	}
+	if len(kt.Entries) == 0 {
+		return nil, fmt.Errorf("kerberos: keytab %s has no keys", path)
+	}
+	return kt, nil
+}
+
+// Principals lists the service principals a keytab holds keys for, as
+// "cifs/host.example.com@EXAMPLE.COM", for logging what the server answers
+// to.
+func Principals(kt *keytab.Keytab) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, e := range kt.Entries {
+		name := e.Principal.String()
+		if !seen[name] {
+			seen[name] = true
+			out = append(out, name)
+		}
+	}
+	return out
 }
 
 func NewServer(kt *keytab.Keytab, opts ...Option) auth.Factory {
@@ -69,7 +108,7 @@ func (a *Authenticator) Accept(_ context.Context, token []byte) (auth.AcceptResu
 		return auth.AcceptResult{}, fmt.Errorf("kerberos: no service keytab configured")
 	}
 
-	mech, err := extractMechToken(token)
+	mech, mechOID, err := extractMechToken(token)
 	if err != nil {
 		return auth.AcceptResult{}, auth.ErrLogonFailed
 	}
@@ -87,20 +126,32 @@ func (a *Authenticator) Accept(_ context.Context, token []byte) (auth.AcceptResu
 		return auth.AcceptResult{}, auth.ErrLogonFailed
 	}
 
-	key := mt.APReq.Ticket.DecryptedEncPart.Key
+	ticketKey := mt.APReq.Ticket.DecryptedEncPart.Key
+	key := ticketKey
 	if sub := mt.APReq.Authenticator.SubKey; len(sub.KeyValue) > 0 {
 		key = sub
 	}
 
 	ident := &auth.Identity{
-		Username: creds.UserName(),
-		Domain:   creds.Domain(),
+		Username:  creds.UserName(),
+		Domain:    creds.Domain(),
+		Mechanism: auth.MechanismKerberos,
 	}
-	if groups := extractGroups(&mt.APReq, a.settings, a.wantPAC); len(groups) > 0 {
-		ident.Groups = groups
+	if a.wantPAC {
+		addPACIdentity(ident, &mt.APReq, a.settings)
 	}
 
-	out, err := acceptCompletedToken()
+	// A client asking for mutual authentication, as Windows always does,
+	// gets an AP-REP proving the server could read its ticket; without one
+	// it fails the session setup.
+	var apRep []byte
+	if mutualRequested(&mt.APReq) {
+		apRep, err = buildAPRep(&mt.APReq, ticketKey)
+		if err != nil {
+			return auth.AcceptResult{}, fmt.Errorf("kerberos: build AP-REP: %w", err)
+		}
+	}
+	out, err := acceptCompletedToken(mechOID, apRep)
 	if err != nil {
 		return auth.AcceptResult{}, fmt.Errorf("kerberos: marshal response token: %w", err)
 	}
@@ -113,45 +164,128 @@ func (a *Authenticator) Accept(_ context.Context, token []byte) (auth.AcceptResu
 	}, nil
 }
 
-func extractMechToken(token []byte) ([]byte, error) {
+// Kerberos mechanism OIDs: the standard one, and the one Windows lists
+// first, which Microsoft once encoded wrongly and has kept (MS-KILE).
+var (
+	oidKRB5       = gssapi.OIDKRB5.OID()
+	oidMSKRB5     = gssapi.OIDMSLegacyKRB5.OID()
+	oidKRB5Token  = goforkasn1.ObjectIdentifier{1, 2, 840, 113554, 1, 2, 2}
+	tokIDKRBAPRep = []byte{0x02, 0x00}
+)
+
+// extractMechToken returns the Kerberos token inside a session setup's
+// security buffer, and the mechanism the client offered it as, which the
+// reply names back.
+func extractMechToken(token []byte) ([]byte, goforkasn1.ObjectIdentifier, error) {
 	if len(token) == 0 {
-		return nil, errors.New("kerberos: empty security buffer")
+		return nil, nil, errors.New("kerberos: empty security buffer")
 	}
 	var st spnego.SPNEGOToken
 	if err := st.Unmarshal(token); err == nil {
 		if st.Init && len(st.NegTokenInit.MechTokenBytes) > 0 {
-			return st.NegTokenInit.MechTokenBytes, nil
+			oid := oidKRB5
+			if types := st.NegTokenInit.MechTypes; len(types) > 0 && types[0].Equal(oidMSKRB5) {
+				oid = oidMSKRB5
+			}
+			return st.NegTokenInit.MechTokenBytes, oid, nil
 		}
 		if st.Resp && len(st.NegTokenResp.ResponseToken) > 0 {
-			return st.NegTokenResp.ResponseToken, nil
+			return st.NegTokenResp.ResponseToken, oidKRB5, nil
 		}
-		return nil, errors.New("kerberos: SPNEGO token carries no mechanism token")
+		return nil, nil, errors.New("kerberos: SPNEGO token carries no mechanism token")
 	}
 	var mt spnego.KRB5Token
 	if err := mt.Unmarshal(token); err != nil {
-		return nil, errors.New("kerberos: token is neither SPNEGO nor KRB5")
+		return nil, nil, errors.New("kerberos: token is neither SPNEGO nor KRB5")
 	}
-	return token, nil
+	return token, nil, nil
 }
 
-func acceptCompletedToken() ([]byte, error) {
+// mutualRequested reports whether the client asked for mutual
+// authentication, in the AP-REQ's options or its GSS-API checksum flags.
+func mutualRequested(apreq *messages.APReq) bool {
+	if types.IsFlagSet(&apreq.APOptions, flags.APOptionMutualRequired) {
+		return true
+	}
+	cksum := apreq.Authenticator.Cksum
+	if cksum.CksumType == chksumtype.GSSAPI && len(cksum.Checksum) >= 24 {
+		return binary.LittleEndian.Uint32(cksum.Checksum[20:24])&uint32(gssapi.ContextFlagMutual) != 0
+	}
+	return false
+}
+
+// buildAPRep builds the GSS-API KRB5 token carrying an AP-REP for apreq
+// (RFC 4120 section 5.5.2, RFC 4121 section 4.1): the client's own time,
+// encrypted in the ticket's session key. No acceptor subkey is sent, so the
+// session key stays the client's subkey, or the ticket's.
+func buildAPRep(apreq *messages.APReq, ticketKey types.EncryptionKey) ([]byte, error) {
+	var seq [4]byte
+	if _, err := rand.Read(seq[:]); err != nil {
+		return nil, err
+	}
+	encPart := messages.EncAPRepPart{
+		CTime:          apreq.Authenticator.CTime,
+		Cusec:          apreq.Authenticator.Cusec,
+		SequenceNumber: int64(binary.BigEndian.Uint32(seq[:])&0x3fffffff) + 1,
+	}
+	plain, err := goforkasn1.Marshal(encPart)
+	if err != nil {
+		return nil, err
+	}
+	plain = asn1tools.AddASNAppTag(plain, asnAppTag.EncAPRepPart)
+	enc, err := crypto.GetEncryptedData(plain, ticketKey, keyusage.AP_REP_ENCPART, 0)
+	if err != nil {
+		return nil, err
+	}
+	rep, err := goforkasn1.Marshal(messages.APRep{PVNO: iana.PVNO, MsgType: msgtype.KRB_AP_REP, EncPart: enc})
+	if err != nil {
+		return nil, err
+	}
+	rep = asn1tools.AddASNAppTag(rep, asnAppTag.APREP)
+	b, err := goforkasn1.Marshal(oidKRB5Token)
+	if err != nil {
+		return nil, err
+	}
+	b = append(b, tokIDKRBAPRep...)
+	b = append(b, rep...)
+	return asn1tools.AddASNAppTag(b, 0), nil
+}
+
+func acceptCompletedToken(mech goforkasn1.ObjectIdentifier, responseToken []byte) ([]byte, error) {
+	if mech == nil {
+		mech = oidKRB5
+	}
 	resp := spnego.NegTokenResp{
 		NegState:      goforkasn1.Enumerated(spnego.NegStateAcceptCompleted),
-		SupportedMech: gssapi.OIDKRB5.OID(),
+		SupportedMech: mech,
+		ResponseToken: responseToken,
 	}
 	return resp.Marshal()
 }
 
-func extractGroups(apreq *messages.APReq, settings *service.Settings, wantPAC bool) []string {
-	if !wantPAC || settings.Keytab == nil {
-		return nil
-	}
+// addPACIdentity fills in what the ticket's PAC says about the client: its
+// SID, its groups, and its domain's NetBIOS name. A ticket without a PAC,
+// or with one whose server signature does not verify, adds nothing.
+func addPACIdentity(ident *auth.Identity, apreq *messages.APReq, settings *service.Settings) {
 	isPAC, pac, err := apreq.Ticket.GetPACType(settings.Keytab, settings.KeytabPrincipal(), settings.Logger())
-	if !isPAC || err != nil {
-		return nil
+	if !isPAC || err != nil || pac.KerbValidationInfo == nil {
+		return
 	}
-	if sids := pac.KerbValidationInfo.GetGroupMembershipSIDs(); len(sids) > 0 {
-		return append([]string(nil), sids...)
+	info := pac.KerbValidationInfo
+	domainSID := info.LogonDomainID.String()
+	if info.UserID != 0 {
+		ident.SID = fmt.Sprintf("%s-%d", domainSID, info.UserID)
 	}
-	return nil
+	if info.PrimaryGroupID != 0 {
+		ident.PrimaryGroup = fmt.Sprintf("%s-%d", domainSID, info.PrimaryGroupID)
+	}
+	if name := info.LogonDomainName.String(); name != "" {
+		ident.Domain = name
+	}
+	if name := info.EffectiveName.String(); name != "" {
+		ident.Username = name
+	}
+	if sids := info.GetGroupMembershipSIDs(); len(sids) > 0 {
+		ident.Groups = append([]string(nil), sids...)
+	}
 }

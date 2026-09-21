@@ -82,9 +82,83 @@ type SMBConfig struct {
 	MaxDialect string `mapstructure:"max_dialect"`
 	// Limits bound what clients can make the server hold. 0 means no limit.
 	Limits SMBLimits `mapstructure:"limits"`
-	// Users are the accounts allowed to connect, authenticated with NTLM.
+	// Users are local accounts, authenticated with NTLM.
 	Users []SMBUser `mapstructure:"users"`
+	// Kerberos lets Active Directory users sign in with their own
+	// credentials, with no local account.
+	Kerberos SMBKerberos `mapstructure:"kerberos"`
+	// IDMap maps the users who create files to the uid and gid the gateway
+	// stores for them, which NFS clients see.
+	IDMap SMBIDMap `mapstructure:"id_map"`
+	// Shares are the shares served, each a directory of the bucket with
+	// its own access rules. Without any, one share named ShareName serves
+	// the whole bucket to every user.
+	Shares []SMBShare `mapstructure:"shares"`
 }
+
+// SMBKerberos configures Kerberos sign-in for Active Directory users.
+type SMBKerberos struct {
+	// Keytab is the keytab holding the key of the gateway's service
+	// principal, cifs/<host name> for every name clients use, as ktpass or
+	// "net ads keytab" writes it. Setting it enables Kerberos.
+	Keytab string `mapstructure:"keytab"`
+	// MaxClockSkew is how far a client's clock may be from the gateway's.
+	MaxClockSkew string `mapstructure:"max_clock_skew"`
+}
+
+// Enabled reports whether Kerberos sign-in is configured.
+func (k *SMBKerberos) Enabled() bool { return strings.TrimSpace(k.Keytab) != "" }
+
+// GetMaxClockSkew returns the parsed clock skew allowance.
+func (k *SMBKerberos) GetMaxClockSkew() (time.Duration, error) {
+	if strings.TrimSpace(k.MaxClockSkew) == "" {
+		return 5 * time.Minute, nil
+	}
+	return time.ParseDuration(k.MaxClockSkew)
+}
+
+// SMBIDMap maps domain accounts to uids and gids by their relative ID, the
+// way Samba's idmap_rid does: an account's uid (or a group's gid) is Base
+// plus the last part of its SID. Local accounts use the uid and gid they are
+// configured with.
+type SMBIDMap struct {
+	// DomainSID is the Active Directory domain's SID, as
+	// "Get-ADDomain | select DomainSID" shows it. Empty maps no domain
+	// accounts: files they create keep the default owner.
+	DomainSID string `mapstructure:"domain_sid"`
+	// Base is the uid and gid of relative ID 0. Local accounts' uids and
+	// gids must be below it.
+	Base int `mapstructure:"base"`
+}
+
+// SMBShare is one share: a directory of the bucket, and who may use it.
+//
+// Users are named as in Windows: "DOMAIN\user" or "user" for an account,
+// "@group" for a group of local accounts, or a SID ("S-1-5-21-...") for a
+// domain account or group, as "Get-ADGroup <name>" shows it. Domain groups
+// can only be named by SID.
+type SMBShare struct {
+	// Name is the share's name, as in \\host\name.
+	Name string `mapstructure:"name"`
+	// Path is the directory of the bucket the share serves; "/" (the
+	// default) serves the whole bucket. Shares may not overlap.
+	Path string `mapstructure:"path"`
+	// ReadOnly lets users read the share but change nothing, except those
+	// in WriteList.
+	ReadOnly bool `mapstructure:"read_only"`
+	// ValidUsers are the only users who may use the share; empty lets every
+	// user who can sign in.
+	ValidUsers []string `mapstructure:"valid_users"`
+	// ReadList are users who may only read, even when the share is not
+	// read-only, and WriteList users who may write even when it is.
+	// WriteList wins for a user in both.
+	ReadList  []string `mapstructure:"read_list"`
+	WriteList []string `mapstructure:"write_list"`
+}
+
+// DefaultIDMapBase is the uid and gid of a domain's relative ID 0: domain
+// accounts' ids start well above those of local accounts.
+const DefaultIDMapBase = 100000
 
 // DefaultMaxStreamBytes is the default cap on a file's named streams, and
 // MaxStreamBytesLimit the most IBM COS metadata can hold beside the
@@ -133,6 +207,12 @@ type SMBUser struct {
 	// but the password itself is not written down and cannot be reused
 	// against other systems where the user picked the same one.
 	NTLMHash string `mapstructure:"ntlm_hash"`
+	// UID and GID are the owner the gateway records for files the account
+	// creates; 0 leaves the default owner.
+	UID int `mapstructure:"uid"`
+	GID int `mapstructure:"gid"`
+	// Groups name the account's groups, for "@group" in share access lists.
+	Groups []string `mapstructure:"groups"`
 }
 
 // NTHashBytes returns the configured NT hash, or nil when the account uses a
@@ -514,6 +594,10 @@ func bindEnvOverrides(v *viper.Viper) error {
 		"smb.leases",
 		"smb.durable_handles",
 		"smb.max_dialect",
+		"smb.kerberos.keytab",
+		"smb.kerberos.max_clock_skew",
+		"smb.id_map.domain_sid",
+		"smb.id_map.base",
 		"smb.limits.max_connections",
 		"smb.limits.max_connections_per_client",
 		"smb.limits.max_sessions_per_connection",
@@ -678,6 +762,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("smb.leases", true)
 	v.SetDefault("smb.durable_handles", true)
 	v.SetDefault("smb.max_dialect", "3.1.1")
+	v.SetDefault("smb.kerberos.max_clock_skew", "5m")
+	v.SetDefault("smb.id_map.base", DefaultIDMapBase)
 	// Limits are generous enough that no ordinary client meets them, and
 	// small enough that one client cannot exhaust the gateway.
 	v.SetDefault("smb.limits.max_connections", 256)

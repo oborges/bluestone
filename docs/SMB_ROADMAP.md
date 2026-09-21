@@ -146,6 +146,22 @@ network interruption with its handles and locks intact.
 - Per-share access control and read-only shares.
 - Mapping Windows identities to the metadata the gateway stores.
 
+Done (`windows-domain-test.ps1`), against a Windows Server 2025 domain
+controller with a gateway that had no local accounts:
+- A domain user reached a share only their group was admitted to, with a
+  Kerberos ticket, both with credentials given and signed in at the
+  machine with none asked for.
+- A user outside the group was refused it. On a read-only share they could
+  read but not write, delete or create, while a user on its write list
+  could.
+- Files record their creator: Windows showed the domain account as owner
+  after a gateway restart, from the uid kept in the object's metadata.
+  NFS clients do not see stored owners yet: the NFS server reports every
+  file as root's, which predates this phase.
+- Local accounts keep working alongside over NTLM, and Windows, macOS, the
+  Linux kernel client and `smbclient` pass their suites with Kerberos
+  advertised.
+
 **Done when:** a domain-joined Windows client mounts with its own credentials
 and no local user exists in the config.
 

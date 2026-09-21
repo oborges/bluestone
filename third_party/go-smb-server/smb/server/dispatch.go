@@ -11,7 +11,6 @@ import (
 
 	"github.com/sonroyaalmerol/go-smb-server/smb/auth"
 	"github.com/sonroyaalmerol/go-smb-server/smb/encryption"
-	"github.com/sonroyaalmerol/go-smb-server/smb/ntlmssp"
 	"github.com/sonroyaalmerol/go-smb-server/smb/signing"
 	"github.com/sonroyaalmerol/go-smb-server/smb/vfs"
 	"github.com/sonroyaalmerol/go-smb-server/smb/wire"
@@ -54,12 +53,18 @@ func (c *request) dispatch(ctx context.Context, msg []byte, hdr *wire.Header, la
 	case wire.CmdRead:
 		return c.handleRead(ctx, msg, tr)
 	case wire.CmdWrite:
+		if tr.readOnly {
+			return c.errBody(wire.StatusAccessDenied)
+		}
 		return c.handleWrite(ctx, msg, tr)
 	case wire.CmdQueryDirectory:
 		return c.handleQueryDirectory(ctx, msg, tr)
 	case wire.CmdQueryInfo:
 		return c.handleQueryInfo(ctx, msg, tr)
 	case wire.CmdSetInfo:
+		if tr.readOnly {
+			return c.errBody(wire.StatusAccessDenied)
+		}
 		return c.handleSetInfo(ctx, msg, tr)
 	case wire.CmdFlush:
 		return c.handleFlush(ctx, msg, tr)
@@ -123,7 +128,7 @@ func (c *request) handleNegotiate(msg []byte, hdr *wire.Header) uint32 {
 		MaxTransactSize: c.srv.maxTransact,
 		MaxReadSize:     c.srv.maxRead,
 		MaxWriteSize:    c.srv.maxWrite,
-		SecurityBuffer:  ntlmssp.NegTokenInitNTLM(),
+		SecurityBuffer:  c.srv.negotiateHintToken(),
 	}
 	if dialect == wire.DialectSMB311 {
 		contexts, status := c.negotiate311(&req, msg)
@@ -262,6 +267,8 @@ func (c *request) handleSessionSetup(ctx context.Context, msg []byte, hdr *wire.
 		}
 		sess.identity = result.Identity
 		sess.authenticated = true
+		c.log.Debug("session established", "user", result.Identity.Username, "domain", result.Identity.Domain,
+			"mechanism", result.Identity.Mechanism, "sid", result.Identity.SID, "groups", len(result.Identity.Groups))
 	}
 	c.out = ssr.Append(c.out)
 	if sess.authenticated {
@@ -300,12 +307,19 @@ func (c *request) handleTreeConnect(msg []byte, hdr *wire.Header, sess *session)
 	if max := c.srv.limits.TreesPerSession; max > 0 && sess.treeCount() >= max {
 		return c.errBody(wire.StatusInsufficientResources)
 	}
+	access := c.srv.treeAccess(sess, sh.Name())
+	if access == ShareDenied {
+		c.log.Debug("share access denied", "share", sh.Name(), "user", sessionUser(sess))
+		return c.errBody(wire.StatusAccessDenied)
+	}
+	readOnly := access == ShareReadOnly
 
 	treeID := sess.nextTreeID
 	sess.nextTreeID++
 	sess.addTree(treeID, &tree{
-		share: sh,
-		opens: make(map[[16]byte]*openHandle),
+		share:    sh,
+		readOnly: readOnly,
+		opens:    make(map[[16]byte]*openHandle),
 	})
 	hdr.TreeId = treeID
 
@@ -313,7 +327,12 @@ func (c *request) handleTreeConnect(msg []byte, hdr *wire.Header, sess *session)
 		ShareType:     wire.ShareTypeDisk,
 		ShareFlags:    0x00000030,
 		Capabilities:  0,
-		MaximalAccess: 0x001f01ff,
+		MaximalAccess: maximalAccessFull,
+	}
+	if readOnly {
+		// Windows shows the share as read-only from this, and does not
+		// offer to change what it cannot.
+		resp.MaximalAccess = maximalAccessRead
 	}
 	c.out = resp.Append(c.out)
 	return wire.StatusSuccess
@@ -365,7 +384,7 @@ func (c *conn) closeAllOpens(ctx context.Context, tr *tree, connectionLost bool)
 			c.srv.preserve(tr.share, oh)
 			continue
 		}
-		c.srv.lockTable().ReleaseOwner(lockOwner(oh.sessionID, oh.fileId))
+		c.srv.lockerFor(tr.share).ReleaseOwner(lockOwner(oh.sessionID, oh.fileId))
 		c.srv.resumeKeyTable().release(oh)
 		c.srv.leaseTable().release(oh)
 		c.srv.endWatch(oh)
@@ -457,6 +476,18 @@ func (c *request) handleCreate(ctx context.Context, msg []byte, hdr *wire.Header
 		// (MS-SMB2 section 3.3.5.9).
 		return c.errBody(wire.StatusAccessDenied)
 	}
+	// On a read-only share, only opens that change nothing get through.
+	// OPEN_IF becomes OPEN, since creating the file would change the
+	// share: a file that is not there is refused rather than created.
+	readOnlyOpenIf := false
+	if tr.readOnly {
+		if status := readOnlyCreate(&req, deleteOnClose); status != wire.StatusSuccess {
+			return c.errBody(status)
+		}
+		if req.CreateDisposition == vfs.DispositionOpenIf {
+			req.CreateDisposition, readOnlyOpenIf = vfs.DispositionOpen, true
+		}
+	}
 	key := keyFor(tr.share.Name(), name)
 	files := c.srv.fileTable()
 	if files.deletePending(key) || (stream != "" && files.deletePending(keyFor(tr.share.Name(), base))) {
@@ -487,6 +518,7 @@ func (c *request) handleCreate(ctx context.Context, msg []byte, hdr *wire.Header
 		DesiredAccess: req.DesiredAccess,
 		ShareAccess:   req.ShareAccess,
 		DeleteOnClose: deleteOnClose,
+		User:          sessionIdentity(sess),
 	}
 	// A backend that does not report changes has them reported for it,
 	// which needs to know whether this open creates the file.
@@ -497,6 +529,19 @@ func (c *request) handleCreate(ctx context.Context, msg []byte, hdr *wire.Header
 			existed = true
 			_ = probe.Close(ctx)
 		}
+	}
+	if tr.readOnly && opts.CreateDir {
+		// Not every backend refuses to create a directory it is asked to
+		// open, so a read-only share checks that it exists first.
+		probe, err := backend.Open(ctx, vfs.OpenOptions{Path: base, Disposition: vfs.DispositionOpen, User: opts.User})
+		if err != nil {
+			status := osErrToStatus(err)
+			if readOnlyOpenIf && status == wire.StatusObjectNameNotFound {
+				status = wire.StatusAccessDenied
+			}
+			return c.errBody(status)
+		}
+		_ = probe.Close(ctx)
 	}
 	var h vfs.Handle
 	if stream != "" {
@@ -517,7 +562,11 @@ func (c *request) handleCreate(ctx context.Context, msg []byte, hdr *wire.Header
 		}
 	}
 	if err != nil {
-		return c.errBody(osErrToStatus(err))
+		status := osErrToStatus(err)
+		if readOnlyOpenIf && status == wire.StatusObjectNameNotFound {
+			status = wire.StatusAccessDenied
+		}
+		return c.errBody(status)
 	}
 	fi, err := h.Stat(ctx)
 	if err != nil {
@@ -640,6 +689,9 @@ func (c *request) handleClose(ctx context.Context, msg []byte, tr *tree) uint32 
 		return c.errBody(osErrToStatus(err))
 	}
 	tr.removeOpen(req.FileId)
+	// Closing an open releases the byte-range locks it holds (MS-SMB2
+	// section 3.3.5.10); they used to stay until the session went.
+	c.srv.lockerFor(tr.share).ReleaseOwner(lockOwner(oh.sessionID, oh.fileId))
 	c.srv.leaseTable().release(oh)
 	c.srv.resumeKeyTable().release(oh)
 	c.srv.endWatch(oh)
@@ -904,9 +956,10 @@ func (c *request) establishKeys(sess *session, sessionKey []byte) uint32 {
 		}
 		signKey, outKey, inKey = encryption.Keys311(sessionKey, sess.preauth, keyLen)
 	} else {
-		signKey = signing.DeriveSigningKey(sessionKey)
-		outKey = encryption.DeriveServerEncryptionKey(sessionKey)
-		inKey = encryption.DeriveServerDecryptionKey(sessionKey)
+		key := encryption.SessionKey(sessionKey)
+		signKey = signing.DeriveSigningKey(key)
+		outKey = encryption.DeriveServerEncryptionKey(key)
+		inKey = encryption.DeriveServerDecryptionKey(key)
 		if c.negCaps&wire.CapEncryption == 0 {
 			cipherID = 0
 		}

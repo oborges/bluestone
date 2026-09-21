@@ -140,12 +140,28 @@ func (g *AESGCM) Open(transform []byte) ([]byte, error) {
 
 // Keys311 derives an SMB 3.1.1 session's keys (MS-SMB2 section 3.3.5.5.3):
 // the signing key, and the keys for what the server sends and receives,
-// from the session key and the session's pre-authentication integrity hash.
-func Keys311(sessionKey, preauthHash []byte, cipherKeyLen int) (signing, serverOut, serverIn []byte) {
+// from the key authentication produced and the session's pre-authentication
+// integrity hash. The signing key, and 128-bit cipher keys, come from its
+// first 16 bytes (Session.SessionKey); 256-bit cipher keys come from all of
+// it (Session.FullSessionKey), which is longer when Kerberos agreed on an
+// AES-256 key.
+func Keys311(fullSessionKey, preauthHash []byte, cipherKeyLen int) (signing, serverOut, serverIn []byte) {
+	sessionKey := SessionKey(fullSessionKey)
+	cipherKey := sessionKey
+	if cipherKeyLen == 32 {
+		cipherKey = fullSessionKey
+	}
 	signing = kdf(sessionKey, []byte("SMBSigningKey\x00"), preauthHash, 16)
-	serverOut = kdf(sessionKey, []byte("SMBS2CCipherKey\x00"), preauthHash, cipherKeyLen)
-	serverIn = kdf(sessionKey, []byte("SMBC2SCipherKey\x00"), preauthHash, cipherKeyLen)
+	serverOut = kdf(cipherKey, []byte("SMBS2CCipherKey\x00"), preauthHash, cipherKeyLen)
+	serverIn = kdf(cipherKey, []byte("SMBC2SCipherKey\x00"), preauthHash, cipherKeyLen)
 	return signing, serverOut, serverIn
+}
+
+// SessionKey is an SMB session's key: the first 16 bytes of the key
+// authentication produced (MS-SMB2 section 3.3.5.5.3). NTLM keys are 16
+// bytes already; a Kerberos AES-256 key is 32.
+func SessionKey(fullSessionKey []byte) []byte {
+	return fullSessionKey[:min(16, len(fullSessionKey))]
 }
 
 // kdf is SP800-108 counter mode with HMAC-SHA256, producing length bytes.

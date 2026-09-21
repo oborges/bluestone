@@ -5,12 +5,29 @@ import (
 	"errors"
 )
 
+// Identity is who a session authenticated as.
 type Identity struct {
+	// Username is the account name, and Domain its domain: the NetBIOS
+	// name for a domain account, or whatever an NTLM client sent.
 	Username string
 	Domain   string
-	SID      string
-	Groups   []string
+	// SID is the account's security identifier, when authentication
+	// carried one (a Kerberos ticket's PAC). PrimaryGroup is the SID of its
+	// primary group, and Groups the SIDs of every group it belongs to.
+	SID          string
+	PrimaryGroup string
+	Groups       []string
+	// Mechanism is how the session authenticated: MechanismNTLM or
+	// MechanismKerberos. An NTLM client names its own domain, which proves
+	// nothing; a Kerberos ticket's domain was vouched for by its KDC.
+	Mechanism string
 }
+
+// Authentication mechanisms an Identity can come from.
+const (
+	MechanismNTLM     = "ntlm"
+	MechanismKerberos = "kerberos"
+)
 
 type AcceptResult struct {
 	OutputToken []byte

@@ -409,32 +409,50 @@ func main() {
 			logging.Fatal("Invalid smb.limits.auth_max_block", zap.Error(err))
 		}
 		users := make([]smb.User, 0, len(cfg.SMB.Users))
+		idMap := &smb.IDMap{DomainSID: cfg.SMB.IDMap.DomainSID, Base: cfg.SMB.IDMap.Base, Local: map[string]smb.LocalIDs{}}
 		for _, user := range cfg.SMB.Users {
 			hash, err := user.NTHashBytes()
 			if err != nil {
 				logging.Fatal("Invalid smb user", zap.String("username", user.Username), zap.Error(err))
 			}
-			users = append(users, smb.User{Name: user.Username, Password: user.Password, NTLMHash: hash})
+			users = append(users, smb.User{Name: user.Username, Password: user.Password, NTLMHash: hash,
+				UID: user.UID, GID: user.GID, Groups: user.Groups})
+			if user.UID != 0 {
+				idMap.Local[strings.ToLower(user.Username)] = smb.LocalIDs{UID: user.UID, GID: user.GID}
+			}
+		}
+		shares := make([]smb.ShareOptions, 0, len(cfg.SMB.Shares))
+		for _, share := range cfg.SMB.Shares {
+			shares = append(shares, smb.ShareOptions{Name: share.Name, Path: config.SharePath(share.Path),
+				ReadOnly: share.ReadOnly, ValidUsers: share.ValidUsers, ReadList: share.ReadList, WriteList: share.WriteList})
+		}
+		clockSkew, err := cfg.SMB.Kerberos.GetMaxClockSkew()
+		if err != nil {
+			logging.Fatal("Invalid smb.kerberos.max_clock_skew", zap.Error(err))
 		}
 		if plaintext := cfg.SMB.UsesPlaintextPasswords(); len(plaintext) > 0 {
 			logging.Warn("SMB accounts are configured with passwords in clear; store their NT hash in ntlm_hash instead (bluestone -smb-hash)",
 				zap.Strings("users", plaintext))
 		}
 		smbServer, err = smb.NewServer(smbFilesystem, smb.ServerOptions{
-			Address:            fmt.Sprintf(":%d", cfg.SMB.Port),
-			ShareName:          cfg.SMB.ShareName,
-			Domain:             cfg.SMB.Domain,
-			Users:              users,
-			AllowedClients:     cfg.Server.AllowedClients,
-			EncryptionRequired: cfg.SMB.EncryptionRequired,
-			Opens:              opens,
-			Locks:              locks,
-			ConcurrentRequests: cfg.SMB.ConcurrentRequests,
-			DrainTimeout:       drainTimeout,
-			MaxStreamBytes:     cfg.SMB.MaxStreamBytes,
-			Leases:             cfg.SMB.Leases,
-			DurableHandles:     cfg.SMB.DurableHandles,
-			MaxDialect:         cfg.SMB.MaxDialect,
+			Address:              fmt.Sprintf(":%d", cfg.SMB.Port),
+			ShareName:            cfg.SMB.ShareName,
+			Shares:               shares,
+			Domain:               cfg.SMB.Domain,
+			Users:                users,
+			KerberosKeytab:       cfg.SMB.Kerberos.Keytab,
+			KerberosMaxClockSkew: clockSkew,
+			IDMap:                idMap,
+			AllowedClients:       cfg.Server.AllowedClients,
+			EncryptionRequired:   cfg.SMB.EncryptionRequired,
+			Opens:                opens,
+			Locks:                locks,
+			ConcurrentRequests:   cfg.SMB.ConcurrentRequests,
+			DrainTimeout:         drainTimeout,
+			MaxStreamBytes:       cfg.SMB.MaxStreamBytes,
+			Leases:               cfg.SMB.Leases,
+			DurableHandles:       cfg.SMB.DurableHandles,
+			MaxDialect:           cfg.SMB.MaxDialect,
 			Limits: smb.Limits{
 				Connections:           cfg.SMB.Limits.MaxConnections,
 				ConnectionsPerClient:  cfg.SMB.Limits.MaxConnectionsPerClient,

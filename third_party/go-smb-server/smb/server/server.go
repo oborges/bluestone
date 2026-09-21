@@ -35,6 +35,11 @@ const (
 type Server struct {
 	addr        string
 	authFactory auth.Factory
+	// negotiateHint advertises the authentication mechanisms; nil means NTLM.
+	negotiateHint []byte
+	// shareAccess decides what a user may do on a share; nil gives full
+	// access.
+	shareAccess func(id *auth.Identity, share string) ShareAccess
 	shares      []vfs.Share
 	shareByName map[string]vfs.Share
 	dialect     uint16
@@ -79,6 +84,14 @@ type Option func(*Server)
 func WithAddr(addr string) Option { return func(s *Server) { s.addr = addr } }
 
 func WithAuth(f auth.Factory) Option { return func(s *Server) { s.authFactory = f } }
+
+// WithNegotiateHint sets the SPNEGO token the NEGOTIATE response carries to
+// advertise the server's authentication mechanisms, such as
+// spnego.NegTokenInit(spnego.OIDMSKRB5, spnego.OIDKRB5, spnego.OIDNTLM) for a
+// server that takes Kerberos. The default advertises NTLM alone.
+func WithNegotiateHint(token []byte) Option {
+	return func(s *Server) { s.negotiateHint = token }
+}
 
 func WithShares(shares ...vfs.Share) Option {
 	return func(s *Server) { s.shares = append(s.shares, shares...) }
@@ -330,10 +343,12 @@ type session struct {
 }
 
 type tree struct {
-	share  vfs.Share
-	mu     sync.RWMutex
-	opens  map[[16]byte]*openHandle
-	nextID uint64
+	share vfs.Share
+	// readOnly is set when the session's user may only read the share.
+	readOnly bool
+	mu       sync.RWMutex
+	opens    map[[16]byte]*openHandle
+	nextID   uint64
 }
 
 // open returns an open handle by id.
@@ -645,7 +660,7 @@ func (c *request) replyWildcardNegotiate() {
 		MaxTransactSize: c.srv.maxTransact,
 		MaxReadSize:     c.srv.maxRead,
 		MaxWriteSize:    c.srv.maxWrite,
-		SecurityBuffer:  ntlmssp.NegTokenInitNTLM(),
+		SecurityBuffer:  c.srv.negotiateHintToken(),
 	}
 	c.out = resp.Append(c.out)
 }
@@ -1124,6 +1139,15 @@ func preauthUpdate(hash, msg []byte) []byte {
 	sha.Write(hash)
 	sha.Write(msg)
 	return sha.Sum(nil)
+}
+
+// negotiateHintToken is the token advertising the server's authentication
+// mechanisms in NEGOTIATE responses.
+func (s *Server) negotiateHintToken() []byte {
+	if s.negotiateHint != nil {
+		return s.negotiateHint
+	}
+	return ntlmssp.NegTokenInitNTLM()
 }
 
 func (s *session) getTree(id uint32) *tree {

@@ -3,6 +3,8 @@ package config
 import (
 	"fmt"
 	"os"
+	"path"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -125,14 +127,10 @@ func validateSMB(config *SMBConfig) error {
 	if config.Port < 1 || config.Port > 65535 {
 		return fmt.Errorf("invalid port: %d (must be 1-65535)", config.Port)
 	}
-	if config.ShareName == "" || len(config.ShareName) > 80 {
-		return fmt.Errorf("invalid share_name %q: must be 1-80 characters", config.ShareName)
-	}
-	if strings.ContainsAny(config.ShareName, `\/:*?"<>|`) || strings.ContainsFunc(config.ShareName, func(r rune) bool { return r < 0x20 }) {
-		return fmt.Errorf("invalid share_name %q: contains a character share names cannot use", config.ShareName)
-	}
-	if strings.EqualFold(config.ShareName, "IPC$") {
-		return fmt.Errorf("invalid share_name %q: reserved", config.ShareName)
+	if len(config.Shares) == 0 {
+		if err := validShareName(config.ShareName); err != nil {
+			return fmt.Errorf("share_name: %w", err)
+		}
 	}
 	if strings.TrimSpace(config.Domain) == "" {
 		return fmt.Errorf("domain must not be empty")
@@ -158,8 +156,17 @@ func validateSMB(config *SMBConfig) error {
 	if err := validateSMBLimits(&config.Limits); err != nil {
 		return err
 	}
-	if len(config.Users) == 0 {
-		return fmt.Errorf("at least one user is required when enabled")
+	if len(config.Users) == 0 && !config.Kerberos.Enabled() {
+		return fmt.Errorf("at least one user, or kerberos.keytab, is required when enabled")
+	}
+	if skew, err := config.Kerberos.GetMaxClockSkew(); err != nil || skew <= 0 {
+		return fmt.Errorf("invalid kerberos.max_clock_skew %q: must be a positive duration", config.Kerberos.MaxClockSkew)
+	}
+	if err := validateIDMap(config); err != nil {
+		return err
+	}
+	if err := validateShares(config.Shares); err != nil {
+		return err
 	}
 	seen := make(map[string]bool, len(config.Users))
 	for i, user := range config.Users {
@@ -176,11 +183,126 @@ func validateSMB(config *SMBConfig) error {
 		case len(hash) > 0 && user.Password != "":
 			return fmt.Errorf("users[%d] (%s): set ntlm_hash or password, not both", i, user.Username)
 		}
+		if user.UID < 0 || user.GID < 0 {
+			return fmt.Errorf("users[%d] (%s): uid and gid must not be negative", i, user.Username)
+		}
 		key := strings.ToLower(user.Username)
 		if seen[key] {
 			return fmt.Errorf("users[%d]: duplicate username %q", i, user.Username)
 		}
 		seen[key] = true
+	}
+	return nil
+}
+
+// validShareName checks a share's name.
+func validShareName(name string) error {
+	if name == "" || len(name) > 80 {
+		return fmt.Errorf("invalid share name %q: must be 1-80 characters", name)
+	}
+	if strings.ContainsAny(name, `\/:*?"<>|`) || strings.ContainsFunc(name, func(r rune) bool { return r < 0x20 }) {
+		return fmt.Errorf("invalid share name %q: contains a character share names cannot use", name)
+	}
+	if strings.EqualFold(name, "IPC$") {
+		return fmt.Errorf("invalid share name %q: reserved", name)
+	}
+	return nil
+}
+
+// SharePath cleans a share's path: absolute, with "/" for the whole bucket.
+func SharePath(p string) string {
+	return path.Clean("/" + strings.TrimSpace(p))
+}
+
+// validateShares checks the configured shares: valid, distinct names, and
+// directories that do not overlap. Overlapping shares would let one file be
+// open through two shares that each keep their own open state.
+func validateShares(shares []SMBShare) error {
+	names := map[string]bool{}
+	for i, share := range shares {
+		if err := validShareName(share.Name); err != nil {
+			return fmt.Errorf("shares[%d]: %w", i, err)
+		}
+		key := strings.ToLower(share.Name)
+		if names[key] {
+			return fmt.Errorf("shares[%d]: duplicate share name %q", i, share.Name)
+		}
+		names[key] = true
+		for _, list := range [][]string{share.ValidUsers, share.ReadList, share.WriteList} {
+			for _, entry := range list {
+				if err := validPrincipal(entry); err != nil {
+					return fmt.Errorf("shares[%d] (%s): %w", i, share.Name, err)
+				}
+			}
+		}
+		for j := range i {
+			a, b := SharePath(share.Path), SharePath(shares[j].Path)
+			if pathWithin(a, b) || pathWithin(b, a) {
+				return fmt.Errorf("shares[%d] (%s): path %s overlaps share %s (%s); shares may not overlap", i, share.Name, a, shares[j].Name, b)
+			}
+		}
+	}
+	return nil
+}
+
+// pathWithin reports whether p is dir or below it, ignoring case as SMB
+// does.
+func pathWithin(p, dir string) bool {
+	p, dir = strings.ToLower(p), strings.ToLower(dir)
+	return dir == "/" || p == dir || strings.HasPrefix(p, dir+"/")
+}
+
+// validPrincipal checks a user, group or SID in a share access list.
+func validPrincipal(entry string) error {
+	e := strings.TrimSpace(entry)
+	switch {
+	case e == "" || e == "@":
+		return fmt.Errorf("empty user in an access list")
+	case strings.HasPrefix(strings.ToUpper(e), "S-1-"):
+		if !isSID(e) {
+			return fmt.Errorf("invalid SID %q", entry)
+		}
+	case strings.Count(e, `\`) > 1:
+		return fmt.Errorf("invalid user %q: use DOMAIN\\user", entry)
+	}
+	return nil
+}
+
+// isSID reports whether s is a SID in string form: S-1-<authority>-<sub>...
+func isSID(s string) bool {
+	parts := strings.Split(strings.ToUpper(s), "-")
+	if len(parts) < 3 || len(parts) > 3+15 || parts[0] != "S" || parts[1] != "1" {
+		return false
+	}
+	if _, err := strconv.ParseUint(parts[2], 10, 48); err != nil {
+		return false
+	}
+	for _, p := range parts[3:] {
+		if _, err := strconv.ParseUint(p, 10, 32); err != nil {
+			return false
+		}
+	}
+	return true
+}
+
+// validateIDMap checks the id map, and that local accounts' ids sit below
+// the domain's.
+func validateIDMap(config *SMBConfig) error {
+	m := config.IDMap
+	if m.DomainSID == "" {
+		return nil
+	}
+	parts := strings.Split(m.DomainSID, "-")
+	if !isSID(m.DomainSID) || len(parts) != 7 || parts[2] != "5" || parts[3] != "21" {
+		return fmt.Errorf("invalid id_map.domain_sid %q: want a domain SID, S-1-5-21-<n>-<n>-<n>", m.DomainSID)
+	}
+	if m.Base < 1000 || m.Base > 1<<30 {
+		return fmt.Errorf("invalid id_map.base %d: must be 1000-%d", m.Base, 1<<30)
+	}
+	for i, user := range config.Users {
+		if user.UID >= m.Base || user.GID >= m.Base {
+			return fmt.Errorf("users[%d] (%s): uid and gid must be below id_map.base (%d), where domain accounts start", i, user.Username, m.Base)
+		}
 	}
 	return nil
 }

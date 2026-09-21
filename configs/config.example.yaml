@@ -158,6 +158,35 @@ smb:
   #     # (it reads the password from stdin, so it stays out of shell history)
   #     ntlm_hash: "<32 hex characters>"
   #     # password: "change-me"   # deprecated: use ntlm_hash
+  #     uid: 2001            # owner recorded for files the account creates
+  #     gid: 2001
+  #     groups: ["staff"]    # for "@staff" in share access lists
+  # Active Directory users sign in with Kerberos when the gateway holds its
+  # service account's keytab (cifs/<name clients use>, AES-256). Clients must
+  # connect by that name; by IP address they fall back to NTLM, which only
+  # local accounts above can use. No local accounts are needed with it.
+  # kerberos:
+  #   keytab: "/etc/bluestone/smb.keytab"
+  #   max_clock_skew: "5m"
+  # Record owners for files domain accounts create: uid = base + the RID (last
+  # part) of the account's SID, gid from its primary group, as Samba's
+  # idmap_rid does. Local accounts' uid and gid must be below base.
+  # id_map:
+  #   domain_sid: "S-1-5-21-<n>-<n>-<n>"   # Get-ADDomain | select DomainSID
+  #   base: 100000
+  # Shares, each a directory of the bucket with its own access rules; they
+  # replace share_name and may not overlap. Name users as CORP\alice or alice,
+  # local groups as @staff, and domain accounts or groups by SID. Write
+  # DOMAIN\user in single quotes: in double quotes, \ starts an escape.
+  # shares:
+  #   - name: "projects"
+  #     path: "/projects"
+  #     valid_users: ["S-1-5-21-<n>-<n>-<n>-1105", "@staff"]  # empty: everyone
+  #     read_list: ['CORP\contractor']   # may only read
+  #   - name: "public"
+  #     path: "/public"
+  #     read_only: true
+  #     write_list: ["alice"]            # may write even so
 
 logging:
   level: "info"     # debug, info, warn, error

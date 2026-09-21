@@ -1230,20 +1230,17 @@ func (fs *Filesystem) Readlink(link string) (string, error) {
 
 // Chroot creates a chrooted filesystem
 func (fs *Filesystem) Chroot(path string) (billy.Filesystem, error) {
-	newRoot := fs.keyPath(path)
-	return &Filesystem{
-		ops:            fs.ops,
-		logger:         fs.logger,
-		root:           newRoot,
-		perfConfig:     fs.perfConfig,
-		sessionManager: fs.sessionManager,
-		stagingManager: fs.stagingManager,
-		syncWorker:     fs.syncWorker,
-		featureFlags:   fs.featureFlags,
-		protocol:       fs.protocol,
-		windowsNames:   fs.windowsNames,
-		changes:        fs.changes,
-	}, nil
+	return fs.WithRoot(path), nil
+}
+
+// WithRoot returns a view of the directory at path: its root is that
+// directory, and changes outside it are not reported to its subscribers as
+// paths of their own. The view shares everything else, including the change
+// feed and naming, with fs.
+func (fs *Filesystem) WithRoot(path string) *Filesystem {
+	view := *fs
+	view.root = fs.keyPath(path)
+	return &view
 }
 
 // Root returns the root path

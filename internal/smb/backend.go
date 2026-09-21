@@ -19,7 +19,9 @@ import (
 	"github.com/oborges/bluestone/internal/lock"
 	"github.com/oborges/bluestone/internal/posix"
 	"github.com/oborges/bluestone/internal/vfs"
+	"github.com/sonroyaalmerol/go-smb-server/smb/auth"
 	smbvfs "github.com/sonroyaalmerol/go-smb-server/smb/vfs"
+	"go.uber.org/zap"
 )
 
 // Backend exposes a Bluestone filesystem view as an SMB share. Give it a view
@@ -28,6 +30,16 @@ import (
 type Backend struct {
 	fs    *vfs.Filesystem
 	opens *lock.ShareTable
+	// root is the share's directory in the bucket, which the share table
+	// keys its entries under, so that shares of different directories do
+	// not share entries for the same relative path.
+	root string
+	// ids maps the users who create files to the owners recorded for them;
+	// nil leaves the default owner.
+	ids *IDMap
+	// locks is the gateway's byte-range lock table, shared with NFS; nil
+	// leaves locking to the server's own table.
+	locks *lock.Manager
 	// maxStreamBytes caps a file's named streams; 0 selects the default.
 	maxStreamBytes int
 	// streamMu serializes changes to files' named streams.
@@ -42,6 +54,50 @@ func NewBackend(fs *vfs.Filesystem, opens *lock.ShareTable) *Backend {
 		opens = lock.NewShareTable(lock.ShareOptions{})
 	}
 	return &Backend{fs: fs, opens: opens}
+}
+
+// newShareBackend returns the backend of a share serving the directory dir
+// of fs ("" or "/" for all of it), creating the directory if it is missing.
+func newShareBackend(fs *vfs.Filesystem, dir string, opens *lock.ShareTable, logger *zap.Logger) *Backend {
+	root := path.Clean("/" + dir)
+	view := fs
+	if root != "/" {
+		if info, err := fs.Stat(root); err != nil || !info.IsDir() {
+			if err := fs.MkdirAll(root, 0o755); err != nil {
+				logger.Warn("Could not create a share's directory", zap.String("path", root), zap.Error(err))
+			}
+		}
+		view = fs.WithRoot(root)
+	}
+	b := NewBackend(view, opens)
+	b.root = root
+	return b
+}
+
+// tableKey is the share table's key for a path of the share.
+func (b *Backend) tableKey(p string) string {
+	return path.Join(b.root, p)
+}
+
+// ByteRangeLocker implements server.LockerProvider: the share's locks go in
+// the gateway's table, keyed by the object's path in the bucket, so they
+// conflict with locks taken through NFS and through other shares.
+func (b *Backend) ByteRangeLocker() smbvfs.ByteRangeLocker {
+	if b.locks == nil {
+		return nil
+	}
+	return NewLockerFor(b.locks, b.fs)
+}
+
+// setOwner records the user who created p as its owner, when the id map
+// knows them.
+func (b *Backend) setOwner(p string, user *auth.Identity) {
+	uid, gid, ok := b.ids.owner(user)
+	if !ok {
+		return
+	}
+	// The file exists either way; one without its owner still works.
+	_ = b.fs.Chown(p, uid, gid)
 }
 
 // SMB access bits an open can ask for (MS-SMB2 section 2.2.13).
@@ -95,7 +151,7 @@ func permittedAccess(share uint32) lock.Access {
 // reserve records the open in the share table, reporting a conflict in the
 // form the SMB server turns into STATUS_SHARING_VIOLATION.
 func (b *Backend) reserve(path string, opts smbvfs.OpenOptions) (*lock.ShareHandle, error) {
-	reservation, err := b.opens.Acquire(path,
+	reservation, err := b.opens.Acquire(b.tableKey(path),
 		requestedAccess(opts.DesiredAccess, opts.DeleteOnClose),
 		permittedAccess(opts.ShareAccess))
 	switch {
@@ -156,15 +212,16 @@ func (b *Backend) Open(_ context.Context, opts smbvfs.OpenOptions) (smbvfs.Handl
 			if err := b.fs.MkdirAll(p, 0o755); err != nil {
 				return nil, err
 			}
+			b.setOwner(p, opts.User)
 		}
-		return &handle{fs: b.fs, path: p, dir: true}, nil
+		return b.newHandle(p, true), nil
 	}
 
 	if exists && info.IsDir() {
 		// Directories are opened without the directory flag to list or query
 		// them; only dispositions that keep existing content make sense.
 		if opts.Disposition == smbvfs.DispositionOpen || opts.Disposition == smbvfs.DispositionOpenIf {
-			return &handle{fs: b.fs, path: p, dir: true}, nil
+			return b.newHandle(p, true), nil
 		}
 		return nil, fs.ErrExist
 	}
@@ -175,10 +232,10 @@ func (b *Backend) Open(_ context.Context, opts smbvfs.OpenOptions) (smbvfs.Handl
 			if !exists {
 				return nil, fs.ErrNotExist
 			}
-			return &handle{fs: b.fs, path: p}, nil
+			return b.newHandle(p, false), nil
 		case smbvfs.DispositionOpenIf:
 			if exists {
-				return &handle{fs: b.fs, path: p}, nil
+				return b.newHandle(p, false), nil
 			}
 			return b.openWritable(p, os.O_RDWR|os.O_CREATE|os.O_TRUNC)
 		case smbvfs.DispositionCreate:
@@ -200,6 +257,9 @@ func (b *Backend) Open(_ context.Context, opts smbvfs.OpenOptions) (smbvfs.Handl
 	if err != nil {
 		return nil, err
 	}
+	if !exists {
+		b.setOwner(p, opts.User)
+	}
 	if exists && replacesData(opts.Disposition) {
 		// Replacing a file's data replaces the file: its named streams go
 		// too, as on Windows. Truncating it through an open handle keeps
@@ -213,7 +273,6 @@ func (b *Backend) Open(_ context.Context, opts smbvfs.OpenOptions) (smbvfs.Handl
 	}
 	if h, ok := opened.(*handle); ok {
 		h.reservation = reservation
-		h.opens = b.opens
 		reservation = nil // the handle releases it on close
 	}
 	return opened, nil
@@ -236,7 +295,14 @@ func (b *Backend) openWritable(p string, flag int) (smbvfs.Handle, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &handle{fs: b.fs, path: p, file: f, writable: true}, nil
+	h := b.newHandle(p, false)
+	h.file, h.writable = f, true
+	return h, nil
+}
+
+// newHandle returns a handle on p, which the caller opens.
+func (b *Backend) newHandle(p string, dir bool) *handle {
+	return &handle{fs: b.fs, path: p, dir: dir, opens: b.opens, root: b.root, ids: b.ids}
 }
 
 // Remove implements smbvfs.Remover for delete-on-close. "file:stream"
@@ -274,6 +340,10 @@ type handle struct {
 	// handle closes; opens is where a rename moves it.
 	reservation *lock.ShareHandle
 	opens       *lock.ShareTable
+	// root is the share's directory, which share table keys start with.
+	root string
+	// ids names the file's owner in Stat.
+	ids *IDMap
 	// copied is set once a server-side copy has made the file a copy of
 	// another inside the bucket, so the rest of that copy's chunks have
 	// nothing left to move. Any write through this handle clears it.
@@ -363,7 +433,10 @@ func (h *handle) Stat(_ context.Context) (smbvfs.FileInfo, error) {
 	if err != nil {
 		return smbvfs.FileInfo{}, err
 	}
-	return fileInfo(info), nil
+	fi := fileInfo(info)
+	attrs := vfs.FileAttributes(info)
+	fi.OwnerSID, fi.GroupSID = h.ids.sids(attrs.UID, attrs.GID)
+	return fi, nil
 }
 
 // Enumerate implements smbvfs.Handle for directory listings. Patterns match
@@ -454,7 +527,7 @@ func (h *handle) Rename(_ context.Context, newPath string, replaceIfExists bool)
 	}
 	h.copied = nil
 	if h.opens != nil {
-		h.opens.Rename(h.path, target)
+		h.opens.Rename(path.Join(h.root, h.path), path.Join(h.root, target))
 	}
 	h.path = target
 	return nil
@@ -506,7 +579,9 @@ func matchPattern(pattern, name string) (bool, error) {
 // itself. Even then they only travel gateway-side, never out to the client.
 func (h *handle) CopyChunk(_ context.Context, src smbvfs.Handle, srcOffset, dstOffset, length int64) (int64, error) {
 	source, ok := src.(*handle)
-	if !ok || source == h || h.dir || source.dir {
+	// A source in another share names its path in that share's view: the
+	// server copies the bytes itself.
+	if !ok || source == h || h.dir || source.dir || source.fs != h.fs {
 		return 0, errors.ErrUnsupported
 	}
 	// A bucket-side copy puts every byte where it was in the source.

@@ -2,6 +2,7 @@ package smb
 
 import (
 	"context"
+	"encoding/asn1"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -16,8 +17,11 @@ import (
 	"github.com/oborges/bluestone/internal/lock"
 	"github.com/oborges/bluestone/internal/metrics"
 	"github.com/oborges/bluestone/internal/vfs"
+	"github.com/sonroyaalmerol/go-smb-server/smb/auth"
+	"github.com/sonroyaalmerol/go-smb-server/smb/kerberos"
 	"github.com/sonroyaalmerol/go-smb-server/smb/ntlmssp"
 	"github.com/sonroyaalmerol/go-smb-server/smb/server"
+	"github.com/sonroyaalmerol/go-smb-server/smb/spnego"
 	smbvfs "github.com/sonroyaalmerol/go-smb-server/smb/vfs"
 	"github.com/sonroyaalmerol/go-smb-server/smb/wire"
 	"go.uber.org/zap"
@@ -34,14 +38,32 @@ type User struct {
 	// NTLMHash is the account's NT hash (16 bytes), as
 	// bluestone -smb-hash prints it. When set, Password is ignored.
 	NTLMHash []byte
+	// UID and GID are the owner recorded for files the account creates; 0
+	// leaves the default owner.
+	UID, GID int
+	// Groups name the account's groups, for "@group" in share access lists.
+	Groups []string
 }
 
 // ServerOptions configures an SMB server.
 type ServerOptions struct {
 	// Address is the TCP address to listen on, such as ":445".
 	Address string
-	// ShareName is the share clients connect to.
+	// ShareName is the share clients connect to when Shares is empty: the
+	// whole bucket, for every user.
 	ShareName string
+	// Shares are the shares served, each a directory of the bucket with its
+	// own access rules.
+	Shares []ShareOptions
+	// KerberosKeytab is the keytab of the gateway's service principal.
+	// Setting it lets domain users sign in with Kerberos.
+	KerberosKeytab string
+	// KerberosMaxClockSkew is how far a client's clock may be off; 0
+	// selects five minutes.
+	KerberosMaxClockSkew time.Duration
+	// IDMap maps users to the owners recorded for files they create; nil
+	// leaves every file with the default owner.
+	IDMap *IDMap
 	// Domain is the NTLM domain and server name the server advertises.
 	Domain string
 	// Users are the accounts allowed to connect. Usernames match
@@ -134,8 +156,8 @@ const drainIdleFor = time.Second
 // NewServer creates an SMB server for fs and binds its listener. Give it a
 // view with Windows naming, labelled for SMB metrics.
 func NewServer(fs *vfs.Filesystem, opts ServerOptions) (*Server, error) {
-	if len(opts.Users) == 0 {
-		return nil, errors.New("smb: at least one user is required")
+	if len(opts.Users) == 0 && opts.KerberosKeytab == "" {
+		return nil, errors.New("smb: at least one user, or a Kerberos keytab, is required")
 	}
 	logger := opts.Logger
 	if logger == nil {
@@ -158,11 +180,30 @@ func NewServer(fs *vfs.Filesystem, opts ServerOptions) (*Server, error) {
 	if drainTimeout <= 0 {
 		drainTimeout = DefaultDrainTimeout
 	}
-	backend := NewBackend(fs, opts.Opens)
-	backend.maxStreamBytes = opts.MaxStreamBytes
-	serverOpts := []server.Option{
-		server.WithShares(smbvfs.NewDiskShare(opts.ShareName, backend)),
-		server.WithAuth(ntlmssp.NewServer(newCredentials(opts.Users), opts.Domain)),
+	authOpts, err := authOptions(opts, logger)
+	if err != nil {
+		return nil, err
+	}
+	shares := opts.Shares
+	if len(shares) == 0 {
+		shares = []ShareOptions{{Name: opts.ShareName}}
+	}
+	opens := opts.Opens
+	if opens == nil {
+		opens = lock.NewShareTable(lock.ShareOptions{})
+	}
+	var smbShares []smbvfs.Share
+	for _, share := range shares {
+		backend := newShareBackend(fs, share.Path, opens, logger)
+		backend.maxStreamBytes = opts.MaxStreamBytes
+		backend.ids = opts.IDMap
+		backend.locks = opts.Locks
+		smbShares = append(smbShares, smbvfs.NewDiskShare(share.Name, backend))
+	}
+	rules := newAccessRules(opts.Domain, opts.Users, shares)
+	serverOpts := append(authOpts,
+		server.WithShares(smbShares...),
+		server.WithShareAccess(rules.access),
 		server.WithLogger(slog.New(zapHandler{logger: logger})),
 		server.WithObserver(obs),
 		server.WithAuthGate(gate),
@@ -171,7 +212,7 @@ func NewServer(fs *vfs.Filesystem, opts ServerOptions) (*Server, error) {
 			OpensPerSession:       opts.Limits.OpensPerSession,
 			TreesPerSession:       opts.Limits.TreesPerSession,
 		}),
-	}
+	)
 	if opts.EncryptionRequired {
 		serverOpts = append(serverOpts, server.WithEncryptionRequired())
 	}
@@ -183,9 +224,6 @@ func NewServer(fs *vfs.Filesystem, opts ServerOptions) (*Server, error) {
 		if opts.DurableHandles {
 			serverOpts = append(serverOpts, server.WithDurableHandles())
 		}
-	}
-	if opts.Locks != nil {
-		serverOpts = append(serverOpts, server.WithLocker(NewLockerFor(opts.Locks, fs)))
 	}
 	if opts.ConcurrentRequests > 0 {
 		serverOpts = append(serverOpts, server.WithMaxConcurrentRequests(opts.ConcurrentRequests))
@@ -209,7 +247,7 @@ func NewServer(fs *vfs.Filesystem, opts ServerOptions) (*Server, error) {
 		listener: newConnListener(inner, allowed, logger, opts.Limits.Connections, opts.Limits.ConnectionsPerClient),
 		logger:   logger,
 		observer: obs,
-		opens:    opts.Opens,
+		opens:    opens,
 		gate:     gate,
 		drain:    drainTimeout,
 		ctx:      ctx,
@@ -322,6 +360,37 @@ func (s *Server) Running() bool {
 // Address returns the server's listening address.
 func (s *Server) Address() string {
 	return s.listener.Addr().String()
+}
+
+// authOptions configures sign-in: NTLM for local accounts, Kerberos for
+// domain accounts, or both, with the NEGOTIATE response advertising what
+// is on offer so Windows knows to try Kerberos.
+func authOptions(opts ServerOptions, logger *zap.Logger) ([]server.Option, error) {
+	var ntlm, krb auth.Factory
+	if len(opts.Users) > 0 {
+		ntlm = ntlmssp.NewServer(newCredentials(opts.Users), opts.Domain)
+	}
+	if opts.KerberosKeytab == "" {
+		return []server.Option{server.WithAuth(ntlm)}, nil
+	}
+	kt, err := kerberos.LoadKeytab(opts.KerberosKeytab)
+	if err != nil {
+		return nil, fmt.Errorf("smb: %w", err)
+	}
+	skew := opts.KerberosMaxClockSkew
+	if skew <= 0 {
+		skew = 5 * time.Minute
+	}
+	krb = kerberos.NewServer(kt, kerberos.WithMaxClockSkew(skew))
+	logger.Info("SMB Kerberos sign-in enabled", zap.Strings("principals", kerberos.Principals(kt)))
+	mechs := []asn1.ObjectIdentifier{spnego.OIDMSKRB5, spnego.OIDKRB5}
+	if ntlm != nil {
+		mechs = append(mechs, spnego.OIDNTLM)
+	}
+	return []server.Option{
+		server.WithAuth(spnego.Negotiate(krb, ntlm)),
+		server.WithNegotiateHint(spnego.NegTokenInit(mechs...)),
+	}, nil
 }
 
 // credentials looks up NTLM keys for configured users. The NTLMv2 key mixes

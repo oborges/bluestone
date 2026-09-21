@@ -248,6 +248,23 @@ smb:
     - username: "alice"
       # The account's NT hash, from: bluestone -smb-hash
       ntlm_hash: "<32 hex characters>"
+      uid: 2001            # owner recorded for files alice creates (optional)
+      gid: 2001
+      groups: ["staff"]    # for "@staff" in share access lists (optional)
+  kerberos:
+    keytab: "/etc/bluestone/smb.keytab"  # lets Active Directory users sign in
+  id_map:
+    domain_sid: "S-1-5-21-<n>-<n>-<n>"   # map domain accounts to uids by RID
+    base: 100000
+  shares:                  # optional; without it, share_name serves the bucket
+    - name: "projects"
+      path: "/projects"
+      valid_users: ["S-1-5-21-<n>-<n>-<n>-1105", "@staff"]
+      read_list: ['CORP\contractor']
+    - name: "public"
+      path: "/public"
+      read_only: true
+      write_list: ["alice"]
 ```
 
 The SMB server is experimental and disabled by default. It serves the same
@@ -296,9 +313,75 @@ set one or the other, not both.
 Keep the configuration file readable only by the gateway's service account.
 `server.allowed_clients` also applies to the SMB port. Binding port 445 on
 Linux needs root or `CAP_NET_BIND_SERVICE`. `smb.enabled`, `smb.port`,
-`smb.share_name`, `smb.domain`, and `smb.encryption_required` can be
-overridden with `BLUESTONE_SMB_*` environment variables; users are read from
-the file only.
+`smb.share_name`, `smb.domain`, `smb.encryption_required`,
+`smb.kerberos.keytab` and `smb.id_map.*` can be overridden with
+`BLUESTONE_SMB_*` environment variables; users and shares are read from the
+file only.
+
+#### Active Directory
+
+With `smb.kerberos.keytab` set, users of an Active Directory domain sign in
+with their own credentials over Kerberos, and a domain-joined Windows machine
+connects without asking for a password. The gateway needs no local accounts
+and does not join the domain: it only needs a service account whose key it
+holds.
+
+1. Give the gateway a DNS name clients resolve, such as
+   `gw.corp.example.com`. Kerberos is only used when clients connect by
+   name; a client that connects by IP address falls back to NTLM, which only
+   local accounts can use.
+2. Create a service account for it, with AES-256, and write its keytab:
+
+   ```powershell
+   New-ADUser bluestone-gw -AccountPassword (Read-Host -AsSecureString) -Enabled $true -PasswordNeverExpires $true
+   Set-ADUser bluestone-gw -KerberosEncryptionType AES256
+   ktpass -princ cifs/gw.corp.example.com@CORP.EXAMPLE.COM -mapuser CORP\bluestone-gw `
+       -crypto AES256-SHA1 -ptype KRB5_NT_PRINCIPAL -pass * -out gw.keytab
+   ```
+
+3. Copy `gw.keytab` to the gateway, readable only by its service account,
+   and point `smb.kerberos.keytab` at it. The gateway logs the principals it
+   answers to at startup. Clocks must agree to within
+   `smb.kerberos.max_clock_skew` (five minutes).
+
+The ticket's PAC tells the gateway who the user is: their SID, their groups,
+and their domain's NetBIOS name. Local accounts under `users` keep working
+alongside, over NTLM.
+
+#### Shares and access
+
+Without `smb.shares`, one share named `share_name` serves the whole bucket to
+every user who can sign in. `smb.shares` replaces it with shares of their own
+directories, created when missing. Shares may not overlap. Each share can
+limit who uses it and how:
+
+- `valid_users`: the only users admitted; empty admits everyone.
+- `read_only`: nobody may change anything, except users in `write_list`.
+- `read_list`: users who may only read, even on a writable share.
+  `write_list` wins for a user on both.
+
+Users are named as Windows names them: `CORP\alice` or `alice` for an
+account, `@staff` for a group of local accounts, or a SID for a domain
+account or group. Domain groups can only be named by SID, as
+`Get-ADGroup Engineering | select SID` shows it. In YAML, write
+`DOMAIN\user` in single quotes: in double quotes, `\` starts an escape. A
+local account matches `DOMAIN\user` only for the gateway's own `smb.domain`,
+since an NTLM client names whatever domain it likes.
+
+A user a share does not admit is refused when connecting. On a read-only
+share, opening a file to change it, creating, deleting or renaming is refused
+with "access denied", as a Windows server does, and Windows shows the share's
+files as readable only.
+
+#### Owners
+
+Files record who created them. With `smb.id_map.domain_sid` set, a domain
+account's uid is `id_map.base` plus its relative ID (the last part of its
+SID), and its gid comes from its primary group the same way, as Samba's
+`idmap_rid` does. A local account with a `uid` and `gid` gets those. Windows
+shows the owner on a file's Security tab: the domain account, or a Unix SID
+(`S-1-22-1-<uid>`) for a local one. Without an id map, files keep the
+default owner, as before.
 
 Tested against Windows Server 2025 (SMB 3.1.1 with signing, or encryption), macOS
 (`mount_smbfs`), the Linux kernel client (`mount -t cifs`), and `smbclient`:

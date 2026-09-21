@@ -10,6 +10,27 @@ import (
 // lockToEOF is the range end for a lock that runs to the end of the file.
 const lockToEOF = uint64(math.MaxUint64)
 
+// LockerProvider is implemented by a backend that keeps a share's
+// byte-range locks itself, in terms of the share's own paths. A server with
+// several shares needs it: the locker a server is given sees paths relative
+// to a share, without knowing which share they are in.
+type LockerProvider interface {
+	ByteRangeLocker() vfs.ByteRangeLocker
+}
+
+// lockerFor returns the byte-range locker for a share's files: its
+// backend's own, or the server's.
+func (s *Server) lockerFor(share vfs.Share) vfs.ByteRangeLocker {
+	if share != nil {
+		if p, ok := share.Backend().(LockerProvider); ok {
+			if l := p.ByteRangeLocker(); l != nil {
+				return l
+			}
+		}
+	}
+	return s.lockTable()
+}
+
 // lockTable returns the server's byte-range locker, creating the default one
 // for a Server that was built without New.
 func (s *Server) lockTable() vfs.ByteRangeLocker {

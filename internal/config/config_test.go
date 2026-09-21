@@ -349,6 +349,48 @@ func TestValidateSMB(t *testing.T) {
 			c.Limits.AuthBlock = "10m"
 			c.Limits.AuthMaxBlock = "1m"
 		}, wantErr: true},
+		{name: "Kerberos without local users", mutate: func(c *SMBConfig) {
+			c.Users = nil
+			c.Kerberos.Keytab = "/etc/bluestone/smb.keytab"
+		}},
+		{name: "unparsable clock skew", mutate: func(c *SMBConfig) { c.Kerberos.MaxClockSkew = "soon" }, wantErr: true},
+		{name: "id map", mutate: func(c *SMBConfig) {
+			c.IDMap = SMBIDMap{DomainSID: "S-1-5-21-3167651404-3865080224-2280184895", Base: 100000}
+			c.Users[0].UID, c.Users[0].GID = 2001, 2001
+		}},
+		{name: "id map with a SID that is not a domain's", mutate: func(c *SMBConfig) {
+			c.IDMap = SMBIDMap{DomainSID: "S-1-5-32-544", Base: 100000}
+		}, wantErr: true},
+		{name: "id map base too low", mutate: func(c *SMBConfig) {
+			c.IDMap = SMBIDMap{DomainSID: "S-1-5-21-1-2-3", Base: 10}
+		}, wantErr: true},
+		{name: "local uid inside the domain's range", mutate: func(c *SMBConfig) {
+			c.IDMap = SMBIDMap{DomainSID: "S-1-5-21-1-2-3", Base: 100000}
+			c.Users[0].UID = 100001
+		}, wantErr: true},
+		{name: "negative uid", mutate: func(c *SMBConfig) { c.Users[0].UID = -1 }, wantErr: true},
+		{name: "shares", mutate: func(c *SMBConfig) {
+			c.ShareName = ""
+			c.Shares = []SMBShare{
+				{Name: "projects", Path: "/projects", ValidUsers: []string{`CORP\alice`, "@staff", "S-1-5-21-1-2-3-1108"}},
+				{Name: "hr", Path: "hr", ReadOnly: true, WriteList: []string{"alice"}},
+			}
+		}},
+		{name: "duplicate share names", mutate: func(c *SMBConfig) {
+			c.Shares = []SMBShare{{Name: "a", Path: "/a"}, {Name: "A", Path: "/b"}}
+		}, wantErr: true},
+		{name: "nested shares", mutate: func(c *SMBConfig) {
+			c.Shares = []SMBShare{{Name: "a", Path: "/a"}, {Name: "b", Path: "/A/b"}}
+		}, wantErr: true},
+		{name: "a share of the whole bucket beside another", mutate: func(c *SMBConfig) {
+			c.Shares = []SMBShare{{Name: "all"}, {Name: "b", Path: "/b"}}
+		}, wantErr: true},
+		{name: "reserved share name in shares", mutate: func(c *SMBConfig) {
+			c.Shares = []SMBShare{{Name: "IPC$", Path: "/a"}}
+		}, wantErr: true},
+		{name: "bad SID in an access list", mutate: func(c *SMBConfig) {
+			c.Shares = []SMBShare{{Name: "a", ReadList: []string{"S-1-5-21-x"}}}
+		}, wantErr: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
