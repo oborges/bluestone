@@ -121,9 +121,12 @@ file before that write is acknowledged.
 
 ## Phase 4: survives
 
-- SMB 3.1.1: negotiate contexts, pre-auth integrity, and AES-GCM. The dialect
-  is currently pinned to 3.0.2, so encryption is AES-128-CCM, which is
-  markedly slower.
+- SMB 3.1.1: negotiate contexts, pre-auth integrity, and AES-GCM.
+  Done: Windows Server 2025 and macOS negotiate 3.1.1, and Windows encrypts
+  with AES-128-GCM when encryption is required. A 256 MB copy ran at about
+  265 MB/s up and 480 MB/s down, against 150 and 195 MB/s with AES-128-CCM
+  over 3.0.2. `smb.max_dialect: "3.0.2"` caps the dialect. Encryption over
+  3.0.2 had never worked with Windows, and now does.
 - Durable handles v2, so a dropped connection pauses a client rather than
   failing its open files.
   Done (`windows-durable-test.ps1`). Windows held a file open with a

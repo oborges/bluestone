@@ -14,17 +14,10 @@ func (c *conn) openTransform(transform []byte) ([]byte, error) {
 	}
 	sessID := binary.LittleEndian.Uint64(transform[44:52])
 	sess := c.getSession(sessID)
-	if sess == nil || sess.decryptionKey == nil {
+	if sess == nil || sess.decCipher == nil {
 		return nil, errors.New("server: no decryption key for session")
 	}
-	if sess.decCCM == nil {
-		ccm, err := encryption.NewAESCCM(sess.decryptionKey)
-		if err != nil {
-			return nil, err
-		}
-		sess.decCCM = ccm
-	}
-	return sess.decCCM.Open(transform)
+	return sess.decCipher.Open(transform)
 }
 
 func (c *conn) maybeSealResponse(out []byte) ([]byte, bool) {
@@ -37,18 +30,10 @@ func (c *conn) maybeSealResponse(out []byte) ([]byte, bool) {
 	}
 	sessID := binary.LittleEndian.Uint64(out[40:48])
 	sess := c.getSession(sessID)
-	if sess == nil || sess.encryptionKey == nil || !sess.requireEncrypt {
+	if sess == nil || sess.encCipher == nil || !sess.requireEncrypt {
 		return nil, false
 	}
-	if sess.encCCM == nil {
-		ccm, err := encryption.NewAESCCM(sess.encryptionKey)
-		if err != nil {
-			c.log.Debug("seal: new ccm", "err", err)
-			return nil, false
-		}
-		sess.encCCM = ccm
-	}
-	sealed, err := sess.encCCM.Seal(out, sessID)
+	sealed, err := sess.encCipher.Seal(out, sessID)
 	if err != nil {
 		c.log.Debug("seal response", "err", err)
 		return nil, false
@@ -56,12 +41,14 @@ func (c *conn) maybeSealResponse(out []byte) ([]byte, bool) {
 	return sealed, true
 }
 
-func (c *conn) negotiateCapabilities() uint32 {
+func (c *conn) negotiateCapabilities(dialect uint16) uint32 {
 	caps := wire.CapLargeMTU
 	if c.srv.leasesEnabled {
 		caps |= wire.CapLeasing
 	}
-	if c.srv.requireEnc {
+	// SMB 3.1.1 negotiates encryption with a negotiate context instead of
+	// this capability, and clients reject it set.
+	if c.srv.requireEnc && dialect != wire.DialectSMB311 {
 		caps |= wire.CapEncryption
 	}
 	return caps

@@ -111,6 +111,9 @@ smb:
   share_name: "bluestone"   # clients connect to \\<host>\bluestone
   domain: "BLUESTONE"
   encryption_required: false
+  # Highest dialect offered: "3.1.1" (default; AES-GCM encryption and
+  # pre-authentication integrity) or "3.0.2" (AES-128-CCM encryption).
+  max_dialect: "3.1.1"
   # Reads and writes handled at once per connection. 0 (default) uses the
   # built-in value (64); 1 handles every request in turn, as an escape hatch.
   concurrent_requests: 0

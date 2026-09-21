@@ -156,3 +156,79 @@ func (r *NegotiateResponse) Append(dst []byte) []byte {
 	}
 	return out
 }
+
+// Pre-authentication integrity hash algorithms and signing algorithms
+// (MS-SMB2 sections 2.2.3.1.1 and 2.2.3.1.7).
+const (
+	HashSHA512        uint16 = 0x0001
+	SigningHMACSHA256 uint16 = 0x0000
+	SigningAESCMAC    uint16 = 0x0001
+	SigningAESGMAC    uint16 = 0x0002
+	PreauthSaltLength        = 32
+	preauthHashLength        = 64
+)
+
+// Context returns the request's negotiate context of that type.
+func (r *NegotiateRequest) Context(ctxType uint16) ([]byte, bool) {
+	for _, c := range r.Contexts {
+		if c.Type == ctxType {
+			return c.Data, true
+		}
+	}
+	return nil, false
+}
+
+// ParsePreauthCapabilities returns the hash algorithms a client offers.
+func ParsePreauthCapabilities(data []byte) ([]uint16, error) {
+	if len(data) < 4 {
+		return nil, errors.New("wire: preauth integrity context truncated")
+	}
+	count := int(binary.LittleEndian.Uint16(data[0:2]))
+	if len(data) < 4+2*count {
+		return nil, errors.New("wire: preauth integrity algorithms truncated")
+	}
+	return readUint16s(data[4:], count), nil
+}
+
+// ParseAlgorithmList reads the count-prefixed list of 16-bit ids that the
+// encryption and signing capabilities contexts carry.
+func ParseAlgorithmList(data []byte) ([]uint16, error) {
+	if len(data) < 2 {
+		return nil, errors.New("wire: negotiate context truncated")
+	}
+	count := int(binary.LittleEndian.Uint16(data[0:2]))
+	if len(data) < 2+2*count {
+		return nil, errors.New("wire: negotiate context list truncated")
+	}
+	return readUint16s(data[2:], count), nil
+}
+
+func readUint16s(b []byte, count int) []uint16 {
+	out := make([]uint16, count)
+	for i := range out {
+		out[i] = binary.LittleEndian.Uint16(b[2*i:])
+	}
+	return out
+}
+
+// PreauthContext is the server's preauth integrity context: SHA-512 and a
+// salt.
+func PreauthContext(salt []byte) NegotiateContext {
+	data := make([]byte, 6, 6+len(salt))
+	binary.LittleEndian.PutUint16(data[0:2], 1)
+	binary.LittleEndian.PutUint16(data[2:4], uint16(len(salt)))
+	binary.LittleEndian.PutUint16(data[4:6], HashSHA512)
+	return NegotiateContext{Type: CtxPreauthIntegrity, Data: append(data, salt...)}
+}
+
+// SingleAlgorithmContext answers a capabilities context with the one
+// algorithm chosen (0 for a cipher means none in common).
+func SingleAlgorithmContext(ctxType, id uint16) NegotiateContext {
+	data := make([]byte, 4)
+	binary.LittleEndian.PutUint16(data[0:2], 1)
+	binary.LittleEndian.PutUint16(data[2:4], id)
+	return NegotiateContext{Type: ctxType, Data: data}
+}
+
+// ZeroPreauthHash is where a connection's preauth integrity hash starts.
+func ZeroPreauthHash() []byte { return make([]byte, preauthHashLength) }

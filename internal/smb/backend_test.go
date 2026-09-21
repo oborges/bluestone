@@ -1513,3 +1513,32 @@ func TestSMBFullBucketIsDiskFull(t *testing.T) {
 		t.Fatalf("write once the bucket has room: %v", err)
 	}
 }
+
+// With encryption required, a client negotiating SMB 3.1.1 encrypts every
+// request after SESSION_SETUP with the cipher negotiated, and files move
+// intact.
+// TestSMBEncryptedSession writes and reads over a session that must be
+// encrypted: AES-128-GCM with SMB 3.1.1, and AES-128-CCM when the dialect is
+// capped at 3.0.2.
+func TestSMBEncryptedSession(t *testing.T) {
+	for _, dialect := range []string{"3.1.1", "3.0.2"} {
+		t.Run(dialect, func(t *testing.T) {
+			g := startGateway(t, func(o *ServerOptions) {
+				o.EncryptionRequired = true
+				o.MaxDialect = dialect
+			})
+			share, err := g.mount(t, "alice", "secret", "BLUESTONE")
+			if err != nil {
+				t.Fatalf("mount with encryption required: %v", err)
+			}
+			payload := bytes.Repeat([]byte("sealed "), 10000)
+			if err := share.WriteFile("sealed.bin", payload, 0o644); err != nil {
+				t.Fatalf("WriteFile() over an encrypted session: %v", err)
+			}
+			got, err := share.ReadFile("sealed.bin")
+			if err != nil || !bytes.Equal(got, payload) {
+				t.Fatalf("ReadFile() over an encrypted session = %d bytes, %v", len(got), err)
+			}
+		})
+	}
+}

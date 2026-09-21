@@ -19,6 +19,7 @@ import (
 	"github.com/sonroyaalmerol/go-smb-server/smb/ntlmssp"
 	"github.com/sonroyaalmerol/go-smb-server/smb/server"
 	smbvfs "github.com/sonroyaalmerol/go-smb-server/smb/vfs"
+	"github.com/sonroyaalmerol/go-smb-server/smb/wire"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
@@ -81,6 +82,9 @@ type ServerOptions struct {
 	// DurableHandles keeps open files through a dropped connection (see
 	// config.SMBConfig.DurableHandles).
 	DurableHandles bool
+	// MaxDialect is the highest dialect offered, "3.1.1" or "3.0.2"; empty
+	// selects 3.1.1.
+	MaxDialect string
 	// Logger receives server logs; nil discards them.
 	Logger *zap.Logger
 }
@@ -170,6 +174,9 @@ func NewServer(fs *vfs.Filesystem, opts ServerOptions) (*Server, error) {
 	}
 	if opts.EncryptionRequired {
 		serverOpts = append(serverOpts, server.WithEncryptionRequired())
+	}
+	if opts.MaxDialect == "3.0.2" {
+		serverOpts = append(serverOpts, server.WithDialect(wire.DialectSMB302))
 	}
 	if opts.Leases {
 		serverOpts = append(serverOpts, server.WithLeases(0))

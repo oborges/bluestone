@@ -147,6 +147,11 @@ func validateSMB(config *SMBConfig) error {
 	if drain <= 0 {
 		return fmt.Errorf("invalid drain_timeout: %s (must be positive)", drain)
 	}
+	switch config.MaxDialect {
+	case "", "3.1.1", "3.0.2":
+	default:
+		return fmt.Errorf("invalid max_dialect %q: must be 3.1.1 or 3.0.2", config.MaxDialect)
+	}
 	if config.MaxStreamBytes < 0 || config.MaxStreamBytes > MaxStreamBytesLimit {
 		return fmt.Errorf("invalid max_stream_bytes: %d (must be 0-%d: streams are kept in object metadata)", config.MaxStreamBytes, MaxStreamBytesLimit)
 	}

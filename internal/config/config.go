@@ -76,6 +76,10 @@ type SMBConfig struct {
 	// when its connection drops, so it can reconnect and carry on. It
 	// applies to files opened with a read-handle lease, so it needs Leases.
 	DurableHandles bool `mapstructure:"durable_handles"`
+	// MaxDialect is the highest SMB dialect offered: "3.1.1" (the default,
+	// with pre-authentication integrity and AES-GCM encryption) or "3.0.2",
+	// for a client that does not get on with 3.1.1.
+	MaxDialect string `mapstructure:"max_dialect"`
 	// Limits bound what clients can make the server hold. 0 means no limit.
 	Limits SMBLimits `mapstructure:"limits"`
 	// Users are the accounts allowed to connect, authenticated with NTLM.
@@ -509,6 +513,7 @@ func bindEnvOverrides(v *viper.Viper) error {
 		"smb.max_stream_bytes",
 		"smb.leases",
 		"smb.durable_handles",
+		"smb.max_dialect",
 		"smb.limits.max_connections",
 		"smb.limits.max_connections_per_client",
 		"smb.limits.max_sessions_per_connection",
@@ -672,6 +677,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("smb.max_stream_bytes", DefaultMaxStreamBytes)
 	v.SetDefault("smb.leases", true)
 	v.SetDefault("smb.durable_handles", true)
+	v.SetDefault("smb.max_dialect", "3.1.1")
 	// Limits are generous enough that no ordinary client meets them, and
 	// small enough that one client cannot exhaust the gateway.
 	v.SetDefault("smb.limits.max_connections", 256)

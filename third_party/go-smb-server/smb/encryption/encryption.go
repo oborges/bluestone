@@ -18,8 +18,8 @@ type AESCCM struct {
 }
 
 func NewAESCCM(key []byte) (*AESCCM, error) {
-	if len(key) != 16 {
-		return nil, fmt.Errorf("encryption: AES-128-CCM requires a 16-byte key, got %d", len(key))
+	if len(key) != 16 && len(key) != 32 {
+		return nil, fmt.Errorf("encryption: AES-CCM requires a 16- or 32-byte key, got %d", len(key))
 	}
 	block, err := aes.NewCipher(key)
 	if err != nil {
