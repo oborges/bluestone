@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/sonroyaalmerol/go-smb-server/smb/auth"
 	"github.com/sonroyaalmerol/go-smb-server/smb/vfs"
 	"github.com/sonroyaalmerol/go-smb-server/smb/wire"
 )
@@ -75,6 +76,14 @@ func sessionUser(sess *session) string {
 		return ""
 	}
 	return strings.ToLower(sess.identity.Domain + `\` + sess.identity.Username)
+}
+
+// sessionIdentity is who a session authenticated as, or nil.
+func sessionIdentity(sess *session) *auth.Identity {
+	if sess == nil {
+		return nil
+	}
+	return sess.identity
 }
 
 // grantDurable makes an open durable if it asked and caches a handle,
@@ -150,7 +159,7 @@ func (t *durableTable) lookup(fid [16]byte) *preservedOpen {
 // share modes go, and a delete-on-close takes effect.
 func (s *Server) closePreserved(p *preservedOpen) {
 	ctx := context.Background()
-	s.lockTable().ReleaseOwner(lockOwner(p.oh.sessionID, p.oh.fileId))
+	s.lockerFor(p.share).ReleaseOwner(lockOwner(p.oh.sessionID, p.oh.fileId))
 	s.leaseTable().release(p.oh)
 	_ = p.oh.h.Close(ctx)
 	if err := s.releaseOpen(ctx, p.share, p.oh); err != nil {

@@ -269,6 +269,12 @@ func startGateway(t *testing.T, configure ...func(*ServerOptions)) *testGateway 
 // mount connects a real SMB client and mounts the share.
 func (g *testGateway) mount(t *testing.T, user, password, domain string) (*client.Share, error) {
 	t.Helper()
+	return g.mountShare(t, "share", user, password, domain)
+}
+
+// mountShare connects a real SMB client and mounts the named share.
+func (g *testGateway) mountShare(t *testing.T, name, user, password, domain string) (*client.Share, error) {
+	t.Helper()
 	conn, err := net.DialTimeout("tcp", g.server.Address(), 3*time.Second)
 	if err != nil {
 		return nil, err
@@ -280,7 +286,7 @@ func (g *testGateway) mount(t *testing.T, user, password, domain string) (*clien
 		conn.Close()
 		return nil, err
 	}
-	share, err := session.Mount("share")
+	share, err := session.Mount(name)
 	if err != nil {
 		_ = session.Logoff()
 		conn.Close()

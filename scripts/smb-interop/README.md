@@ -106,6 +106,17 @@ ssh gateway 'sudo sed -n "s/^ *password: \"\(.*\)\"$/\1/p" /etc/bluestone/config
   closes through the same handle, which all succeed when durable handles
   work. During the wait, an NFS lock on the same bytes
   (`nfs-try-lock.py FILE 0 10`) must be refused.
+- `windows-domain-test.ps1` checks Kerberos sign-in and share access from a
+  domain-joined Windows machine, against a gateway with no local accounts
+  and two shares: `eng`, admitting one group by SID, and `pub`, read-only
+  with the group's member on its write list. The member uses `eng` and
+  sees itself as the owner of what it writes; the outsider is refused `eng`
+  and can only read `pub`; connecting by IP address, which needs NTLM, is
+  refused. `-SingleSignOn` also runs a scheduled task as the member, which
+  reaches `eng` with no credentials given; the member needs the right to log
+  on as a batch job. Passwords are read from files on the Windows machine
+  (`-SecretDir`), so they never pass through the session. Clients must use
+  the gateway's DNS name (`-Server`) for Kerberos.
 - `windows-space-test.ps1` checks the share's size as Windows reads it
   (`DriveInfo` and `fsutil volume diskfree`), that free space falls as data
   is staged, and that a write past the staging quota fails with "not enough

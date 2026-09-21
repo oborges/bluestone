@@ -202,7 +202,7 @@ func TestSession311KeysFromPreauthHash(t *testing.T) {
 		t.Fatalf("tree connect signed with the 3.1.1 key: %#x", rh.Status)
 	}
 	// And the 3.0 key is not the one in use.
-	if bytes.Equal(signKey, signing.DeriveSigningKey(sessionKey)) {
+	if bytes.Equal(signKey, signing.DeriveSigningKey(sessionKey[:16])) {
 		t.Fatal("3.1.1 signing key equals the 3.0 one")
 	}
 }
@@ -238,7 +238,7 @@ func TestEncryptedRequestSkipsSignature(t *testing.T) {
 	req := buildTreeConnect(rh.SessionId, `\\server\share`)
 	binary.LittleEndian.PutUint32(req[16:20], wire.FlagSigned)
 	copy(req[48:64], bytes.Repeat([]byte{0xAB}, 16))
-	seal, err := encryption.NewAESCCM(encryption.DeriveServerDecryptionKey(sessionKey))
+	seal, err := encryption.NewAESCCM(encryption.DeriveServerDecryptionKey(sessionKey[:16]))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -251,7 +251,7 @@ func TestEncryptedRequestSkipsSignature(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	open, err := encryption.NewAESCCM(encryption.DeriveServerEncryptionKey(sessionKey))
+	open, err := encryption.NewAESCCM(encryption.DeriveServerEncryptionKey(sessionKey[:16]))
 	if err != nil {
 		t.Fatal(err)
 	}

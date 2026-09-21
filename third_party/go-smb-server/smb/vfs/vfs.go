@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/sonroyaalmerol/go-smb-server/smb/auth"
 )
 
 type Share interface {
@@ -53,6 +55,10 @@ type OpenOptions struct {
 	// DeleteOnClose is set when the open asked for the file to be deleted
 	// once every handle to it is closed.
 	DeleteOnClose bool
+	// User is who the session opening the file authenticated as, for a
+	// backend that records who created a file. Nil for the server's own
+	// opens.
+	User *auth.Identity
 }
 
 // ErrSharingViolation reports that an open conflicts with an existing open of
@@ -69,6 +75,12 @@ type FileInfo struct {
 	LastAccess   time.Time
 	LastWrite    time.Time
 	ChangeTime   time.Time
+	// OwnerSID and GroupSID are the file's owner and group as SIDs, such
+	// as "S-1-5-21-...-1105", for its security descriptor. Empty selects
+	// BUILTIN\Administrators and BUILTIN\Users, which say the server keeps
+	// no Windows owners.
+	OwnerSID string
+	GroupSID string
 }
 
 type Handle interface {

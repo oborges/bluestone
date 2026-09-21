@@ -1,6 +1,10 @@
 package wire
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+	"strconv"
+	"strings"
+)
 
 // AdditionalInformation bits in a QUERY_INFO or SET_INFO for security
 // (MS-SMB2 section 2.2.37), naming which parts of the descriptor the client
@@ -23,6 +27,8 @@ const (
 // Access mask bits used in the descriptor (MS-DTYP section 2.4.3).
 const (
 	fileAllAccess uint32 = 0x001F01FF
+	// fileReadExecute is FILE_GENERIC_READ and FILE_GENERIC_EXECUTE.
+	fileReadExecute uint32 = 0x001200A9
 )
 
 const (
@@ -64,21 +70,45 @@ func (s sid) append(dst []byte) []byte {
 	return dst
 }
 
+// Descriptor is what a file's security descriptor describes.
+type Descriptor struct {
+	// IsDir marks a directory, whose ACE is inheritable so Windows shows
+	// the permissions its children will have.
+	IsDir bool
+	// Owner and Group are the file's owner and group as SIDs, such as
+	// "S-1-5-21-...-1105". Empty, or not a SID, selects
+	// BUILTIN\Administrators and BUILTIN\Users.
+	Owner, Group string
+	// ReadOnly grants read access only, for a share its user may only read.
+	ReadOnly bool
+}
+
 // SecurityDescriptor builds the self-relative security descriptor for a file,
-// carrying the parts named in additional. isDir marks a directory, whose ACE
-// is inheritable so Windows shows the permissions its children will have.
+// carrying the parts named in additional.
 //
-// The gateway does not keep Windows owners or ACLs, so the descriptor says
-// so plainly rather than inventing detail: everyone has full access, owned by
-// BUILTIN\Administrators. Clients ask for this on open and to show a file's
-// Security tab; answering STATUS_NOT_SUPPORTED instead makes Windows report
-// that it cannot read the file's security information.
-func SecurityDescriptor(additional uint32, isDir bool) []byte {
+// The gateway does not keep Windows ACLs, so the DACL says plainly what is
+// enforced: everyone has full access, or read access on a read-only share.
+// Clients ask for this on open and to show a file's Security tab; answering
+// STATUS_NOT_SUPPORTED instead makes Windows report that it cannot read the
+// file's security information.
+func SecurityDescriptor(additional uint32, d Descriptor) []byte {
 	// A request naming nothing still gets an owner and a DACL: Windows asks
 	// with AdditionalInformation zero in some paths and expects a
 	// descriptor back.
 	if additional&(OwnerSecurityInformation|GroupSecurityInformation|DACLSecurityInformation|SACLSecurityInformation) == 0 {
 		additional |= OwnerSecurityInformation | DACLSecurityInformation
+	}
+	owner, ok := ParseSID(d.Owner)
+	if !ok {
+		owner = sidAdministrators
+	}
+	group, ok := ParseSID(d.Group)
+	if !ok {
+		group = sidUsers
+	}
+	mask := fileAllAccess
+	if d.ReadOnly {
+		mask = fileReadExecute
 	}
 
 	const headerSize = 20
@@ -88,16 +118,16 @@ func SecurityDescriptor(additional uint32, isDir bool) []byte {
 	var ownerOffset, groupOffset, daclOffset uint32
 	if additional&OwnerSecurityInformation != 0 {
 		ownerOffset = uint32(headerSize + len(body))
-		body = sidAdministrators.append(body)
+		body = owner.append(body)
 	}
 	if additional&GroupSecurityInformation != 0 {
 		groupOffset = uint32(headerSize + len(body))
-		body = sidUsers.append(body)
+		body = group.append(body)
 	}
 	if additional&DACLSecurityInformation != 0 {
 		control |= seDACLPresent
 		daclOffset = uint32(headerSize + len(body))
-		body = appendAllowEveryoneACL(body, isDir)
+		body = appendAllowEveryoneACL(body, d.IsDir, mask)
 	}
 	// The gateway keeps no audit policy, so a request for the SACL gets a
 	// descriptor that says there is none, rather than an error.
@@ -116,10 +146,10 @@ func SecurityDescriptor(additional uint32, isDir bool) []byte {
 	return append(out, body...)
 }
 
-// appendAllowEveryoneACL writes an ACL with one ACE granting everyone full
-// access. On a directory the ACE is inheritable, which is how Windows shows
-// that new files under it get the same access.
-func appendAllowEveryoneACL(dst []byte, isDir bool) []byte {
+// appendAllowEveryoneACL writes an ACL with one ACE granting everyone mask.
+// On a directory the ACE is inheritable, which is how Windows shows that
+// new files under it get the same access.
+func appendAllowEveryoneACL(dst []byte, isDir bool, mask uint32) []byte {
 	aceSize := 8 + sidEveryone.len()
 	aclSize := 8 + aceSize
 
@@ -139,10 +169,32 @@ func appendAllowEveryoneACL(dst []byte, isDir bool) []byte {
 	binary.LittleEndian.PutUint16(u16[:], uint16(aceSize))
 	dst = append(dst, u16[:]...)
 	var u32 [4]byte
-	binary.LittleEndian.PutUint32(u32[:], fileAllAccess)
+	binary.LittleEndian.PutUint32(u32[:], mask)
 	dst = append(dst, u32[:]...)
 	dst = sidEveryone.append(dst)
 
 	binary.LittleEndian.PutUint16(dst[start+2:start+4], uint16(aclSize))
 	return dst
+}
+
+// ParseSID parses a SID in its string form, S-1-<authority>-<sub>... It
+// reports false for anything else.
+func ParseSID(s string) (sid, bool) {
+	parts := strings.Split(s, "-")
+	if len(parts) < 3 || len(parts) > 3+15 || parts[0] != "S" || parts[1] != "1" {
+		return sid{}, false
+	}
+	authority, err := strconv.ParseUint(parts[2], 10, 48)
+	if err != nil {
+		return sid{}, false
+	}
+	out := sid{revision: 1, authority: authority}
+	for _, p := range parts[3:] {
+		v, err := strconv.ParseUint(p, 10, 32)
+		if err != nil {
+			return sid{}, false
+		}
+		out.subAuthorities = append(out.subAuthorities, uint32(v))
+	}
+	return out, true
 }

@@ -362,6 +362,42 @@ proposed upstream.
   SMB 3.0.2 flags FSCTL_VALIDATE_NEGOTIATE_INFO as signed inside an
   encrypted message, and failed every connection that required encryption.
 
+- `smb/kerberos`: Windows can sign in. A client asking for mutual
+  authentication (Windows always does) gets an AP-REP in the reply, which
+  names the mechanism the client offered first (MS-KRB5 for Windows).
+  Upstream sent no AP-REP, so Windows failed the session setup. The
+  identity comes from the ticket's PAC: the account's SID, primary group,
+  groups and NetBIOS domain. `LoadKeytab` and `Principals` help an
+  application load a keytab and log what it answers to.
+- `smb/server` + `smb/encryption`: the session key is the first 16 bytes of
+  the key authentication produced (MS-SMB2 3.3.5.5.3), which matters for
+  Kerberos's 32-byte AES-256 keys; SMB 3.1.1's AES-256 ciphers use the whole
+  key. Upstream signed with keys derived from all 32 bytes, which no client
+  could verify.
+- `smb/spnego` (new): `Negotiate` hands each session setup to Kerberos or
+  NTLM by the mechanism of its first token, and `NegTokenInit` builds the
+  NEGOTIATE response's list of mechanisms, set with
+  `server.WithNegotiateHint`. Windows only tries Kerberos with a server that
+  lists it.
+- `smb/auth`: `Identity` carries `PrimaryGroup` and `Mechanism`, since an
+  NTLM client names its own domain and a Kerberos ticket's is vouched for.
+- `smb/server`: `WithShareAccess` decides at TREE_CONNECT whether a user may
+  use a share, and whether read-only. A read-only tree reports read-only
+  maximal access and refuses, with ACCESS_DENIED as Windows does, any
+  CREATE that asks to change something (write, delete, create, overwrite,
+  delete-on-close, OPEN_IF of a file that is not there), and every WRITE,
+  SET_INFO and server-side copy into it. Upstream gave every user full
+  access to every share.
+- `smb/vfs` + `smb/server`: `OpenOptions.User` tells the backend who opens a
+  file, and `FileInfo.OwnerSID` and `GroupSID` name its owner in the
+  security descriptor, whose DACL is read-only on a read-only share.
+- `smb/server`: a backend can keep its share's byte-range locks
+  (`LockerProvider`). A server's one locker only sees paths relative to a
+  share, so two shares' files collided.
+- `smb/server`: CLOSE releases the open's byte-range locks (MS-SMB2
+  3.3.5.10). They stayed until the tree or session went, so a client that
+  closed a file without unlocking it kept other clients, and NFS, out.
+
 ## Known gaps to close in Bluestone
 
 Tracked with the rest of the SMB work in `docs/SMB_ROADMAP.md`.

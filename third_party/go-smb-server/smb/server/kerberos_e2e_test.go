@@ -141,7 +141,7 @@ func TestKerberosE2E_SessionSetupAndSigning(t *testing.T) {
 	}
 	sessID := rh.SessionId
 
-	correctSigningKey := signing.DeriveSigningKey(sessionKey)
+	correctSigningKey := signing.DeriveSigningKey(sessionKey[:16])
 	mustWrite(t, fc, signedTreeConnect(sessID, 2, `\\server\share`, correctSigningKey))
 	rh, _ = readReply(t, fc)
 	if rh.Status != wire.StatusSuccess {

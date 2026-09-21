@@ -17,7 +17,7 @@ func (c *request) handleLock(_ context.Context, msg []byte, hdr *wire.Header, tr
 		return c.errBody(wire.StatusInvalidHandle)
 	}
 
-	locker := c.srv.lockTable()
+	locker := c.srv.lockerFor(tr.share)
 	// Owned by the open, not the session sending the request: a durable
 	// open reclaimed on a new session keeps the locks it took.
 	owner := lockOwner(oh.sessionID, oh.fileId)
@@ -96,6 +96,9 @@ func (c *request) handleIoctl(ctx context.Context, msg []byte, tr *tree) uint32 
 	case wire.FSCTLSrvCopychunk, wire.FSCTLSrvCopychunkWrite:
 		if tr == nil {
 			return c.errBody(wire.StatusInvalidDeviceRequest)
+		}
+		if tr.readOnly {
+			return c.errBody(wire.StatusAccessDenied)
 		}
 		oh, ok := tr.open(req.FileId)
 		if !ok {

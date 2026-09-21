@@ -38,7 +38,7 @@ func TestCompoundResponsesAreEachSigned(t *testing.T) {
 		t.Fatalf("session_setup: %#x", rh.Status)
 	}
 	sessID := rh.SessionId
-	key := signing.DeriveSigningKey(sessionKey)
+	key := signing.DeriveSigningKey(sessionKey[:16])
 	mustWrite(t, fc, signedTreeConnect(sessID, 2, `\\server\share`, key))
 	rh, _ = readReply(t, fc)
 	if rh.Status != wire.StatusSuccess {
@@ -133,7 +133,7 @@ func TestAsyncChangeNotifyIsSigned(t *testing.T) {
 	mustWrite(t, fc, buildSessionSetup(token))
 	rh, _ := readReply(t, fc)
 	sessID := rh.SessionId
-	key := signing.DeriveSigningKey(sessionKey)
+	key := signing.DeriveSigningKey(sessionKey[:16])
 	mustWrite(t, fc, signedTreeConnect(sessID, 2, `\\server\share`, key))
 	rh, _ = readReply(t, fc)
 	treeID := rh.TreeId
@@ -201,7 +201,7 @@ func TestSignedCompoundRequestsVerify(t *testing.T) {
 	mustWrite(t, fc, buildSessionSetup(token))
 	rh, _ := readReply(t, fc)
 	sessID := rh.SessionId
-	key := signing.DeriveSigningKey(sessionKey)
+	key := signing.DeriveSigningKey(sessionKey[:16])
 	mustWrite(t, fc, signedTreeConnect(sessID, 2, `\\server\share`, key))
 	rh, _ = readReply(t, fc)
 	treeID := rh.TreeId

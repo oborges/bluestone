@@ -115,7 +115,9 @@ func (c *request) handleQueryInfo(ctx context.Context, msg []byte, tr *tree) uin
 		if err != nil {
 			return c.errBody(osErrToStatus(err))
 		}
-		descriptor := wire.SecurityDescriptor(req.AdditionalInfo, fi.IsDir)
+		descriptor := wire.SecurityDescriptor(req.AdditionalInfo, wire.Descriptor{
+			IsDir: fi.IsDir, Owner: fi.OwnerSID, Group: fi.GroupSID, ReadOnly: tr.readOnly,
+		})
 		if uint32(len(descriptor)) > req.OutputBufferLength {
 			// The client asks with a small buffer first and retries with
 			// the size the server reports (MS-SMB2 3.3.5.20.3), so the

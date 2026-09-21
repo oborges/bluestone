@@ -116,8 +116,9 @@ func (s *serverAuthenticator) handleAuthenticate(ctx context.Context, msg []byte
 
 	s.stage = 2
 	ident := &auth.Identity{
-		Username: s.user,
-		Domain:   s.domain,
+		Username:  s.user,
+		Domain:    s.domain,
+		Mechanism: auth.MechanismNTLM,
 	}
 	if !s.spnego {
 		// Raw NTLMSSP ends with an empty security buffer.

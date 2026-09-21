@@ -100,7 +100,7 @@ func itoa(v uint64) string {
 // Windows reads the descriptor to show a file's Security tab, so it has to
 // be a well-formed self-relative descriptor with the parts asked for.
 func TestSecurityDescriptorStructure(t *testing.T) {
-	sd := SecurityDescriptor(OwnerSecurityInformation|GroupSecurityInformation|DACLSecurityInformation, false)
+	sd := SecurityDescriptor(OwnerSecurityInformation|GroupSecurityInformation|DACLSecurityInformation, Descriptor{})
 	got := parseDescriptor(t, sd)
 
 	if got.revision != 1 {
@@ -130,7 +130,7 @@ func TestSecurityDescriptorStructure(t *testing.T) {
 // A directory's ACE is inheritable, which is how Windows shows that files
 // created under it get the same access.
 func TestSecurityDescriptorDirectoryInherits(t *testing.T) {
-	got := parseDescriptor(t, SecurityDescriptor(DACLSecurityInformation, true))
+	got := parseDescriptor(t, SecurityDescriptor(DACLSecurityInformation, Descriptor{IsDir: true}))
 	if got.aceFlags&(aceObjectInheritFlag|aceContainerInherit) != (aceObjectInheritFlag | aceContainerInherit) {
 		t.Errorf("ACE flags on a directory = %#x, want object and container inherit", got.aceFlags)
 	}
@@ -138,7 +138,7 @@ func TestSecurityDescriptorDirectoryInherits(t *testing.T) {
 
 // Only the parts the client asked for come back.
 func TestSecurityDescriptorHonoursAdditionalInformation(t *testing.T) {
-	owner := parseDescriptor(t, SecurityDescriptor(OwnerSecurityInformation, false))
+	owner := parseDescriptor(t, SecurityDescriptor(OwnerSecurityInformation, Descriptor{}))
 	if owner.owner == "" {
 		t.Error("owner-only request returned no owner")
 	}
@@ -149,7 +149,7 @@ func TestSecurityDescriptorHonoursAdditionalInformation(t *testing.T) {
 		t.Error("owner-only request returned a DACL")
 	}
 
-	dacl := parseDescriptor(t, SecurityDescriptor(DACLSecurityInformation, false))
+	dacl := parseDescriptor(t, SecurityDescriptor(DACLSecurityInformation, Descriptor{}))
 	if dacl.owner != "" || dacl.group != "" {
 		t.Errorf("DACL-only request returned owner %q and group %q", dacl.owner, dacl.group)
 	}
@@ -158,15 +158,34 @@ func TestSecurityDescriptorHonoursAdditionalInformation(t *testing.T) {
 	}
 
 	// Asking for the SACL says there is none rather than failing.
-	sacl := parseDescriptor(t, SecurityDescriptor(SACLSecurityInformation, false))
+	sacl := parseDescriptor(t, SecurityDescriptor(SACLSecurityInformation, Descriptor{}))
 	if sacl.control&seSACLPresent == 0 {
 		t.Errorf("control = %#x, want the SACL-present bit", sacl.control)
 	}
 
 	// Some clients ask for nothing in particular and still expect a
 	// descriptor.
-	empty := parseDescriptor(t, SecurityDescriptor(0, false))
+	empty := parseDescriptor(t, SecurityDescriptor(0, Descriptor{}))
 	if empty.owner == "" || !empty.daclPresent {
 		t.Errorf("request with no parts named returned owner %q, dacl %v; want both", empty.owner, empty.daclPresent)
+	}
+}
+
+// A file's owner and group come from the SIDs the backend reports, and a
+// read-only share grants read access only.
+func TestSecurityDescriptorOwnerAndReadOnly(t *testing.T) {
+	const owner, group = "S-1-5-21-3167651404-3865080224-2280184895-1105", "S-1-22-2-100513"
+	got := parseDescriptor(t, SecurityDescriptor(OwnerSecurityInformation|GroupSecurityInformation|DACLSecurityInformation,
+		Descriptor{Owner: owner, Group: group, ReadOnly: true}))
+	if got.owner != owner || got.group != group {
+		t.Errorf("owner %s group %s, want %s and %s", got.owner, got.group, owner, group)
+	}
+	if got.aceMask != fileReadExecute {
+		t.Errorf("ACE mask on a read-only share = %#x, want %#x", got.aceMask, fileReadExecute)
+	}
+	// Something that is not a SID falls back to the defaults.
+	got = parseDescriptor(t, SecurityDescriptor(OwnerSecurityInformation, Descriptor{Owner: "alice"}))
+	if got.owner != "S-1-5-32-544" {
+		t.Errorf("owner for a non-SID = %s, want BUILTIN\\Administrators", got.owner)
 	}
 }
