@@ -123,6 +123,11 @@ smb:
   # contents together. They are kept in the object's metadata: at most 2560
   # on IBM COS, and 1024 for stores with Amazon S3's 2 KB metadata limit.
   max_stream_bytes: 2048
+  # Let clients cache the files they read, with read and read-handle leases.
+  # Writes are never cached. Changes over NFS break the leases; so do changes
+  # made directly in the bucket if object_refresh is enabled. Without it, turn
+  # this off if other tools write to the bucket.
+  leases: true
   # What one client can make the gateway hold, and how fast it may keep
   # failing to log in. 0 means no limit; the defaults shown are generous
   # enough that no ordinary client meets them.

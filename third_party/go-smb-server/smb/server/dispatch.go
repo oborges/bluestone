@@ -109,6 +109,7 @@ func (c *request) handleNegotiate(msg []byte, hdr *wire.Header) uint32 {
 	}
 
 	caps := c.negotiateCapabilities()
+	c.clientGUID = req.ClientGuid
 	c.negDialect = dialect
 	c.negCaps = caps
 
@@ -304,6 +305,7 @@ func (c *conn) closeAllOpens(ctx context.Context, tr *tree) {
 	for _, oh := range tr.allOpens() {
 		c.srv.lockTable().ReleaseOwner(lockOwner(oh.sessionID, oh.fileId))
 		c.srv.resumeKeyTable().release(oh)
+		c.srv.leaseTable().release(oh)
 		c.srv.endWatch(oh)
 		_ = oh.h.Close(ctx)
 		// A client that disconnects still gets its delete-on-close files
@@ -393,6 +395,20 @@ func (c *request) handleCreate(ctx context.Context, msg []byte, hdr *wire.Header
 		// overwrite does not truncate a file on its way out.
 		return c.errBody(wire.StatusDeletePending)
 	}
+	// The lease the request asks for, if any: its key may not already name
+	// another file.
+	var asked leaseID
+	askedLease := false
+	if c.srv.leasesEnabled && req.RequestedOplockLevel == wire.OplockLevelLease {
+		if data, ok := req.Context(wire.CreateContextLease); ok {
+			if l, err := wire.ParseLeaseRequest(data); err == nil {
+				asked, askedLease = leaseID{client: c.clientGUID, key: l.Key}, true
+				if c.srv.leaseTable().leaseConflict(asked, key) {
+					return c.errBody(wire.StatusInvalidParameter)
+				}
+			}
+		}
+	}
 	opts := vfs.OpenOptions{
 		Path:          base,
 		Disposition:   req.CreateDisposition,
@@ -417,6 +433,18 @@ func (c *request) handleCreate(ctx context.Context, msg []byte, hdr *wire.Header
 	} else {
 		h, err = backend.Open(ctx, opts)
 	}
+	if errors.Is(err, vfs.ErrSharingViolation) && c.srv.leasesEnabled && !c.retryingCreate && !c.compound {
+		// Another client may only be holding the file open because it
+		// caches the handle. Told to stop, it closes it, and the open
+		// may then succeed: wait for that before answering.
+		except := asked
+		if !askedLease {
+			except = leaseID{}
+		}
+		if waits := c.srv.leaseTable().breakHandle(key, except); len(waits) > 0 {
+			return c.createAfterBreaks(ctx, msg, hdr, sess, tr, waits)
+		}
+	}
 	if err != nil {
 		return c.errBody(osErrToStatus(err))
 	}
@@ -439,6 +467,11 @@ func (c *request) handleCreate(ctx context.Context, msg []byte, hdr *wire.Header
 		access: req.DesiredAccess, deleteOnClose: deleteOnClose, isDir: fi.IsDir, stream: stream != ""}
 	files.add(key, oh)
 	tr.addOpen(oh)
+	switch req.CreateDisposition {
+	case wire.FileOverwrite, wire.FileOverwriteIf, wire.FileSupersede:
+		// Replacing the file's data: what others cached is stale.
+		c.srv.dataChanged(oh)
+	}
 	if selfNotify {
 		switch {
 		case !existed:
@@ -464,15 +497,14 @@ func (c *request) handleCreate(ctx context.Context, msg []byte, hdr *wire.Header
 		action = wire.FileOverwritten
 	}
 
-	// Grant no oplock. Granting one lets the client cache the file and write
-	// its cached copy back later, but breaking an oplock is not implemented
-	// here, and the same objects are also reachable over NFS and directly in
-	// the object store. With no oplock, clients write through: Windows
-	// PowerShell's Set-Content otherwise flushed stale cached content and
-	// silently appended to files instead of replacing them.
-	var oplock uint8
+	// Read caching at most: a client never caches writes, which upstream
+	// let it do with exclusive and batch oplocks, and which made Windows
+	// PowerShell's Set-Content flush stale cached content and silently
+	// append to files instead of replacing them.
+	oplock, contexts := c.grantCaching(&req, sess, tr, oh, fi)
 
 	resp := wire.CreateResponse{
+		Contexts:       contexts,
 		OplockLevel:    oplock,
 		CreateAction:   action,
 		CreationTime:   wire.TimeToFiletime(fi.CreationTime),
@@ -535,11 +567,9 @@ func (c *request) handleClose(ctx context.Context, msg []byte, tr *tree) uint32 
 		return c.errBody(osErrToStatus(err))
 	}
 	tr.removeOpen(req.FileId)
+	c.srv.leaseTable().release(oh)
 	c.srv.resumeKeyTable().release(oh)
 	c.srv.endWatch(oh)
-	if tr.oplocks != nil {
-		tr.oplocks.release(oh.currentPath())
-	}
 
 	if rmErr := c.releaseOpen(ctx, tr, oh); rmErr != nil {
 		return c.errBody(osErrToStatus(rmErr))
@@ -596,6 +626,9 @@ func (c *request) handleWrite(ctx context.Context, msg []byte, tr *tree) uint32 
 	n, err := oh.h.Write(ctx, int64(req.Offset), req.Data)
 	if err != nil {
 		return c.errBody(osErrToStatus(err))
+	}
+	if n > 0 {
+		c.srv.dataChanged(oh)
 	}
 	if n > 0 && !oh.stream && !oh.wrote.Swap(true) {
 		// Reported once per handle: a client watching does not need a
@@ -729,4 +762,46 @@ func (c *request) handleQueryDirectory(ctx context.Context, msg []byte, tr *tree
 func (c *request) handleEcho(hdr *wire.Header) uint32 {
 	c.out = append(c.out, 0x04, 0x00, 0x00, 0x00)
 	return wire.StatusSuccess
+}
+
+// createAfterBreaks answers a CREATE that met a sharing violation while
+// other clients cache handles to the file: it goes async, and once they have
+// acknowledged the break (or not, in time) it is tried again, succeeding if
+// the clients closed the handles they were caching (MS-SMB2 section
+// 3.3.5.9, the oplock break wait).
+func (c *request) createAfterBreaks(ctx context.Context, msg []byte, hdr *wire.Header, sess *session, tr *tree, waits []chan struct{}) uint32 {
+	op := c.registerPending(hdr.MessageId)
+	c.asyncID = op.asyncID
+	retry := append([]byte(nil), msg...)
+	reqHdr := *hdr
+	timeout := c.srv.leaseTable().timeout + time.Second
+	c.after = append(c.after, func() {
+		go func() {
+			deadline := time.NewTimer(timeout)
+			defer deadline.Stop()
+			for _, wait := range waits {
+				select {
+				case <-wait:
+				case <-deadline.C:
+				case <-op.done:
+					c.unregister(op)
+					c.sendAsyncFinal(reqHdr, op.asyncID, wire.StatusCancelled, errorBody())
+					return
+				}
+			}
+			r := &request{conn: c.conn, retryingCreate: true}
+			var lastFileId [16]byte
+			status := r.handleCreate(ctx, retry, &reqHdr, sess, tr, &lastFileId)
+			c.unregister(op)
+			c.sendAsyncFinal(reqHdr, op.asyncID, status, r.out)
+		}()
+	})
+	c.out = append(c.out, errorBody()...)
+	return wire.StatusPending
+}
+
+// errorBody is an SMB2 ERROR response body with no data, which is also what
+// an interim response carries.
+func errorBody() []byte {
+	return []byte{9, 0, 0, 0, 0, 0, 0, 0, 0}
 }

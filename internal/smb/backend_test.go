@@ -1412,3 +1412,44 @@ func TestSMBBackendReportsChanges(t *testing.T) {
 		}
 	}
 }
+
+// Changes made over NFS are marked external, so the SMB server breaks leases
+// for them; changes made through the SMB server are not, since it breaks
+// leases for those as it makes them.
+func TestSMBBackendMarksExternalChanges(t *testing.T) {
+	g := startGateway(t)
+	backend := NewBackend(g.filesystem, nil)
+	var mu sync.Mutex
+	external := map[string]bool{}
+	stop := backend.NotifyChanges(func(c smbvfs.Change) {
+		if c.Action != smbvfs.ChangeModified {
+			return
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		external[c.Path] = c.External
+	})
+	defer stop()
+
+	if err := g.share.WriteFile("from-smb.txt", []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	nfs := g.filesystem.ForProtocol(metrics.ProtocolNFS)
+	f, err := nfs.OpenFile("from-nfs.txt", os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write([]byte("y")); err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if ext, ok := external["from-smb.txt"]; !ok || ext {
+		t.Errorf("SMB write reported external=%v (seen %v), want a change marked internal", ext, ok)
+	}
+	if ext, ok := external["from-nfs.txt"]; !ok || !ext {
+		t.Errorf("NFS write reported external=%v (seen %v), want a change marked external", ext, ok)
+	}
+}

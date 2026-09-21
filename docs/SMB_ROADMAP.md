@@ -105,6 +105,12 @@ staging area reports as disk full, and macOS no longer litters `._` files.
   client-side caching comes from, and where cross-protocol consistency is
   easiest to lose. Oplocks and leases stay ungranted until breaks are
   implemented and tested from both protocols.
+  Done: read and read-handle leases, and level II oplocks. Write caching is
+  never granted. On Windows (`windows-lease-test.ps1`), an NFS write broke a
+  read-handle lease and the next read through the same handle saw the new
+  data. 50 reads of a file went from 400 READs to 1. A macOS write to a file
+  Windows had cached a handle to succeeded after the handle break, where it
+  would have failed as "in use".
 
 **Done when:** a directory with many watchers costs no listings while idle,
 and a lease held by a Windows client is broken by an NFS write to the same

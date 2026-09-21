@@ -90,6 +90,15 @@ ssh gateway 'sudo sed -n "s/^ *password: \"\(.*\)\"$/\1/p" /etc/bluestone/config
   the gateway's `ListDirectory` log lines during the idle phase to check
   that watching costs no listings. ssh buffers PowerShell's output, so time
   the phases from the start, not from the printed markers.
+- `windows-lease-test.ps1 -Unc \\SERVER\SHARE -Phase stale|cache|handle -User NAME`
+  checks leases from Windows, one phase per run so the gateway's counters
+  can be read around each. `stale` reads a file through an open handle,
+  waits (`-Wait`, 12 s) while you change it elsewhere (over NFS), then reads
+  again: it must see the change. `cache` reads a file 50 times; compare
+  `smb_requests_total{command="READ"}` before and after, with `smb.leases`
+  on and off. `handle` reads a file and closes it, leaving a cached handle:
+  writing it from another client (macOS) afterwards must succeed.
+  `smb_lease_breaks_total` shows the breaks.
 - `windows-space-test.ps1` checks the share's size as Windows reads it
   (`DriveInfo` and `fsutil volume diskfree`), that free space falls as data
   is staged, and that a write past the staging quota fails with "not enough

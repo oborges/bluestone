@@ -231,6 +231,7 @@ smb:
   concurrent_requests: 0 # reads/writes at once per connection; 0 = default (64), 1 = serial
   drain_timeout: "30s"   # how long a shutdown waits for clients to finish
   max_stream_bytes: 2048 # cap on a file's named streams, kept in object metadata
+  leases: true           # let clients cache the files they read
   limits:
     max_connections: 256
     max_connections_per_client: 64
@@ -389,11 +390,26 @@ from Windows is refused, because accepting a change the gateway cannot store
 would show permissions that nothing enforces. Access is controlled by the
 accounts in `smb.users` and by `server.allowed_clients`.
 
-No oplocks or leases are granted, so clients do not cache file contents
-locally and write through to the gateway. That keeps SMB clients consistent
-with NFS clients and with changes made directly in the bucket, at the cost of
-some client-side caching performance. Signing uses AES-CMAC and encryption
-AES-128-CCM.
+Clients may cache the files they read (`smb.leases`, on by default).
+Windows and macOS get read and read-handle leases, and older clients level II
+oplocks. Reads of a cached file are served from the client, and a handle
+closed and reopened is reused. In one Windows test, 50 reads of a file took
+70 ms instead of 969, with 1 read reaching the gateway instead of 400.
+
+Clients never cache writes: every write reaches the gateway. When a file
+changes through anyone else, the gateway breaks the leases on it before
+acknowledging the change, and the clients drop what they cached. That covers
+another SMB client, an NFS client, and changes the object refresh scanner
+finds made directly in the bucket. Without the scanner, a client can keep
+serving its cached copy of a file changed behind the gateway's back, until
+it closes the file. Turn the scanner on, or leases off, if other tools write
+to the bucket.
+
+A client caching a handle keeps the file open after the application closes
+it. When another client's open would conflict with that handle, the gateway
+asks the client to let go and waits for it, up to 35 seconds, instead of
+failing the open as "in use". Signing uses AES-CMAC and encryption
+AES-128-CCM; leases are not granted on sessions that require encryption.
 
 Named data streams (alternate data streams) are supported, and kept in the
 object's metadata rather than as objects of their own. macOS stores Finder
@@ -591,6 +607,10 @@ Important metrics include:
   command, so a compound request counts once per command in it, and `status`
   is the NT status the client saw, such as `STATUS_SHARING_VIOLATION`
 - `smb_connections`, `smb_sessions`, `smb_open_files`
+- `smb_leases_granted_total` (labels `kind`: lease or oplock, `state`),
+  `smb_lease_breaks_total` (labels `kind`, `from`, `to`), and
+  `smb_lease_break_timeouts_total`: client caching granted, and taken back
+  when files change
 - `smb_connections_refused_total` (label `reason`: which limit refused them)
 - `smb_auth_failures_total`, `smb_auth_blocked_total`,
   `smb_auth_blocked_clients`

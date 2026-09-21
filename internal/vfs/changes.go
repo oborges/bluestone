@@ -46,6 +46,10 @@ type Change struct {
 	OldPath string // for ChangeRenamed
 	IsDir   bool
 	Kind    ChangeKind // for ChangeModified
+	// Protocol is the protocol whose view made the change (see
+	// ForProtocol): SMB tells its own changes, which it breaks leases for
+	// as it makes them, from those made over NFS or found in the bucket.
+	Protocol string
 }
 
 // changeFeed passes every change made through the filesystem to its
@@ -95,7 +99,10 @@ func (feed *changeFeed) publish(c Change) {
 	}
 }
 
-func (fs *Filesystem) changed(c Change) { fs.changes.publish(c) }
+func (fs *Filesystem) changed(c Change) {
+	c.Protocol = fs.protocol
+	fs.changes.publish(c)
+}
 
 // active reports whether anything is subscribed, so callers can skip work
 // done only to describe a change.
@@ -198,15 +205,15 @@ func (fs *Filesystem) CopyFile(src, dst string, onlyUnwritten bool) error {
 	return nil
 }
 
-// noteWrite publishes a handle's first write; Close publishes the rest.
-// Called with f.mu held.
+// noteWrite publishes a write. Every write is published, not only a
+// handle's first: an SMB client may take a lease on the file between two
+// writes, and the next write has to break it. Called with f.mu held, before
+// the write is acknowledged to the client that made it.
 func (f *File) noteWrite(n int) {
 	if n <= 0 || f.changes == nil {
 		return
 	}
-	if !f.wrote {
-		f.changes.publish(Change{Action: ChangeModified, Path: f.path, Kind: ChangeData})
-	}
+	f.changes.publish(Change{Action: ChangeModified, Path: f.path, Kind: ChangeData, Protocol: f.protocol})
 	f.wrote = true
 }
 
@@ -215,7 +222,7 @@ func (f *File) Truncate(size int64) error {
 	if err := f.truncate(size); err != nil {
 		return err
 	}
-	f.changes.publish(Change{Action: ChangeModified, Path: f.path, Kind: ChangeData})
+	f.changes.publish(Change{Action: ChangeModified, Path: f.path, Kind: ChangeData, Protocol: f.protocol})
 	return nil
 }
 
@@ -249,7 +256,7 @@ func (fs *Filesystem) ClientPath(keyPath string) (string, bool) {
 // the object refresh scanner finds them, so watchers hear of changes that
 // did not pass through the gateway.
 func (fs *Filesystem) ReportExternalChange(c posix.ObjectChange) {
-	change := Change{Path: c.Path, IsDir: c.IsDir}
+	change := Change{Path: c.Path, IsDir: c.IsDir, Protocol: ProtocolBucket}
 	switch c.Kind {
 	case posix.ObjectAdded:
 		change.Action = ChangeAdded
@@ -260,5 +267,9 @@ func (fs *Filesystem) ReportExternalChange(c posix.ObjectChange) {
 	default:
 		return
 	}
-	fs.changed(change)
+	fs.changes.publish(change)
 }
+
+// ProtocolBucket marks changes found in the bucket rather than made through
+// the gateway.
+const ProtocolBucket = "bucket"

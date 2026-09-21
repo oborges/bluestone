@@ -429,6 +429,7 @@ func main() {
 			ConcurrentRequests: cfg.SMB.ConcurrentRequests,
 			DrainTimeout:       drainTimeout,
 			MaxStreamBytes:     cfg.SMB.MaxStreamBytes,
+			Leases:             cfg.SMB.Leases,
 			Limits: smb.Limits{
 				Connections:           cfg.SMB.Limits.MaxConnections,
 				ConnectionsPerClient:  cfg.SMB.Limits.MaxConnectionsPerClient,

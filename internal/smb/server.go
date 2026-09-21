@@ -75,6 +75,9 @@ type ServerOptions struct {
 	// MaxStreamBytes caps a file's named streams, names and contents
 	// together; 0 selects config.DefaultMaxStreamBytes.
 	MaxStreamBytes int
+	// Leases lets clients cache the files they read (see
+	// config.SMBConfig.Leases).
+	Leases bool
 	// Logger receives server logs; nil discards them.
 	Logger *zap.Logger
 }
@@ -164,6 +167,9 @@ func NewServer(fs *vfs.Filesystem, opts ServerOptions) (*Server, error) {
 	}
 	if opts.EncryptionRequired {
 		serverOpts = append(serverOpts, server.WithEncryptionRequired())
+	}
+	if opts.Leases {
+		serverOpts = append(serverOpts, server.WithLeases(0))
 	}
 	if opts.Locks != nil {
 		serverOpts = append(serverOpts, server.WithLocker(NewLocker(opts.Locks)))

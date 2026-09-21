@@ -33,26 +33,30 @@ const (
 )
 
 type Server struct {
-	addr          string
-	authFactory   auth.Factory
-	shares        []vfs.Share
-	shareByName   map[string]vfs.Share
-	dialect       uint16
-	locker        vfs.ByteRangeLocker
-	observer      Observer
-	limits        Limits
-	authGate      AuthGate
-	resume        *resumeKeys
-	files         *openFiles
-	notify        *notifyHub
-	maxConcurrent int
-	maxTransact   uint32
-	maxRead       uint32
-	maxWrite      uint32
-	maxCredits    uint32
-	requireEnc    bool
-	log           *slog.Logger
-	guid          [16]byte
+	addr        string
+	authFactory auth.Factory
+	shares      []vfs.Share
+	shareByName map[string]vfs.Share
+	dialect     uint16
+	locker      vfs.ByteRangeLocker
+	observer    Observer
+	limits      Limits
+	authGate    AuthGate
+	resume      *resumeKeys
+	files       *openFiles
+	notify      *notifyHub
+	leases      *leaseTable
+	// leasesEnabled grants leases and level II oplocks (WithLeases).
+	leasesEnabled     bool
+	leaseBreakTimeout time.Duration
+	maxConcurrent     int
+	maxTransact       uint32
+	maxRead           uint32
+	maxWrite          uint32
+	maxCredits        uint32
+	requireEnc        bool
+	log               *slog.Logger
+	guid              [16]byte
 
 	mu       sync.Mutex
 	listener net.Listener
@@ -306,11 +310,10 @@ type session struct {
 }
 
 type tree struct {
-	share   vfs.Share
-	mu      sync.RWMutex
-	opens   map[[16]byte]*openHandle
-	nextID  uint64
-	oplocks *oplockTable
+	share  vfs.Share
+	mu     sync.RWMutex
+	opens  map[[16]byte]*openHandle
+	nextID uint64
 }
 
 // open returns an open handle by id.
@@ -374,6 +377,9 @@ type openHandle struct {
 	isDir         bool
 	// stream is set on a handle to a named stream rather than a file.
 	stream bool
+	// lease is the lease or oplock the open caches under, if any; the
+	// lease table's lock guards it.
+	lease *lease
 	// key names the file in the server's table of open files, and changes
 	// when the file is renamed. The table's lock guards it.
 	key fileKey
@@ -419,6 +425,14 @@ type request struct {
 	// concurrent is set for a read or write handled alongside other
 	// requests rather than in turn on the read loop.
 	concurrent bool
+	// compound is set while handling a request that is part of a chain.
+	compound bool
+	// asyncID is set by a handler that answers with an interim response
+	// and completes later: the response goes out as async.
+	asyncID uint64
+	// retryingCreate marks a CREATE tried again after lease breaks, which
+	// does not wait for breaks a second time.
+	retryingCreate bool
 }
 
 // finish queues the response and runs what waited for it.
@@ -470,6 +484,9 @@ type conn struct {
 	// clients compare the two and drop the connection when they differ.
 	negDialect uint16
 	negCaps    uint32
+	// clientGUID is the client's identity from NEGOTIATE, which scopes the
+	// lease keys it chooses.
+	clientGUID [16]byte
 }
 
 func (s *Server) serveConn(ctx context.Context, c net.Conn) {
@@ -817,12 +834,13 @@ func (c *request) handleMessage(ctx context.Context, msg []byte) {
 		case related && createErr != wire.StatusSuccess:
 			status = createErr
 		default:
+			c.compound = hdr.NextCommand != 0 || !first
 			status = c.dispatch(ctx, sub, &hdr, &lastFileId, related)
 		}
 		c.srv.obs().RequestCompleted(hdr.Command, status, time.Since(started))
 		c.lastActive.Store(time.Now().UnixNano())
 		lastStatus = status
-		if hdr.Command == wire.CmdCreate {
+		if hdr.Command == wire.CmdCreate && status != wire.StatusPending {
 			createErr = status
 		}
 
@@ -834,6 +852,13 @@ func (c *request) handleMessage(ctx context.Context, msg []byte) {
 			hdr.Flags |= wire.FlagRelatedOps
 		}
 		hdr.Flags &^= wire.FlagAsyncCommand
+		interim := c.asyncID != 0
+		if interim {
+			// The request completes later; this is its interim response.
+			hdr.Flags |= wire.FlagAsyncCommand
+			hdr.AsyncId = c.asyncID
+			c.asyncID = 0
+		}
 		hdr.Status = status
 		hdr.EncodeAt(c.out[respStart:])
 
@@ -841,7 +866,7 @@ func (c *request) handleMessage(ctx context.Context, msg []byte) {
 			c.updatePreauth(c.out[respStart:])
 		}
 
-		if sess := c.getSession(hdr.SessionId); sess != nil && sess.signer != nil {
+		if sess := c.getSession(hdr.SessionId); sess != nil && sess.signer != nil && !interim {
 			encrypting := sess.requireEncrypt && hdr.Command != wire.CmdNegotiate && hdr.Command != wire.CmdSessionSetup
 			if !encrypting {
 				hdr.Flags |= wire.FlagSigned

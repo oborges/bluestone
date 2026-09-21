@@ -436,6 +436,11 @@ type Change struct {
 	OldPath string
 	IsDir   bool
 	Filter  uint32
+	// External is set for a change not made through this server, as by
+	// NFS or directly in the bucket. The server breaks leases for the
+	// changes it makes itself as it makes them, sparing the lease of the
+	// open making the change, and for external ones when they are reported.
+	External bool
 }
 
 // ChangeNotifier is a backend that reports changes to its share as they
