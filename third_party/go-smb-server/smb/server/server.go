@@ -43,6 +43,7 @@ type Server struct {
 	limits        Limits
 	authGate      AuthGate
 	resume        *resumeKeys
+	files         *openFiles
 	maxConcurrent int
 	maxTransact   uint32
 	maxRead       uint32
@@ -361,13 +362,26 @@ func (t *tree) nextFileID() uint64 {
 }
 
 type openHandle struct {
-	h             vfs.Handle
-	fileId        [16]byte
-	sessionID     uint64
-	path          string
-	deletePending bool
-	enumDone      bool
-	enumMu        sync.Mutex
+	h         vfs.Handle
+	fileId    [16]byte
+	sessionID uint64
+	// access is what the open was granted (MS-SMB2 section 2.2.13.1).
+	access uint32
+	// deleteOnClose is set when the open was made with
+	// FILE_DELETE_ON_CLOSE: closing it marks the file delete-pending.
+	deleteOnClose bool
+	isDir         bool
+	// key names the file in the server's table of open files, and changes
+	// when the file is renamed. The table's lock guards it.
+	key fileKey
+
+	// path is the share-relative name the client used, updated when the
+	// file is renamed through any handle; read it with currentPath.
+	pathMu sync.Mutex
+	path   string
+
+	enumDone bool
+	enumMu   sync.Mutex
 
 	// Directory enumeration is paged: clients ask repeatedly, sometimes one
 	// entry at a time, until the server reports no more files. The entries
@@ -969,4 +983,17 @@ func (s *session) allTrees() []*tree {
 		trees = append(trees, t)
 	}
 	return trees
+}
+
+// currentPath is the file's share-relative name, following renames.
+func (oh *openHandle) currentPath() string {
+	oh.pathMu.Lock()
+	defer oh.pathMu.Unlock()
+	return oh.path
+}
+
+func (oh *openHandle) setPath(p string) {
+	oh.pathMu.Lock()
+	defer oh.pathMu.Unlock()
+	oh.path = p
 }

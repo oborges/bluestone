@@ -351,6 +351,18 @@ fail with a sharing violation until it closes. The table of open files lives
 in the gateway, so opens conflict across all SMB clients; NFS does not take
 part in it yet.
 
+Deletes follow Windows semantics. A file marked for deletion stays until
+the last handle to it closes, not only the handle that marked it; every
+handle reports the delete as pending, and new opens are refused meanwhile.
+A read-only file and a directory with anything in it refuse to be deleted,
+and a directory opened delete-on-close while it has entries is left in
+place. Handles follow renames, so deleting through a handle after renaming
+its file deletes the renamed file, never a new file that has taken the old
+name, which is how applications that save by renaming the old version
+aside behave. A directory with a file open inside it, a file someone has
+open as a rename target, and a file waiting to be deleted all refuse
+renames, as on Windows.
+
 Copying a file inside the share is done by the gateway: the client asks for
 a server-side copy and the bytes never travel to it and back. When the whole
 file is being copied, the gateway goes further and copies the object inside

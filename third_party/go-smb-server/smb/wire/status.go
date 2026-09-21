@@ -36,6 +36,8 @@ const (
 	StatusUserSessionDeleted     uint32 = 0xC0000203
 	StatusDiskFull               uint32 = 0xC000007F
 	StatusDirectoryNotEmpty      uint32 = 0xC0000101
+	StatusDeletePending          uint32 = 0xC0000056
+	StatusCannotDelete           uint32 = 0xC0000121
 	StatusMediaWriteProtected    uint32 = 0xC00000A2
 	StatusObjectNameInvalid      uint32 = 0xC0000033
 	StatusIOTimeout              uint32 = 0xC00000B5

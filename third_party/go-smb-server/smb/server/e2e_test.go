@@ -215,6 +215,14 @@ func buildTreeConnect(sessID uint64, share string) []byte {
 }
 
 func buildCreate(sessID uint64, treeID uint32, name string, disposition uint32) []byte {
+	return buildCreateWith(sessID, treeID, name, disposition, genericAll, 0)
+}
+
+const genericAll uint32 = 0x10000000
+
+// buildCreateWith opens name asking for access, with the given create
+// options, sharing everything.
+func buildCreateWith(sessID uint64, treeID uint32, name string, disposition, access, options uint32) []byte {
 	nameBytes := wire.UTF16ToBytes(name)
 	hdr := wire.NewHeader(wire.CmdCreate)
 	hdr.SessionId = sessID
@@ -226,7 +234,10 @@ func buildCreate(sessID uint64, treeID uint32, name string, disposition uint32) 
 	pad := nameOff - (wire.HeaderSize + fixed)
 	body := make([]byte, fixed+pad+len(nameBytes))
 	binary.LittleEndian.PutUint16(body[0:2], 57)
+	binary.LittleEndian.PutUint32(body[24:28], access)
+	binary.LittleEndian.PutUint32(body[32:36], 7) // share read, write and delete
 	binary.LittleEndian.PutUint32(body[36:40], disposition)
+	binary.LittleEndian.PutUint32(body[40:44], options)
 	binary.LittleEndian.PutUint16(body[44:46], uint16(nameOff))
 	binary.LittleEndian.PutUint16(body[46:48], uint16(len(nameBytes)))
 	copy(body[fixed+pad:], nameBytes)

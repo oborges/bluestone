@@ -123,12 +123,12 @@ func (c *request) handleCopyChunk(ctx context.Context, req *wire.IoctlRequest, d
 		n, err := copyRange(ctx, src.h, dst.h, int64(chunk.SourceOffset), int64(chunk.TargetOffset), int64(chunk.Length))
 		total += uint32(n)
 		if err != nil {
-			c.log.Debug("copychunk failed", "source", src.path, "target", dst.path, "err", err)
+			c.log.Debug("copychunk failed", "source", src.currentPath(), "target", dst.currentPath(), "err", err)
 			return c.errBody(osErrToStatus(err))
 		}
 	}
 
-	c.log.Debug("copychunk", "source", src.path, "target", dst.path,
+	c.log.Debug("copychunk", "source", src.currentPath(), "target", dst.currentPath(),
 		"chunks", len(copyReq.Chunks), "bytes", total)
 	resp := wire.CopyChunkResponse{ChunksWritten: uint32(len(copyReq.Chunks)), TotalBytesWritten: total}
 	c.out = wire.IoctlResponseAppend(c.out, req.CtlCode, req.FileId, nil, resp.Encode(), req.Flags)
