@@ -348,6 +348,19 @@ proposed upstream.
   the chain, after changing the FileId, so every signed compound request but
   the last failed with ACCESS_DENIED. Windows reclaims durable handles with a
   signed compound.
+- `smb/server` + `smb/wire` + `smb/encryption`: SMB 3.1.1, now the default
+  dialect (`WithDialect` caps it). NEGOTIATE answers the preauth integrity,
+  encryption and signing contexts: SHA-512 with a salt, the first of the
+  client's ciphers the server supports (AES-128/256-GCM/CCM), and AES-CMAC.
+  Keys come from the pre-authentication hash of the NEGOTIATE and
+  SESSION_SETUP exchange with the 3.1.1 labels, and CAP_ENCRYPTION is not
+  set for 3.1.1. Upstream pinned 3.0.2 and hashed every NEGOTIATE and
+  SESSION_SETUP into one connection-wide hash it never used.
+  `encryption.Cipher` covers AES-GCM and AES-CCM with 128- or 256-bit keys.
+- `smb/server`: a request that arrives encrypted is not signature-checked:
+  the transform authenticates it (MS-SMB2 section 3.3.5.2.4). Windows over
+  SMB 3.0.2 flags FSCTL_VALIDATE_NEGOTIATE_INFO as signed inside an
+  encrypted message, and failed every connection that required encryption.
 
 ## Known gaps to close in Bluestone
 
@@ -357,8 +370,6 @@ Tracked with the rest of the SMB work in `docs/SMB_ROADMAP.md`.
   when the client did not set SMB2_LOCKFLAG_FAIL_IMMEDIATELY, instead of
   waiting for the conflicting lock to be released.
 - No persistent handles and no multichannel.
-- The dialect is fixed at 3.0.2: no SMB 3.1.1, so no pre-auth integrity and
-  no AES-GCM. Signing is AES-CMAC and encryption AES-128-CCM.
 - Byte-range locks are keyed by path in the lock table, and are not moved
   when their file is renamed. They are still released when the handle
   closes, but a lock taken before a rename does not conflict with NFS locks

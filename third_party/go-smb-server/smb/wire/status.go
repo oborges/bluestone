@@ -15,6 +15,7 @@ const (
 	StatusMoreProcessingRequired uint32 = 0xC0000016
 	StatusNoMemory               uint32 = 0xC0000017
 	StatusAccessDenied           uint32 = 0xC0000022
+	StatusInternalError          uint32 = 0xC00000E5
 	StatusBufferTooSmall         uint32 = 0xC0000023
 	StatusBufferOverflow         uint32 = 0x80000005
 	StatusObjectNameNotFound     uint32 = 0xC0000034

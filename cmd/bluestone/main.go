@@ -434,6 +434,7 @@ func main() {
 			MaxStreamBytes:     cfg.SMB.MaxStreamBytes,
 			Leases:             cfg.SMB.Leases,
 			DurableHandles:     cfg.SMB.DurableHandles,
+			MaxDialect:         cfg.SMB.MaxDialect,
 			Limits: smb.Limits{
 				Connections:           cfg.SMB.Limits.MaxConnections,
 				ConnectionsPerClient:  cfg.SMB.Limits.MaxConnectionsPerClient,

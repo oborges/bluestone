@@ -2,8 +2,10 @@ package server
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/binary"
 	"errors"
+	"slices"
 	"strings"
 	"time"
 
@@ -108,7 +110,7 @@ func (c *request) handleNegotiate(msg []byte, hdr *wire.Header) uint32 {
 		return c.errBody(wire.StatusNotSupported)
 	}
 
-	caps := c.negotiateCapabilities()
+	caps := c.negotiateCapabilities(dialect)
 	c.clientGUID = req.ClientGuid
 	c.negDialect = dialect
 	c.negCaps = caps
@@ -123,24 +125,63 @@ func (c *request) handleNegotiate(msg []byte, hdr *wire.Header) uint32 {
 		MaxWriteSize:    c.srv.maxWrite,
 		SecurityBuffer:  ntlmssp.NegTokenInitNTLM(),
 	}
-	if c.srv.requireEnc && dialect >= wire.DialectSMB30 {
-		resp.Contexts = append(resp.Contexts, wire.NegotiateContext{
-			Type: wire.CtxEncryption,
-			Data: []byte{0x01, 0x00,
-				0x01, 0x00},
-		})
-	}
 	if dialect == wire.DialectSMB311 {
-		resp.Contexts = append(resp.Contexts, wire.NegotiateContext{
-			Type: wire.CtxPreauthIntegrity,
-			Data: []byte{0x01, 0x00,
-				0x00, 0x00,
-				0x01, 0x00},
-		})
+		contexts, status := c.negotiate311(&req, msg)
+		if status != wire.StatusSuccess {
+			return c.errBody(status)
+		}
+		resp.Contexts = contexts
 	}
 	c.out = resp.Append(c.out)
 	return wire.StatusSuccess
 }
+
+// negotiate311 answers an SMB 3.1.1 NEGOTIATE's contexts (MS-SMB2 section
+// 3.3.5.4): SHA-512 pre-authentication integrity, which it starts the
+// connection's hash with, the first cipher in the client's list the server
+// supports, and AES-CMAC signing.
+func (c *request) negotiate311(req *wire.NegotiateRequest, msg []byte) ([]wire.NegotiateContext, uint32) {
+	data, ok := req.Context(wire.CtxPreauthIntegrity)
+	if !ok {
+		return nil, wire.StatusInvalidParameter
+	}
+	hashes, err := wire.ParsePreauthCapabilities(data)
+	if err != nil || !slices.Contains(hashes, wire.HashSHA512) {
+		return nil, statusSMBNoPreauthIntegrityHashOverlap
+	}
+	salt := make([]byte, wire.PreauthSaltLength)
+	if _, err := rand.Read(salt); err != nil {
+		return nil, wire.StatusInsufficientResources
+	}
+	// The hash covers the NEGOTIATE request as received; the response
+	// joins it once it is built.
+	c.preauthHash = preauthUpdate(wire.ZeroPreauthHash(), msg)
+	contexts := []wire.NegotiateContext{wire.PreauthContext(salt)}
+
+	c.cipher = 0
+	if data, ok := req.Context(wire.CtxEncryption); ok {
+		if ciphers, err := wire.ParseAlgorithmList(data); err == nil {
+			for _, id := range ciphers {
+				if encryption.Supported(id) {
+					c.cipher = id
+					break
+				}
+			}
+		}
+		contexts = append(contexts, wire.SingleAlgorithmContext(wire.CtxEncryption, c.cipher))
+	}
+	if data, ok := req.Context(wire.CtxSigning); ok {
+		if algs, err := wire.ParseAlgorithmList(data); err == nil && slices.Contains(algs, wire.SigningAESCMAC) {
+			contexts = append(contexts, wire.SingleAlgorithmContext(wire.CtxSigning, wire.SigningAESCMAC))
+		}
+	}
+	c.log.Debug("negotiated SMB 3.1.1", "cipher", encryption.CipherName(c.cipher))
+	return contexts, wire.StatusSuccess
+}
+
+// statusSMBNoPreauthIntegrityHashOverlap: the client offers no hash the
+// server supports.
+const statusSMBNoPreauthIntegrityHashOverlap uint32 = 0xC05D0000
 
 func pickDialect(offered []uint16, maxDialect uint16) uint16 {
 	var best uint16
@@ -189,6 +230,15 @@ func (c *request) handleSessionSetup(ctx context.Context, msg []byte, hdr *wire.
 		hdr.SessionId = sessID
 	}
 
+	if c.negDialect == wire.DialectSMB311 {
+		// The session's pre-authentication hash starts from the
+		// connection's and takes in each of its SESSION_SETUP requests.
+		if sess.preauth == nil {
+			sess.preauth = append([]byte(nil), c.preauthHash...)
+		}
+		sess.preauth = preauthUpdate(sess.preauth, msg)
+	}
+
 	started := time.Now()
 	result, err := sess.auth.Accept(ctx, req.SecurityBuffer)
 	if err != nil {
@@ -206,12 +256,12 @@ func (c *request) handleSessionSetup(ctx context.Context, msg []byte, hdr *wire.
 		ssr.SessionFlags |= wire.SessionFlagEncryptData
 	}
 	if result.Identity != nil {
+		if status := c.establishKeys(sess, result.SessionKey); status != wire.StatusSuccess {
+			c.dropSession(hdr.SessionId)
+			return c.errBody(status)
+		}
 		sess.identity = result.Identity
 		sess.authenticated = true
-		sess.signer, _ = signing.NewSigner(signing.DeriveSigningKey(result.SessionKey))
-		sess.encryptionKey = encryption.DeriveServerEncryptionKey(result.SessionKey)
-		sess.decryptionKey = encryption.DeriveServerDecryptionKey(result.SessionKey)
-		sess.requireEncrypt = c.srv.requireEnc
 	}
 	c.out = ssr.Append(c.out)
 	if sess.authenticated {
@@ -836,4 +886,48 @@ func contextNames(req *wire.CreateRequest) []string {
 		names = append(names, c.Name)
 	}
 	return names
+}
+
+// establishKeys derives an authenticated session's signing and encryption
+// keys: from the session key alone for SMB 3.0 and 3.0.2, and from it and the
+// session's pre-authentication integrity hash for 3.1.1, with the cipher the
+// connection negotiated. A server that requires encryption refuses a client
+// that cannot encrypt.
+func (c *request) establishKeys(sess *session, sessionKey []byte) uint32 {
+	var signKey, outKey, inKey []byte
+	cipherID := encryption.CipherAES128CCM
+	if c.negDialect == wire.DialectSMB311 {
+		cipherID = c.cipher
+		keyLen := 16
+		if cipherID != 0 {
+			keyLen = encryption.KeyLen(cipherID)
+		}
+		signKey, outKey, inKey = encryption.Keys311(sessionKey, sess.preauth, keyLen)
+	} else {
+		signKey = signing.DeriveSigningKey(sessionKey)
+		outKey = encryption.DeriveServerEncryptionKey(sessionKey)
+		inKey = encryption.DeriveServerDecryptionKey(sessionKey)
+		if c.negCaps&wire.CapEncryption == 0 {
+			cipherID = 0
+		}
+	}
+	if c.srv.requireEnc && cipherID == 0 {
+		c.log.Debug("refusing a session that cannot encrypt", "dialect", c.negDialect)
+		return wire.StatusAccessDenied
+	}
+	sess.signer, _ = signing.NewSigner(signKey)
+	sess.encryptionKey, sess.decryptionKey = outKey, inKey
+	if cipherID != 0 {
+		enc, err := encryption.NewCipher(cipherID, outKey)
+		if err != nil {
+			return wire.StatusInternalError
+		}
+		dec, err := encryption.NewCipher(cipherID, inKey)
+		if err != nil {
+			return wire.StatusInternalError
+		}
+		sess.encCipher, sess.decCipher = enc, dec
+	}
+	sess.requireEncrypt = c.srv.requireEnc
+	return wire.StatusSuccess
 }

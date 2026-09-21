@@ -228,6 +228,7 @@ smb:
   share_name: "bluestone"
   domain: "BLUESTONE"
   encryption_required: false
+  max_dialect: "3.1.1"   # or "3.0.2" for clients that mishandle 3.1.1
   concurrent_requests: 0 # reads/writes at once per connection; 0 = default (64), 1 = serial
   drain_timeout: "30s"   # how long a shutdown waits for clients to finish
   max_stream_bytes: 2048 # cap on a file's named streams, kept in object metadata
@@ -299,7 +300,7 @@ Linux needs root or `CAP_NET_BIND_SERVICE`. `smb.enabled`, `smb.port`,
 overridden with `BLUESTONE_SMB_*` environment variables; users are read from
 the file only.
 
-Tested against Windows Server 2025 (SMB 3.0.2 with signing), macOS
+Tested against Windows Server 2025 (SMB 3.1.1 with signing, or encryption), macOS
 (`mount_smbfs`), the Linux kernel client (`mount -t cifs`), and `smbclient`:
 mapping a drive, listing, reading
 and writing, copying multi-megabyte files, case-insensitive access, DOS
@@ -430,8 +431,17 @@ files do not survive the gateway itself restarting or failing over.
 A client caching a handle keeps the file open after the application closes
 it. When another client's open would conflict with that handle, the gateway
 asks the client to let go and waits for it, up to 35 seconds, instead of
-failing the open as "in use". Signing uses AES-CMAC and encryption
-AES-128-CCM; leases are not granted on sessions that require encryption.
+failing the open as "in use".
+
+The gateway speaks SMB 2.0.2 through 3.1.1. With 3.1.1, the handshake is
+protected by pre-authentication integrity (SHA-512), sessions are signed with
+AES-CMAC, and `encryption_required` encrypts them with AES-128-GCM, or
+whichever of AES-128/256-GCM/CCM the client prefers. SMB 3.0 clients encrypt
+with AES-128-CCM. GCM is markedly faster: Windows Server 2025 copied a
+256 MB file at about 265 MB/s up and 480 MB/s down with GCM, against 150 and
+195 MB/s with CCM. `max_dialect: "3.0.2"` caps the dialect for a client that
+mishandles 3.1.1. Leases are not granted on sessions that require
+encryption.
 
 Named data streams (alternate data streams) are supported, and kept in the
 object's metadata rather than as objects of their own. macOS stores Finder

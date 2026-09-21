@@ -116,7 +116,7 @@ func WithDialect(d uint16) Option { return func(s *Server) { s.dialect = d } }
 func New(opts ...Option) (*Server, error) {
 	s := &Server{
 		addr:          ":445",
-		dialect:       wire.DialectSMB302,
+		dialect:       wire.DialectSMB311,
 		locker:        newMemLocker(),
 		maxConcurrent: defaultMaxConcurrent,
 		maxTransact:   defaultMaxTransact,
@@ -319,8 +319,14 @@ type session struct {
 	encryptionKey  []byte
 	decryptionKey  []byte
 	requireEncrypt bool
-	encCCM         *encryption.AESCCM
-	decCCM         *encryption.AESCCM
+	// encCipher seals what the server sends and decCipher opens what it
+	// receives, for sessions that encrypt.
+	encCipher encryption.Cipher
+	decCipher encryption.Cipher
+	// preauth is the session's SMB 3.1.1 pre-authentication integrity
+	// hash: the connection's, then each SESSION_SETUP request and the
+	// responses that ask for more (MS-SMB2 section 3.3.5.5).
+	preauth []byte
 }
 
 type tree struct {
@@ -449,6 +455,9 @@ type request struct {
 	// retryingCreate marks a CREATE tried again after lease breaks, which
 	// does not wait for breaks a second time.
 	retryingCreate bool
+	// encrypted is set for a request that arrived in an encryption
+	// transform, which authenticates it: its signature is not checked.
+	encrypted bool
 }
 
 // finish queues the response and runs what waited for it.
@@ -500,6 +509,9 @@ type conn struct {
 	// clients compare the two and drop the connection when they differ.
 	negDialect uint16
 	negCaps    uint32
+	// cipher is the encryption cipher negotiated for SMB 3.1.1 (0 when
+	// none is in common); 3.0 dialects use AES-128-CCM.
+	cipher uint16
 	// clientGUID is the client's identity from NEGOTIATE, which scopes the
 	// lease keys it chooses.
 	clientGUID [16]byte
@@ -512,8 +524,6 @@ func (s *Server) serveConn(ctx context.Context, c net.Conn) {
 	connCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	sha := sha512.New()
-	sha.Write(nil)
 	cn := &conn{
 		srv:           s,
 		fc:            transport.NewFramedConn(c),
@@ -526,7 +536,6 @@ func (s *Server) serveConn(ctx context.Context, c net.Conn) {
 		connDone:      make(chan struct{}),
 		writerDone:    make(chan struct{}),
 		inflight:      make(chan struct{}, s.concurrentRequests()),
-		preauthHash:   sha.Sum(nil),
 	}
 	s.addConn(cn)
 	defer s.removeConn(cn)
@@ -561,13 +570,14 @@ func (s *Server) serveConn(ctx context.Context, c net.Conn) {
 			continue
 		}
 
+		encrypted := false
 		if len(msg) >= 4 && msg[0] == 0xFD {
 			dec, dErr := cn.openTransform(msg)
 			if dErr != nil {
 				cn.log.Debug("decrypt error", "err", dErr)
 				return
 			}
-			msg = dec
+			msg, encrypted = dec, true
 		} else if len(msg) >= wire.HeaderSize && msg[0] == wire.SMB2ProtocolId[0] {
 			sessID := binary.LittleEndian.Uint64(msg[40:48])
 			if sess := cn.getSession(sessID); sess != nil && sess.requireEncrypt {
@@ -576,13 +586,6 @@ func (s *Server) serveConn(ctx context.Context, c net.Conn) {
 			}
 		}
 
-		cmdBefore := uint16(0xFFFF)
-		if len(msg) >= wire.HeaderSize {
-			cmdBefore = binary.LittleEndian.Uint16(msg[12:14])
-		}
-		if cmdBefore == wire.CmdNegotiate || cmdBefore == wire.CmdSessionSetup {
-			cn.updatePreauth(msg)
-		}
 		if cn.canHandleConcurrently(msg) {
 			// ReadMessage hands back a buffer it reuses, so a request that
 			// outlives this loop iteration needs its own copy.
@@ -602,7 +605,7 @@ func (s *Server) serveConn(ctx context.Context, c net.Conn) {
 				defer cn.running.Add(-1)
 				defer func() { <-cn.inflight }()
 				defer release()
-				r := &request{conn: cn, concurrent: true}
+				r := &request{conn: cn, concurrent: true, encrypted: encrypted}
 				r.handleMessage(connCtx, queued)
 				r.finish()
 			}()
@@ -610,7 +613,7 @@ func (s *Server) serveConn(ctx context.Context, c net.Conn) {
 		}
 
 		cn.running.Add(1)
-		r := &request{conn: cn}
+		r := &request{conn: cn, encrypted: encrypted}
 		r.handleMessage(connCtx, msg)
 		r.finish()
 		cn.running.Add(-1)
@@ -638,7 +641,7 @@ func (c *request) replyWildcardNegotiate() {
 		SecurityMode:    wire.SigningEnabled,
 		DialectRevision: wire.DialectWildcard,
 		ServerGuid:      c.srv.guid,
-		Capabilities:    c.negotiateCapabilities(),
+		Capabilities:    c.negotiateCapabilities(wire.DialectWildcard),
 		MaxTransactSize: c.srv.maxTransact,
 		MaxReadSize:     c.srv.maxRead,
 		MaxWriteSize:    c.srv.maxWrite,
@@ -769,8 +772,11 @@ func (c *request) handleMessage(ctx context.Context, msg []byte) {
 			return
 		}
 		// Verified before the related FileId is filled in below, which
-		// changes the bytes the client signed.
-		if sess := c.getSession(hdr.SessionId); sess != nil && sess.signer != nil {
+		// changes the bytes the client signed. A request that arrived
+		// encrypted is not: the transform authenticated it, and 3.0 clients
+		// flag FSCTL_VALIDATE_NEGOTIATE_INFO as signed inside it without
+		// a signature the server can check (MS-SMB2 section 3.3.5.2.4).
+		if sess := c.getSession(hdr.SessionId); sess != nil && sess.signer != nil && !c.encrypted {
 			if hdr.Flags&wire.FlagSigned != 0 {
 				// Each request in a compound is signed over its own bytes,
 				// up to where the next one starts (MS-SMB2 3.2.4.1.4).
@@ -892,8 +898,19 @@ func (c *request) handleMessage(ctx context.Context, msg []byte) {
 		hdr.Status = status
 		hdr.EncodeAt(c.out[respStart:])
 
-		if hdr.Command == wire.CmdNegotiate || hdr.Command == wire.CmdSessionSetup {
-			c.updatePreauth(c.out[respStart:])
+		// SMB 3.1.1 pre-authentication integrity: the NEGOTIATE response
+		// joins the connection's hash, and a SESSION_SETUP response asking
+		// for more joins the session's. The final one does not: the keys
+		// are derived before it is sent, and it is signed with them.
+		if c.negDialect == wire.DialectSMB311 {
+			switch {
+			case hdr.Command == wire.CmdNegotiate && status == wire.StatusSuccess:
+				c.preauthHash = preauthUpdate(c.preauthHash, c.out[respStart:])
+			case hdr.Command == wire.CmdSessionSetup && status == wire.StatusMoreProcessingRequired:
+				if sess := c.getSession(hdr.SessionId); sess != nil && sess.preauth != nil {
+					sess.preauth = preauthUpdate(sess.preauth, c.out[respStart:])
+				}
+			}
 		}
 
 		if sess := c.getSession(hdr.SessionId); sess != nil && sess.signer != nil && !interim {
@@ -1100,14 +1117,13 @@ func (c *conn) cleanup() {
 	})
 }
 
-func (c *conn) updatePreauth(msg []byte) {
-	if len(c.preauthHash) == 0 {
-		return
-	}
+// preauthUpdate chains a message into a pre-authentication integrity hash:
+// SHA-512 of the hash so far and the message.
+func preauthUpdate(hash, msg []byte) []byte {
 	sha := sha512.New()
-	sha.Write(c.preauthHash)
+	sha.Write(hash)
 	sha.Write(msg)
-	c.preauthHash = sha.Sum(nil)
+	return sha.Sum(nil)
 }
 
 func (s *session) getTree(id uint32) *tree {
