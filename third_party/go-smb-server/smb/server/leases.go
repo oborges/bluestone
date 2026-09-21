@@ -287,6 +287,26 @@ func (t *leaseTable) breakHandle(file fileKey, except leaseID) []chan struct{} {
 	return waits
 }
 
+// releaseHandles breaks handle caching on a renamed file's target and on
+// every file under a renamed directory, for a rename refused because they
+// are open. It does not wait: the client retries the rename once the
+// holders have closed the handles they were only caching.
+func (t *leaseTable) releaseHandles(target fileKey, dir fileKey) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	prefix := dir.path + "\\"
+	for file, set := range t.byFile {
+		if file.share != target.share || (file != target && !strings.HasPrefix(file.path, prefix)) {
+			continue
+		}
+		for l := range set {
+			if !l.oplock && l.state&wire.LeaseHandle != 0 {
+				t.breakLocked(l, l.state&^wire.LeaseHandle)
+			}
+		}
+	}
+}
+
 // holdsHandle reports whether anyone but the requester caches a handle to
 // the file.
 func (t *leaseTable) holdsHandle(file fileKey, except leaseID) bool {

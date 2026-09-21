@@ -315,6 +315,9 @@ proposed upstream.
   - A CREATE that meets a sharing violation while others cache handles to
     the file breaks their handle caching and goes async. It waits for the
     acknowledgement (or a timeout, 35s by default), then tries again.
+  - A rename refused because a file is open (the target, or one inside a
+    renamed directory) breaks the handle caching of clients holding those
+    files, without waiting, so a retry can succeed.
   - Break acknowledgements are handled, a lower break wanted during one is
     sent after it, and leases follow renames and end with their last open.
   - `LeaseObserver` reports grants, breaks and timeouts.

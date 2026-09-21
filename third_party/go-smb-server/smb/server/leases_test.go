@@ -443,3 +443,28 @@ func (h *releasingHandle) Close(ctx context.Context) error {
 	h.release()
 	return h.Handle.Close(ctx)
 }
+
+// A rename refused because another client has a file open inside the
+// directory tells that client to let go of a handle it only caches, so the
+// rename succeeds when tried again.
+func TestRefusedRenameReleasesCachedHandles(t *testing.T) {
+	srv := newLeaseServer(newMemBackend(), 0)
+	a := connectLeaseClient(t, srv, 1)
+	b := connectLeaseClient(t, srv, 2)
+	b.close(b.mustOpen("folder", wire.FileCreate, genericAll, fileDirectory))
+	cached, _, _, _ := a.openLease(`folder\doc.txt`, wire.FileOverwriteIf, shareAll, leaseKey(1), wire.LeaseRead|wire.LeaseHandle)
+
+	dir := b.mustOpen("folder", wire.FileOpen, genericAll, fileDirectory)
+	if status := b.rename(dir, "renamed", false); status != wire.StatusAccessDenied {
+		t.Fatalf("rename with a file open inside: %#x, want ACCESS_DENIED", status)
+	}
+	got := parseLeaseBreak(t, a.notification())
+	if got.next != wire.LeaseRead || got.flags != 1 {
+		t.Fatalf("break = %+v, want RH to R", got)
+	}
+	a.closeFile(cached)
+	a.ack(leaseKey(1), wire.LeaseRead)
+	if status := b.rename(dir, "renamed", false); status != wire.StatusSuccess {
+		t.Fatalf("rename retried after the handle was released: %#x", status)
+	}
+}
