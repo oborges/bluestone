@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/IBM/ibm-cos-sdk-go/service/s3"
 	client "github.com/hirochachacha/go-smb2"
 	"github.com/oborges/bluestone/internal/cache"
 	"github.com/oborges/bluestone/internal/config"
@@ -37,6 +38,8 @@ type memStore struct {
 	// copies counts bucket-side copies, so a test can tell one from the
 	// gateway reading and writing the bytes itself.
 	copies int
+	// copyErr, when set, fails every copy.
+	copyErr error
 }
 
 func (s *memStore) copyCount() int {
@@ -138,6 +141,9 @@ func (s *memStore) CopyObject(_ context.Context, sourceKey, destKey string) erro
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.copies++
+	if s.copyErr != nil {
+		return s.copyErr
+	}
 	data, ok := s.objects[sourceKey]
 	if !ok {
 		return os.ErrNotExist
@@ -145,6 +151,13 @@ func (s *memStore) CopyObject(_ context.Context, sourceKey, destKey string) erro
 	s.objects[destKey] = append([]byte(nil), data...)
 	s.metadata[destKey] = s.metadata[sourceKey]
 	return nil
+}
+
+func (s *memStore) CopyObjectWithMetadata(ctx context.Context, sourceKey, destKey string, metadata map[string]string) error {
+	if err := s.CopyObject(ctx, sourceKey, destKey); err != nil {
+		return err
+	}
+	return s.UpdateObjectMetadata(ctx, destKey, metadata)
 }
 
 func (s *memStore) UpdateObjectMetadata(_ context.Context, key string, metadata map[string]string) error {
@@ -737,10 +750,9 @@ func TestServerSideCopyUsesBucketCopy(t *testing.T) {
 	}
 }
 
-// Windows creates the destination before asking for the copy, which stages
-// it. A bucket-side copy would then be overwritten when that staged, empty
-// file syncs, so the backend declines and the server moves the bytes
-// instead: still gateway-side, never out to the client.
+// While another open still holds the destination's staged file, it could
+// write to it at any moment, so the backend declines and the server moves
+// the bytes instead: still gateway-side, never out to the client.
 func TestServerSideCopyDeclinesStagedDestination(t *testing.T) {
 	g := startGateway(t)
 	g.store.put("source.txt", []byte("the file that gets copied"))
@@ -798,5 +810,347 @@ func TestServerSideCopyDeclinesStagedSource(t *testing.T) {
 	}
 	if _, err := dstHandle.CopyChunk(context.Background(), srcHandle, 0, 0, info.Size()); !errors.Is(err, errors.ErrUnsupported) {
 		t.Fatalf("CopyChunk() with a staged source = %v, want ErrUnsupported", err)
+	}
+}
+
+// syncStore lets the staging sync worker upload into a memStore. The worker
+// names objects by path, which the COS client turns into keys. The files the
+// tests sync are far below the multipart size.
+type syncStore struct{ *memStore }
+
+func (s syncStore) PutObjectStream(ctx context.Context, path string, body io.ReadSeeker, metadata map[string]string) error {
+	data, err := io.ReadAll(body)
+	if err != nil {
+		return err
+	}
+	return s.PutObject(ctx, strings.TrimPrefix(path, "/"), data, metadata)
+}
+
+func (syncStore) CreateMultipartUpload(context.Context, string, map[string]string) (string, error) {
+	return "", errors.ErrUnsupported
+}
+
+func (syncStore) UploadPart(context.Context, string, string, int64, io.ReadSeeker) (string, error) {
+	return "", errors.ErrUnsupported
+}
+
+func (syncStore) CompleteMultipartUpload(context.Context, string, string, []*s3.CompletedPart) error {
+	return errors.ErrUnsupported
+}
+
+func (syncStore) AbortMultipartUpload(context.Context, string, string) error {
+	return errors.ErrUnsupported
+}
+
+// runSyncWorker runs the staging sync worker until it has uploaded the
+// object at marker, which proves it has made a pass over every dirty file.
+// Every dirty file is old enough to sync, including staged bytes no session
+// holds any more.
+func (g *testGateway) runSyncWorker(t *testing.T, marker string) {
+	t.Helper()
+	worker := staging.NewSyncWorker(g.manager, syncStore{g.store}, &config.StagingConfig{
+		Enabled:          true,
+		SyncInterval:     "50ms",
+		SyncThresholdMB:  1,
+		MaxDirtyAge:      "1ms",
+		SyncWorkerCount:  1,
+		MaxSyncRetries:   3,
+		RetryBackoffInit: "10ms",
+		RetryBackoffMax:  "50ms",
+		CleanAfterSync:   true,
+	})
+	worker.Start()
+	defer worker.Stop()
+
+	// The worker leaves a file alone until it has been idle a few seconds.
+	deadline := time.Now().Add(20 * time.Second)
+	for g.manager.IsDirty(marker) {
+		if time.Now().After(deadline) {
+			t.Fatalf("sync worker did not sync %s", marker)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// storedObject returns what the bucket holds for key.
+func (g *testGateway) storedObject(t *testing.T, key string) string {
+	t.Helper()
+	data, err := g.store.GetObject(context.Background(), key)
+	if err != nil {
+		t.Fatalf("object %s: %v", key, err)
+	}
+	return string(data)
+}
+
+// serverCopy copies a range the way the SMB server does: through the
+// backend's CopyChunk, and when that declines, by reading and writing the
+// bytes gateway-side.
+func serverCopy(t *testing.T, dst, src *handle, offset, length int64) {
+	t.Helper()
+	ctx := context.Background()
+	n, err := dst.CopyChunk(ctx, src, offset, offset, length)
+	if err == nil {
+		if n != length {
+			t.Fatalf("CopyChunk(%d, %d) = %d bytes", offset, length, n)
+		}
+		return
+	}
+	if !errors.Is(err, errors.ErrUnsupported) {
+		t.Fatalf("CopyChunk(%d, %d) error = %v", offset, length, err)
+	}
+	buf := make([]byte, length)
+	read, err := src.Read(ctx, offset, buf)
+	if err != nil && !errors.Is(err, io.EOF) {
+		t.Fatalf("Read(%d) error = %v", offset, err)
+	}
+	if _, err := dst.Write(ctx, offset, buf[:read]); err != nil {
+		t.Fatalf("Write(%d) error = %v", offset, err)
+	}
+}
+
+// Creating a file through SMB stages it, empty. Copying into it replaces
+// that staged file with a copy inside the bucket, and the staged file is
+// gone for good: the sync worker must not upload it over the copy later.
+func TestServerSideCopyReplacesUnwrittenDestination(t *testing.T) {
+	g := startGateway(t)
+	const contents = "the file that gets copied"
+	g.store.put("source.txt", []byte(contents))
+
+	for _, name := range []string{"copy.txt", "marker.txt"} {
+		f, err := g.share.Create(name)
+		if err != nil {
+			t.Fatalf("Create(%s) error = %v", name, err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatalf("Close(%s) error = %v", name, err)
+		}
+	}
+	if !g.manager.IsDirty("/copy.txt") {
+		t.Fatal("a file created through SMB must be staged")
+	}
+
+	before := g.store.copyCount()
+	srcHandle := &handle{fs: g.filesystem, path: "/source.txt"}
+	dstHandle := &handle{fs: g.filesystem, path: "/copy.txt", opens: g.server.opens}
+	n, err := dstHandle.CopyChunk(context.Background(), srcHandle, 0, 0, int64(len(contents)))
+	if err != nil {
+		t.Fatalf("CopyChunk() error = %v", err)
+	}
+	if n != int64(len(contents)) {
+		t.Fatalf("CopyChunk() = %d bytes, want %d", n, len(contents))
+	}
+	if copies := g.store.copyCount() - before; copies != 1 {
+		t.Fatalf("bucket-side copies = %d, want 1", copies)
+	}
+	if got := g.readFile(t, "copy.txt"); got != contents {
+		t.Fatalf("copy contains %q, want %q", got, contents)
+	}
+	if g.manager.IsDirty("/copy.txt") {
+		t.Fatal("the replaced staged file is still waiting to sync")
+	}
+
+	// The marker was created alongside the destination; once the worker
+	// has synced it, it has had its chance at the destination too.
+	g.runSyncWorker(t, "/marker.txt")
+	if _, err := g.store.GetObject(context.Background(), "marker.txt"); err != nil {
+		t.Fatalf("the sync worker did not upload the marker: %v", err)
+	}
+	if got := g.storedObject(t, "copy.txt"); got != contents {
+		t.Fatalf("after sync the bucket holds %q, want %q", got, contents)
+	}
+	if got := g.readFile(t, "copy.txt"); got != contents {
+		t.Fatalf("after sync the copy reads %q, want %q", got, contents)
+	}
+}
+
+// Windows' own sequence: create the destination, set its length to the
+// source's, then copy in 1 MiB chunks through the same open. The first chunk
+// copies the whole file inside the bucket and the rest have nothing left to
+// move.
+func TestServerSideCopyWindowsSequence(t *testing.T) {
+	g := startGateway(t)
+	ctx := context.Background()
+	source := bytes.Repeat([]byte("0123456789abcdef"), (5<<20)/16+100) // not a whole number of chunks
+	g.store.put("source.bin", source)
+	size := int64(len(source))
+
+	backend := NewBackend(g.filesystem, lock.NewShareTable(lock.ShareOptions{}))
+	src, err := backend.Open(ctx, openOptions("source.bin", smbvfs.DispositionOpen, accessReadData, shareAccessRead))
+	if err != nil {
+		t.Fatalf("Open(source) error = %v", err)
+	}
+	defer src.Close(ctx)
+	dst, err := backend.Open(ctx, openOptions("copy.bin", smbvfs.DispositionOverwriteIf, accessReadData|accessWriteData, shareAccessRead))
+	if err != nil {
+		t.Fatalf("Open(destination) error = %v", err)
+	}
+	if err := dst.(*handle).SetInfo(ctx, &smbvfs.SetInfoRequest{EndOfFile: &size}); err != nil {
+		t.Fatalf("SetInfo(EndOfFile) error = %v", err)
+	}
+
+	before := g.store.copyCount()
+	const chunk = 1 << 20
+	for offset := int64(0); offset < size; offset += chunk {
+		length := min(chunk, size-offset)
+		n, err := dst.(*handle).CopyChunk(ctx, src, offset, offset, length)
+		if err != nil {
+			t.Fatalf("CopyChunk(%d) error = %v", offset, err)
+		}
+		if n != length {
+			t.Fatalf("CopyChunk(%d) = %d bytes, want %d", offset, n, length)
+		}
+	}
+	if copies := g.store.copyCount() - before; copies != 1 {
+		t.Fatalf("bucket-side copies = %d, want 1", copies)
+	}
+	if err := dst.Close(ctx); err != nil {
+		t.Fatalf("Close(destination) error = %v", err)
+	}
+	if g.manager.IsDirty("/copy.bin") {
+		t.Fatal("the replaced staged file is still waiting to sync")
+	}
+	if got := g.readFile(t, "copy.bin"); got != string(source) {
+		t.Fatalf("copy differs from the source (%d bytes read, want %d)", len(got), len(source))
+	}
+}
+
+// A destination someone has written to holds data a bucket-side copy would
+// throw away, so the backend declines and the server copies the bytes,
+// which leaves the destination correct once the staged file syncs.
+func TestServerSideCopyDeclinesWrittenDestination(t *testing.T) {
+	g := startGateway(t)
+	ctx := context.Background()
+	source := bytes.Repeat([]byte("s"), 3<<20)
+	g.store.put("source.bin", source)
+	size := int64(len(source))
+
+	backend := NewBackend(g.filesystem, lock.NewShareTable(lock.ShareOptions{}))
+	src, err := backend.Open(ctx, openOptions("source.bin", smbvfs.DispositionOpen, accessReadData, shareAccessRead))
+	if err != nil {
+		t.Fatalf("Open(source) error = %v", err)
+	}
+	defer src.Close(ctx)
+	dst, err := backend.Open(ctx, openOptions("copy.bin", smbvfs.DispositionOverwriteIf, accessReadData|accessWriteData, shareAccessRead))
+	if err != nil {
+		t.Fatalf("Open(destination) error = %v", err)
+	}
+	dstHandle := dst.(*handle)
+	if _, err := dstHandle.Write(ctx, 0, []byte("written")); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	if err := dstHandle.SetInfo(ctx, &smbvfs.SetInfoRequest{EndOfFile: &size}); err != nil {
+		t.Fatalf("SetInfo(EndOfFile) error = %v", err)
+	}
+
+	before := g.store.copyCount()
+	if _, err := dstHandle.CopyChunk(ctx, src.(*handle), 0, 0, 1<<20); !errors.Is(err, errors.ErrUnsupported) {
+		t.Fatalf("CopyChunk() into a written destination = %v, want ErrUnsupported", err)
+	}
+	if copies := g.store.copyCount() - before; copies != 0 {
+		t.Fatalf("bucket-side copies = %d, want 0", copies)
+	}
+	// Declining kept what was written.
+	got := make([]byte, 7)
+	if _, err := dstHandle.Read(ctx, 0, got); err != nil || string(got) != "written" {
+		t.Fatalf("destination after the decline reads %q (%v), want %q", got, err, "written")
+	}
+
+	for offset := int64(0); offset < size; offset += 1 << 20 {
+		serverCopy(t, dstHandle, src.(*handle), offset, min(1<<20, size-offset))
+	}
+	if copies := g.store.copyCount() - before; copies != 0 {
+		t.Fatalf("bucket-side copies = %d, want 0", copies)
+	}
+	if err := dst.Close(ctx); err != nil {
+		t.Fatalf("Close(destination) error = %v", err)
+	}
+	if got := g.readFile(t, "copy.bin"); got != string(source) {
+		t.Fatal("copy differs from the source")
+	}
+
+	g.runSyncWorker(t, "/copy.bin")
+	if got := g.storedObject(t, "copy.bin"); got != string(source) {
+		t.Fatal("after sync the bucket's copy differs from the source")
+	}
+}
+
+// Once the first chunk has copied the whole file, a later chunk is only
+// taken as done while the destination is untouched. A write in between
+// means the server copies the rest itself.
+func TestServerSideCopyRechecksLaterChunks(t *testing.T) {
+	g := startGateway(t)
+	ctx := context.Background()
+	source := bytes.Repeat([]byte("s"), 3<<20)
+	g.store.put("source.bin", source)
+	size := int64(len(source))
+
+	backend := NewBackend(g.filesystem, lock.NewShareTable(lock.ShareOptions{}))
+	src, err := backend.Open(ctx, openOptions("source.bin", smbvfs.DispositionOpen, accessReadData, shareAccessRead))
+	if err != nil {
+		t.Fatalf("Open(source) error = %v", err)
+	}
+	defer src.Close(ctx)
+	dst, err := backend.Open(ctx, openOptions("copy.bin", smbvfs.DispositionOverwriteIf, accessReadData|accessWriteData, shareAccessRead))
+	if err != nil {
+		t.Fatalf("Open(destination) error = %v", err)
+	}
+	defer dst.Close(ctx)
+	dstHandle := dst.(*handle)
+	if err := dstHandle.SetInfo(ctx, &smbvfs.SetInfoRequest{EndOfFile: &size}); err != nil {
+		t.Fatalf("SetInfo(EndOfFile) error = %v", err)
+	}
+
+	if _, err := dstHandle.CopyChunk(ctx, src.(*handle), 0, 0, 1<<20); err != nil {
+		t.Fatalf("first CopyChunk() error = %v", err)
+	}
+	if _, err := dstHandle.Write(ctx, 1<<20, []byte("changed")); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	if _, err := dstHandle.CopyChunk(ctx, src.(*handle), 1<<20, 1<<20, 1<<20); !errors.Is(err, errors.ErrUnsupported) {
+		t.Fatalf("CopyChunk() after a write = %v, want ErrUnsupported", err)
+	}
+}
+
+// If the bucket-side copy fails after the destination's staged file was
+// discarded, the destination is staged again as the client left it.
+func TestServerSideCopyRestoresDestinationWhenCopyFails(t *testing.T) {
+	g := startGateway(t)
+	ctx := context.Background()
+	source := bytes.Repeat([]byte("s"), 2<<20)
+	g.store.put("source.bin", source)
+	size := int64(len(source))
+
+	backend := NewBackend(g.filesystem, lock.NewShareTable(lock.ShareOptions{}))
+	src, err := backend.Open(ctx, openOptions("source.bin", smbvfs.DispositionOpen, accessReadData, shareAccessRead))
+	if err != nil {
+		t.Fatalf("Open(source) error = %v", err)
+	}
+	defer src.Close(ctx)
+	dst, err := backend.Open(ctx, openOptions("copy.bin", smbvfs.DispositionOverwriteIf, accessReadData|accessWriteData, shareAccessRead))
+	if err != nil {
+		t.Fatalf("Open(destination) error = %v", err)
+	}
+	defer dst.Close(ctx)
+	dstHandle := dst.(*handle)
+	if err := dstHandle.SetInfo(ctx, &smbvfs.SetInfoRequest{EndOfFile: &size}); err != nil {
+		t.Fatalf("SetInfo(EndOfFile) error = %v", err)
+	}
+
+	failure := errors.New("bucket unavailable")
+	g.store.mu.Lock()
+	g.store.copyErr = failure
+	g.store.mu.Unlock()
+	if _, err := dstHandle.CopyChunk(ctx, src.(*handle), 0, 0, 1<<20); !errors.Is(err, failure) {
+		t.Fatalf("CopyChunk() error = %v, want %v", err, failure)
+	}
+	if !g.manager.IsDirty("/copy.bin") {
+		t.Fatal("the destination is no longer staged after the failed copy")
+	}
+	info, err := g.filesystem.Stat("/copy.bin")
+	if err != nil {
+		t.Fatalf("Stat() error = %v", err)
+	}
+	if info.Size() != size {
+		t.Fatalf("destination is %d bytes after the failed copy, want %d", info.Size(), size)
 	}
 }

@@ -236,6 +236,19 @@ type handle struct {
 	// handle closes; opens is where a rename moves it.
 	reservation *lock.ShareHandle
 	opens       *lock.ShareTable
+	// copied is set once a server-side copy has made the file a copy of
+	// another inside the bucket, so the rest of that copy's chunks have
+	// nothing left to move. Any write through this handle clears it.
+	copied *bucketCopy
+}
+
+// bucketCopy describes a bucket-side copy into a handle's file: the source,
+// and both files as they were right after the copy.
+type bucketCopy struct {
+	src     string
+	size    int64
+	srcTime time.Time
+	dstTime time.Time
 }
 
 // fileFor returns the open file, reopening it read-write when write is set
@@ -246,6 +259,9 @@ func (h *handle) fileFor(write bool) (billy.File, error) {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if write {
+		h.copied = nil
+	}
 	if h.file != nil && (h.writable || !write) {
 		return h.file, nil
 	}
@@ -398,6 +414,7 @@ func (h *handle) Rename(_ context.Context, newPath string, replaceIfExists bool)
 	if err := h.fs.Rename(h.path, target); err != nil {
 		return err
 	}
+	h.copied = nil
 	if h.opens != nil {
 		h.opens.Rename(h.path, target)
 	}
@@ -430,46 +447,122 @@ func matchPattern(pattern, name string) (bool, error) {
 }
 
 // CopyChunk implements smbvfs.ChunkCopier: a client copying a file inside
-// the share asks the gateway to move the bytes, and for a whole file that
-// becomes a copy inside the bucket, with no bytes moving at all.
+// the share asks the gateway to move the bytes, and when the copy covers the
+// whole file it becomes a copy inside the bucket, with no bytes moving at
+// all.
 //
-// Anything else, a partial range or a source the gateway cannot copy in the
-// bucket, returns errors.ErrUnsupported so the server copies the bytes
+// Clients send a copy as chunks of at most 1 MiB, so a whole-file copy is
+// recognized from its first chunk in one of two ways:
+//
+//   - the chunk covers the whole source, and the destination is no longer
+//     than it
+//   - the destination is already exactly as long as the source and holds no
+//     bytes anyone wrote, as when Windows creates the file and sets its
+//     length before asking for the copy. Its bytes are all zeros, so copying
+//     the whole file early leaves nothing a partial copy would have kept.
+//
+// After that, later chunks of the same copy are acknowledged without moving
+// anything, as long as neither file has changed since.
+//
+// Anything else returns errors.ErrUnsupported so the server copies the bytes
 // itself. Even then they only travel gateway-side, never out to the client.
 func (h *handle) CopyChunk(_ context.Context, src smbvfs.Handle, srcOffset, dstOffset, length int64) (int64, error) {
 	source, ok := src.(*handle)
-	if !ok || h.dir || source.dir {
+	if !ok || source == h || h.dir || source.dir {
 		return 0, errors.ErrUnsupported
 	}
-	if srcOffset != 0 || dstOffset != 0 {
+	// A bucket-side copy puts every byte where it was in the source.
+	if srcOffset != dstOffset {
 		return 0, errors.ErrUnsupported
 	}
 
 	source.mu.Lock()
 	srcPath := source.path
 	source.mu.Unlock()
-	h.mu.Lock()
-	dstPath := h.path
-	writable := h.writable
-	h.mu.Unlock()
 
-	info, err := h.fs.Stat(srcPath)
+	// Held for the whole copy: this handle's writes, including the server
+	// copying another chunk itself, wait until the copy has landed.
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	srcInfo, err := h.fs.Stat(srcPath)
 	if err != nil {
 		return 0, err
 	}
-	// Only a copy of the whole file: a shorter range would leave the rest of
-	// the destination as it was, which a bucket-side copy cannot express.
-	if info.Size() != length {
-		return 0, errors.ErrUnsupported
-	}
-	// A destination already open for writing has staged state that a
-	// bucket-side copy would not replace.
-	if writable {
+	size := srcInfo.Size()
+	// A range past the end of the source copies short, which the server
+	// handles.
+	if srcOffset+length > size {
 		return 0, errors.ErrUnsupported
 	}
 
-	if err := h.fs.CopyFile(srcPath, dstPath); err != nil {
+	if h.copied != nil {
+		if h.stillCopied(srcPath, srcInfo) {
+			return length, nil
+		}
+		h.copied = nil
+		return 0, errors.ErrUnsupported
+	}
+
+	if srcOffset != 0 {
+		return 0, errors.ErrUnsupported
+	}
+	// A destination that is gone, removed by another client, is empty.
+	var dstSize int64
+	if dstInfo, err := h.fs.Stat(h.path); err == nil {
+		dstSize = dstInfo.Size()
+	} else if !errors.Is(err, fs.ErrNotExist) {
 		return 0, err
 	}
+	var copyErr error
+	switch {
+	case length == size && dstSize <= size:
+		copyErr = h.copyFileLocked(srcPath, false)
+	case dstSize == size:
+		copyErr = h.copyFileLocked(srcPath, true)
+	default:
+		return 0, errors.ErrUnsupported
+	}
+	if copyErr != nil {
+		return 0, copyErr
+	}
+
+	h.copied = &bucketCopy{src: srcPath, size: size, srcTime: srcInfo.ModTime()}
+	if info, err := h.fs.Stat(h.path); err == nil && info.Size() == size {
+		h.copied.dstTime = info.ModTime()
+	} else {
+		// The copy landed, but it cannot vouch for later chunks.
+		h.copied = nil
+	}
 	return length, nil
+}
+
+// copyFileLocked copies srcPath over the handle's file inside the bucket,
+// with h.mu held. The handle's open file is closed first: it holds the
+// destination's staged session, which the copy can only discard once no
+// handle holds it. The next I/O reopens it.
+func (h *handle) copyFileLocked(srcPath string, onlyUnwritten bool) error {
+	if h.file != nil {
+		if err := h.file.Close(); err != nil {
+			return err
+		}
+		h.file, h.writable = nil, false
+	}
+	return h.fs.CopyFile(srcPath, h.path, onlyUnwritten)
+}
+
+// stillCopied reports whether the handle's file is still the bucket-side
+// copy of srcPath it was made, so a later chunk of the same copy is already
+// in place. srcInfo is the source as it is now.
+func (h *handle) stillCopied(srcPath string, srcInfo os.FileInfo) bool {
+	c := h.copied
+	if c.src != srcPath || srcInfo.Size() != c.size || !srcInfo.ModTime().Equal(c.srcTime) {
+		return false
+	}
+	// Staged on either side means another handle has written since.
+	if h.fs.IsStaged(srcPath) || h.fs.IsStaged(h.path) {
+		return false
+	}
+	dstInfo, err := h.fs.Stat(h.path)
+	return err == nil && dstInfo.Size() == c.size && dstInfo.ModTime().Equal(c.dstTime)
 }

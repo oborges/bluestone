@@ -567,9 +567,22 @@ func (fs *Filesystem) statFromStaging(fullPath string) os.FileInfo {
 //
 // It returns errors.ErrUnsupported when a bucket-side copy would not produce
 // the same bytes a read-and-write would: the caller then copies the data
-// itself. That is the case while either file is staged, because the object
-// in COS is not what a reader would see.
-func (fs *Filesystem) CopyFile(src, dst string) error {
+// itself. That is the case while the source is staged, because the object in
+// COS is not what a reader would see, and while the destination holds staged
+// bytes a client wrote.
+//
+// A destination that is staged but holds no written bytes, as when Windows
+// creates the file and sets its length before asking for the copy, is
+// discarded and replaced by the copy. Nothing is lost: its bytes are all
+// zeros the copy overwrites. The caller must have closed its own handle on
+// dst, or the staged session is still in use and the copy is declined. The
+// copy carries the attributes the staged file would have synced with, as a
+// copy through the staged file would.
+//
+// onlyUnwritten restricts the copy to that case, for a caller that knows
+// only that the destination's current bytes are not worth keeping if nobody
+// wrote them.
+func (fs *Filesystem) CopyFile(src, dst string, onlyUnwritten bool) error {
 	srcFull := fs.keyPath(src)
 	dstFull := fs.keyPath(dst)
 	if isReservedPath(srcFull) || isReservedPath(dstFull) {
@@ -579,22 +592,78 @@ func (fs *Filesystem) CopyFile(src, dst string) error {
 		return nil
 	}
 
-	if fs.featureFlags != nil && fs.featureFlags.IsStagingEnabled() && fs.stagingManager != nil {
-		for _, path := range []string{srcFull, dstFull} {
-			// Staged state is the truth for these paths, and the object in
-			// COS may be older or absent.
-			if fs.stagingManager.IsDirty(path) || fs.stagingManager.HasPendingDelete(path) ||
-				fs.stagingManager.IsConflicted(path) {
+	var discarded *staging.DiscardedSession
+	stagingEnabled := fs.featureFlags != nil && fs.featureFlags.IsStagingEnabled() && fs.stagingManager != nil
+	if onlyUnwritten && !stagingEnabled {
+		return errors.ErrUnsupported
+	}
+	if stagingEnabled {
+		sm := fs.stagingManager
+		// Staged state is the truth for the source, and the object in COS
+		// may be older or absent.
+		if sm.IsDirty(srcFull) || sm.HasPendingDelete(srcFull) || sm.IsConflicted(srcFull) {
+			return errors.ErrUnsupported
+		}
+		// A pending delete would remove the copy once processed.
+		if sm.HasPendingDelete(dstFull) || sm.IsConflicted(dstFull) {
+			return errors.ErrUnsupported
+		}
+
+		_, staged := sm.GetSession(dstFull)
+		if onlyUnwritten && !staged {
+			return errors.ErrUnsupported
+		}
+		if staged || sm.IsDirty(dstFull) {
+			// The claim keeps the sync worker from uploading the staged
+			// destination while it is discarded, and from starting on it
+			// before the copy lands. If a worker already holds it, an
+			// upload may be in flight that would land after the copy.
+			if !sm.TryLockSync(dstFull) {
+				return errors.ErrUnsupported
+			}
+			defer sm.UnlockSync(dstFull)
+			var ok bool
+			discarded, ok = sm.DiscardUnwrittenSession(dstFull)
+			if !ok || (onlyUnwritten && discarded == nil) {
 				return errors.ErrUnsupported
 			}
 		}
 	}
 
-	if err := fs.ops.CopyFile(fs.requestContext(), srcFull, dstFull); err != nil {
+	var attrs *types.POSIXAttributes
+	if discarded != nil {
+		attrs = discarded.Attributes.POSIX()
+	}
+	if err := fs.ops.CopyFile(fs.requestContext(), srcFull, dstFull, attrs); err != nil {
+		if discarded != nil {
+			// Still under the sync claim: put the destination back as the
+			// client left it, rather than exposing whatever the bucket held.
+			if restoreErr := fs.stagingManager.RestoreUnwrittenSession(dstFull, discarded); restoreErr != nil {
+				fs.logger.Error("Failed to restore discarded copy destination",
+					"dst", dstFull, "error", restoreErr)
+			}
+		}
 		return err
 	}
-	fs.logger.Debug("Copied inside the bucket", "src", srcFull, "dst", dstFull)
+	fs.logger.Info("Copied inside the bucket",
+		"src", srcFull,
+		"dst", dstFull,
+		"discarded_unwritten_destination", discarded != nil)
 	return nil
+}
+
+// IsStaged reports whether the gateway holds staged state for name: a
+// session, bytes waiting to sync, a pending delete, or a conflict.
+func (fs *Filesystem) IsStaged(name string) bool {
+	if fs.featureFlags == nil || !fs.featureFlags.IsStagingEnabled() || fs.stagingManager == nil {
+		return false
+	}
+	full := fs.keyPath(name)
+	sm := fs.stagingManager
+	if _, ok := sm.GetSession(full); ok {
+		return true
+	}
+	return sm.IsDirty(full) || sm.HasPendingDelete(full) || sm.IsConflicted(full)
 }
 
 func (fs *Filesystem) Rename(oldpath, newpath string) error {

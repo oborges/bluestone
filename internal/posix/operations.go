@@ -40,6 +40,7 @@ type ObjectStore interface {
 	HeadObject(ctx context.Context, key string) (*types.ObjectMetadata, error)
 	ListObjects(ctx context.Context, prefix string, maxKeys int) ([]*types.ObjectMetadata, error)
 	CopyObject(ctx context.Context, sourceKey, destKey string) error
+	CopyObjectWithMetadata(ctx context.Context, sourceKey, destKey string, metadata map[string]string) error
 	UpdateObjectMetadata(ctx context.Context, key string, metadata map[string]string) error
 }
 
@@ -1173,7 +1174,10 @@ fetchFromCOS:
 // passing through the gateway. It is what a server-side copy (SMB's
 // FSCTL_SRV_COPYCHUNK) becomes when the whole file is being copied and the
 // source is clean in COS.
-func (h *OperationsHandler) CopyFile(ctx context.Context, srcPath, dstPath string) (err error) {
+//
+// The copy keeps the source's metadata, or carries attrs instead when they
+// are given.
+func (h *OperationsHandler) CopyFile(ctx context.Context, srcPath, dstPath string, attrs *types.POSIXAttributes) (err error) {
 	log := logging.WithOperation("CopyFile").With(
 		zap.String("srcPath", srcPath),
 		zap.String("dstPath", dstPath),
@@ -1201,7 +1205,13 @@ func (h *OperationsHandler) CopyFile(ctx context.Context, srcPath, dstPath strin
 	// directory describe a file that is about to change.
 	defer h.invalidateFileMutation(dstPath)
 
-	if err := h.cosClient.CopyObject(ctx, h.translator.ToObjectKey(srcPath), h.translator.ToObjectKey(dstPath)); err != nil {
+	srcKey, dstKey := h.translator.ToObjectKey(srcPath), h.translator.ToObjectKey(dstPath)
+	if attrs != nil {
+		err = h.cosClient.CopyObjectWithMetadata(ctx, srcKey, dstKey, EncodePOSIXAttributes(attrs))
+	} else {
+		err = h.cosClient.CopyObject(ctx, srcKey, dstKey)
+	}
+	if err != nil {
 		log.Error("Failed to copy object", zap.Error(err))
 		return err
 	}

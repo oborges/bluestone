@@ -584,6 +584,21 @@ func (c *Client) ListObjects(ctx context.Context, prefix string, maxKeys int) ([
 
 // CopyObject copies an object within COS
 func (c *Client) CopyObject(ctx context.Context, sourceKey, destKey string) error {
+	return c.copyObject(ctx, sourceKey, destKey, nil)
+}
+
+// CopyObjectWithMetadata copies an object within COS, giving the copy
+// metadata in place of the source's.
+func (c *Client) CopyObjectWithMetadata(ctx context.Context, sourceKey, destKey string, metadata map[string]string) error {
+	if metadata == nil {
+		metadata = map[string]string{}
+	}
+	return c.copyObject(ctx, sourceKey, destKey, metadata)
+}
+
+// copyObject copies sourceKey to destKey, replacing the metadata when
+// metadata is not nil.
+func (c *Client) copyObject(ctx context.Context, sourceKey, destKey string, metadata map[string]string) error {
 	log := logging.WithOperation("CopyObject").With(
 		zap.String("sourceKey", sourceKey),
 		zap.String("destKey", destKey),
@@ -596,6 +611,13 @@ func (c *Client) CopyObject(ctx context.Context, sourceKey, destKey string) erro
 		Bucket:     aws.String(c.bucket),
 		CopySource: aws.String(copySource),
 		Key:        aws.String(destKey),
+	}
+	if metadata != nil {
+		input.Metadata = make(map[string]*string, len(metadata))
+		for k, v := range metadata {
+			input.Metadata[k] = aws.String(v)
+		}
+		input.MetadataDirective = aws.String("REPLACE")
 	}
 
 	_, err := c.s3Client.CopyObjectWithContext(ctx, input)
