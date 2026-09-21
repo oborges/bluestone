@@ -95,7 +95,7 @@ func (m *MultipartUpload) UploadPart(ctx context.Context, partNumber int, data [
 	}
 
 	result, err := m.client.s3Client.UploadPartWithContext(ctx, input)
-	if err != nil {
+	if err = m.client.noteWrite(err); err != nil {
 		log.Error("failed to upload part", zap.Error(err))
 		return fmt.Errorf("failed to upload part %d: %w", partNumber, err)
 	}
@@ -189,7 +189,7 @@ func (m *MultipartUpload) Complete(ctx context.Context) error {
 	}
 
 	_, err := m.client.s3Client.CompleteMultipartUploadWithContext(ctx, input)
-	if err != nil {
+	if err = m.client.noteWrite(err); err != nil {
 		log.Error("failed to complete multipart upload", zap.Error(err))
 		return fmt.Errorf("failed to complete multipart upload: %w", err)
 	}

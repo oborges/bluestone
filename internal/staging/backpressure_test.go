@@ -180,3 +180,32 @@ func newBackpressureSession(t *testing.T, path string) (*StagingManager, *WriteS
 
 	return manager, session
 }
+
+// While the bucket refuses writes for its quota, staging refuses writes too,
+// rather than accepting data it cannot upload; shrinking a file, which frees
+// space, is still allowed.
+func TestStagingRefusesWritesWhileBucketFull(t *testing.T) {
+	cfg := createTestConfig(t)
+	manager, err := NewStagingManager(cfg)
+	if err != nil {
+		t.Fatalf("NewStagingManager() error = %v", err)
+	}
+	defer manager.Shutdown()
+	full := true
+	manager.SetBucketFullCheck(func() bool { return full })
+
+	if _, err := manager.ReserveWrite("/a.txt", 10, 10); !errors.Is(err, syscall.ENOSPC) {
+		t.Fatalf("write while the bucket is full: %v, want ENOSPC", err)
+	}
+	if release, err := manager.ReserveWrite("/a.txt", 0, 0); err != nil {
+		t.Fatalf("shrinking while the bucket is full: %v", err)
+	} else {
+		release()
+	}
+	full = false
+	release, err := manager.ReserveWrite("/a.txt", 10, 10)
+	if err != nil {
+		t.Fatalf("write once the bucket has room: %v", err)
+	}
+	release()
+}

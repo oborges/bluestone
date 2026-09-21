@@ -336,10 +336,21 @@ data piles up. Explorer checks it before a copy and refuses one that will
 not fit, rather than failing partway through. The flip side is that a
 single copy larger than the free staging space is refused up front even
 though uploads would drain staging while it ran; size staging for the
-largest copy users make, or copy in parts. A bucket quota is not reported:
-writes are accepted into staging before they reach COS, so a bucket that
-refuses them leaves the files dirty in staging, which then fills and
-reports disk full.
+largest copy users make, or copy in parts.
+
+A bucket with a hard quota is reported as full once it refuses writes. IBM
+COS counts a bucket's usage a few minutes behind, so some writes past the
+quota succeed, and the gateway learns the bucket is full when COS first
+refuses one (`BucketQuotaExceeded`). From then on, new writes fail at once
+with "not enough space on the disk" (SMB) or "No space left on device"
+(NFS), instead of being staged and then failing to upload, and the share
+shows no free space. Reads and deletes still work, so users can make room.
+Files staged before the bucket filled stay in staging and upload once there
+is room. The gateway notices when an upload succeeds again, or retries
+writes two minutes after the last refusal. `cos_bucket_quota_exceeded` is 1
+while the bucket is full. After a quota is raised, COS can take half a
+minute to apply it everywhere, and writes may be refused now and then
+meanwhile.
 
 Clients watching a directory, as Explorer and Finder windows do, are told of
 changes as they happen, whether made over SMB or NFS. The gateway reports
@@ -607,6 +618,8 @@ Important metrics include:
   command, so a compound request counts once per command in it, and `status`
   is the NT status the client saw, such as `STATUS_SHARING_VIOLATION`
 - `smb_connections`, `smb_sessions`, `smb_open_files`
+- `cos_bucket_quota_exceeded`: 1 while the bucket refuses writes for its
+  hard quota
 - `smb_leases_granted_total` (labels `kind`: lease or oplock, `state`),
   `smb_lease_breaks_total` (labels `kind`, `from`, `to`), and
   `smb_lease_break_timeouts_total`: client caching granted, and taken back

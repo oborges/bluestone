@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/IBM/ibm-cos-sdk-go/aws"
@@ -30,6 +31,9 @@ type Client struct {
 	s3Client *s3.S3
 	bucket   string
 	config   *config.COSConfig
+	// fullUntil is when the bucket stops counting as full, in Unix
+	// nanoseconds; 0 when it is not (see BucketFull).
+	fullUntil atomic.Int64
 }
 
 // NewClient creates a new COS client
@@ -406,7 +410,7 @@ func (c *Client) PutObject(ctx context.Context, key string, data []byte, metadat
 	}
 
 	_, err := c.s3Client.PutObjectWithContext(ctx, input)
-	if err != nil {
+	if err = c.noteWrite(err); err != nil {
 		log.Error("failed to put object", zap.Error(err))
 		return fmt.Errorf("failed to put object: %w", err)
 	}
@@ -435,7 +439,7 @@ func (c *Client) PutObjectStream(ctx context.Context, key string, body io.ReadSe
 	}
 
 	_, err := c.s3Client.PutObjectWithContext(ctx, input)
-	if err != nil {
+	if err = c.noteWrite(err); err != nil {
 		log.Error("failed to put object stream", zap.Error(err))
 		return fmt.Errorf("failed to put object stream: %w", err)
 	}
@@ -621,7 +625,7 @@ func (c *Client) copyObject(ctx context.Context, sourceKey, destKey string, meta
 	}
 
 	_, err := c.s3Client.CopyObjectWithContext(ctx, input)
-	if err != nil {
+	if err = c.noteWrite(err); err != nil {
 		log.Error("failed to copy object", zap.Error(err))
 		return fmt.Errorf("failed to copy object: %w", err)
 	}
@@ -653,7 +657,7 @@ func (c *Client) UpdateObjectMetadata(ctx context.Context, key string, metadata 
 	}
 
 	_, err := c.s3Client.CopyObjectWithContext(ctx, input)
-	if err != nil {
+	if err = c.noteWrite(err); err != nil {
 		log.Error("failed to update object metadata", zap.Error(err))
 		return fmt.Errorf("failed to update object metadata: %w", err)
 	}
@@ -755,7 +759,7 @@ func (c *Client) UploadPart(ctx context.Context, key, uploadID string, partNumbe
 	}
 
 	result, err := c.s3Client.UploadPartWithContext(ctx, input)
-	if err != nil {
+	if err = c.noteWrite(err); err != nil {
 		log.Error("failed to upload part", zap.Error(err))
 		return "", fmt.Errorf("failed to upload part: %w", err)
 	}
@@ -783,7 +787,7 @@ func (c *Client) CompleteMultipartUpload(ctx context.Context, key, uploadID stri
 	}
 
 	_, err := c.s3Client.CompleteMultipartUploadWithContext(ctx, input)
-	if err != nil {
+	if err = c.noteWrite(err); err != nil {
 		log.Error("failed to complete multipart upload", zap.Error(err))
 		return fmt.Errorf("failed to complete multipart upload: %w", err)
 	}

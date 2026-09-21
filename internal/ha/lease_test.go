@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -18,6 +19,9 @@ type memStore struct {
 	mu      sync.Mutex
 	objects map[string][]byte
 	failAll bool
+	// full refuses writes as a bucket over its hard quota does, while
+	// reads and deletes work.
+	full bool
 }
 
 func newMemStore() *memStore {
@@ -46,6 +50,9 @@ func (s *memStore) PutObject(_ context.Context, key string, data []byte, _ map[s
 	defer s.mu.Unlock()
 	if s.failAll {
 		return errStoreDown
+	}
+	if s.full {
+		return fmt.Errorf("failed to put object: %w", syscall.ENOSPC)
 	}
 	s.objects[key] = append([]byte(nil), data...)
 	return nil
@@ -337,4 +344,120 @@ func TestReleaseKeepsAnotherHoldersLease(t *testing.T) {
 	if current.HolderID != "other-host-1234" {
 		t.Fatalf("lease holder = %q, want the other gateway's", current.HolderID)
 	}
+}
+
+func (s *memStore) setFull(full bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.full = full
+}
+
+// expectNoLoss fails if a loss is reported within d.
+func expectNoLoss(t *testing.T, losses chan LeaseLoss, d time.Duration) {
+	t.Helper()
+	select {
+	case loss := <-losses:
+		t.Fatalf("lease reported lost: %+v (%s)", loss, loss.Description())
+	case <-time.After(d):
+	}
+}
+
+// A bucket over its hard quota refuses the lease renewal, but it refuses a
+// standby's takeover too, so the gateway keeps serving: clients can still
+// read, and delete to free space. Once the bucket has room it renews again.
+func TestFullBucketKeepsTheLease(t *testing.T) {
+	store := newMemStore()
+	losses := make(chan LeaseLoss, 4)
+	options := opts(store, t.TempDir())
+	options.OnLeaseLost = func(loss LeaseLoss) { losses <- loss }
+	m, err := Acquire(context.Background(), options)
+	if err != nil {
+		t.Fatalf("Acquire() error = %v", err)
+	}
+	defer m.Release()
+
+	store.setFull(true)
+	expectNoLoss(t, losses, 4*options.LeaseTimeout)
+
+	store.setFull(false)
+	before := store.currentLease(t).RenewedAt
+	time.Sleep(3 * options.HeartbeatInterval)
+	if !store.currentLease(t).RenewedAt.After(before) {
+		t.Fatal("lease not renewed once the bucket had room")
+	}
+}
+
+// A takeover is still noticed while the bucket is full.
+func TestFullBucketStillNoticesTakeover(t *testing.T) {
+	store := newMemStore()
+	losses := make(chan LeaseLoss, 4)
+	options := opts(store, t.TempDir())
+	options.OnLeaseLost = func(loss LeaseLoss) { losses <- loss }
+	m, err := Acquire(context.Background(), options)
+	if err != nil {
+		t.Fatalf("Acquire() error = %v", err)
+	}
+	defer m.Release()
+
+	store.setFull(true)
+	writeForeignLease(t, store, "other-host-9999")
+	select {
+	case loss := <-losses:
+		if loss.Reason != "taken" {
+			t.Fatalf("loss = %+v, want taken", loss)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("a takeover during a full bucket was not noticed")
+	}
+}
+
+// A gateway restarted while the bucket is full cannot replace its previous
+// lease. That lease names this host's previous process, with an older epoch:
+// it is not a takeover, and the gateway keeps serving.
+func TestRestartWhileBucketFull(t *testing.T) {
+	store := newMemStore()
+	dir := t.TempDir()
+	first, err := Acquire(context.Background(), opts(store, dir))
+	if err != nil {
+		t.Fatalf("Acquire() error = %v", err)
+	}
+	// The process dies: its heartbeat stops, the lease stays.
+	first.cancel()
+	<-first.done
+
+	store.setFull(true)
+	losses := make(chan LeaseLoss, 4)
+	options := opts(store, dir)
+	options.OnLeaseLost = func(loss LeaseLoss) { losses <- loss }
+	second, err := Acquire(context.Background(), options)
+	if err != nil {
+		t.Fatalf("Acquire() after a restart with the bucket full: %v", err)
+	}
+	defer second.Release()
+	expectNoLoss(t, losses, 4*options.LeaseTimeout)
+}
+
+// A gateway starting on a bucket that is already full cannot write its
+// lease at all; with no lease there for anyone, and no gateway able to write
+// one, it keeps serving.
+func TestFullBucketWithNoLeaseYet(t *testing.T) {
+	store := newMemStore()
+	dir := t.TempDir()
+	// A node that has held a lease before may start without writing one.
+	first, err := Acquire(context.Background(), opts(store, dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.Release()
+
+	store.setFull(true)
+	losses := make(chan LeaseLoss, 4)
+	options := opts(store, dir)
+	options.OnLeaseLost = func(loss LeaseLoss) { losses <- loss }
+	m, err := Acquire(context.Background(), options)
+	if err != nil {
+		t.Fatalf("Acquire() on a full bucket with no lease: %v", err)
+	}
+	defer m.Release()
+	expectNoLoss(t, losses, 4*options.LeaseTimeout)
 }

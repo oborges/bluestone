@@ -160,6 +160,13 @@ var (
 		},
 	)
 
+	cosBucketFull = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "cos_bucket_quota_exceeded",
+			Help: "1 while the bucket is refusing writes for its hard quota",
+		},
+	)
+
 	smbRequestDuration = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Name:    "smb_request_duration_seconds",
@@ -410,6 +417,7 @@ func Initialize() {
 		smbLeasesGranted,
 		smbLeaseBreaks,
 		smbLeaseBreakTimeouts,
+		cosBucketFull,
 		smbRequestDuration,
 		smbConnections,
 		smbSessions,
@@ -508,6 +516,16 @@ func RequestStatus(err error) string {
 func RecordSMBRequest(command, status string, duration time.Duration) {
 	smbRequestsTotal.WithLabelValues(command, status).Inc()
 	smbRequestDuration.WithLabelValues(command).Observe(duration.Seconds())
+}
+
+// SetCOSBucketFull records whether the bucket is refusing writes for its
+// hard quota.
+func SetCOSBucketFull(full bool) {
+	if full {
+		cosBucketFull.Set(1)
+	} else {
+		cosBucketFull.Set(0)
+	}
 }
 
 // RecordSMBLeaseGranted counts caching granted to an SMB open.

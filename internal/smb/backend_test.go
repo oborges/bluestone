@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -40,6 +41,21 @@ type memStore struct {
 	copies int
 	// copyErr, when set, fails every copy.
 	copyErr error
+	// full refuses writes as a bucket over its hard quota does.
+	full bool
+}
+
+func (s *memStore) setFull(full bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.full = full
+}
+
+// BucketFull reports the full state, as the COS client does.
+func (s *memStore) BucketFull() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.full
 }
 
 func (s *memStore) copyCount() int {
@@ -94,6 +110,9 @@ func (s *memStore) GetObjectStream(ctx context.Context, key string) (io.ReadClos
 func (s *memStore) PutObject(_ context.Context, key string, data []byte, metadata map[string]string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.full {
+		return fmt.Errorf("failed to put object: %w", syscall.ENOSPC)
+	}
 	s.objects[key] = append([]byte(nil), data...)
 	s.metadata[key] = metadata
 	return nil
@@ -1451,5 +1470,46 @@ func TestSMBBackendMarksExternalChanges(t *testing.T) {
 	}
 	if ext, ok := external["from-nfs.txt"]; !ok || !ext {
 		t.Errorf("NFS write reported external=%v (seen %v), want a change marked external", ext, ok)
+	}
+}
+
+// A bucket over its hard quota is reported as full: writes fail with
+// STATUS_DISK_FULL when they are made, rather than being staged and failing
+// to upload later, a new folder cannot be created, and the share shows no
+// free space. Once the bucket has room, writes work again.
+func TestSMBFullBucketIsDiskFull(t *testing.T) {
+	g := startGateway(t)
+	g.manager.SetBucketFullCheck(g.store.BucketFull)
+	if err := g.share.WriteFile("before.txt", []byte("fits"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	g.store.setFull(true)
+	const statusDiskFull = 0xC000007F
+	isDiskFull := func(err error) bool {
+		var respErr *client.ResponseError
+		return errors.As(err, &respErr) && respErr.Code == statusDiskFull
+	}
+	if err := g.share.WriteFile("after.txt", []byte("does not fit"), 0o644); !isDiskFull(err) {
+		t.Fatalf("write to a full bucket: %v, want STATUS_DISK_FULL", err)
+	}
+	if err := g.share.Mkdir("folder", 0o755); !isDiskFull(err) {
+		t.Fatalf("mkdir in a full bucket: %v, want STATUS_DISK_FULL", err)
+	}
+	fs, err := g.share.Statfs("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if free := fs.AvailableBlockCount(); free != 0 {
+		t.Fatalf("free space in a full bucket = %d blocks, want none", free)
+	}
+	// Reads and deletes still work, so users can free space.
+	if got := g.readFile(t, "before.txt"); got != "fits" {
+		t.Fatalf("read from a full bucket = %q", got)
+	}
+
+	g.store.setFull(false)
+	if err := g.share.WriteFile("after.txt", []byte("fits now"), 0o644); err != nil {
+		t.Fatalf("write once the bucket has room: %v", err)
 	}
 }

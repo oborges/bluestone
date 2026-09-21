@@ -32,6 +32,9 @@ type StagingManager struct {
 	tombstoneMu   sync.RWMutex
 	pressureMu    sync.Mutex
 	reservedBytes int64
+	// bucketFull reports whether the bucket is refusing writes for its
+	// quota (see SetBucketFullCheck).
+	bucketFull func() bool
 	// sidecarMu serializes read-modify-write updates of path metadata
 	// sidecars. Lock order: mu before sidecarMu.
 	sidecarMu sync.Mutex
@@ -648,6 +651,16 @@ func (sm *StagingManager) updateConflictMetrics() {
 	metrics.SetStagingConflicts(count, last)
 }
 
+// SetBucketFullCheck tells staging how to learn that the bucket is refusing
+// writes for its hard quota. While it is, writes are refused with ENOSPC
+// rather than accepted into staging: staged data could not be uploaded, and
+// the client would only find out when staging filled.
+func (sm *StagingManager) SetBucketFullCheck(full func() bool) {
+	sm.pressureMu.Lock()
+	defer sm.pressureMu.Unlock()
+	sm.bucketFull = full
+}
+
 // ReserveWrite applies staging backpressure and reserves new bytes before a write.
 func (sm *StagingManager) ReserveWrite(path string, requestedBytes, growthBytes int64) (func(), error) {
 	if requestedBytes < 0 {
@@ -660,6 +673,15 @@ func (sm *StagingManager) ReserveWrite(path string, requestedBytes, growthBytes 
 	releaseNoop := func() {}
 	if sm == nil || sm.config == nil || sm.config.MaxStagingSizeGB <= 0 {
 		return releaseNoop, nil
+	}
+	sm.pressureMu.Lock()
+	bucketFull := sm.bucketFull
+	sm.pressureMu.Unlock()
+	if requestedBytes > 0 && bucketFull != nil && bucketFull() {
+		logging.Info("Refusing write: bucket is over its hard quota",
+			zap.String("path", path), zap.Int64("requested_bytes", requestedBytes))
+		metrics.RecordBackpressureRejected()
+		return releaseNoop, syscall.ENOSPC
 	}
 
 	timeout, err := sm.config.GetBackpressureWaitTimeout()

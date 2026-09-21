@@ -286,6 +286,9 @@ func main() {
 		// narrower invalidation.
 		syncWorker.SetObjectMutatedCallback(operations.InvalidateFileMutation)
 		syncWorker.SetObjectSyncedCallback(operations.InvalidateObjectAfterSync)
+		// A bucket over its hard quota refuses uploads; refuse writes at
+		// the client meanwhile instead of staging data that cannot sync.
+		stagingManager.SetBucketFullCheck(cosClient.BucketFull)
 
 		// Start sync worker
 		syncWorker.Start()

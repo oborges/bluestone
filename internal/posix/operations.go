@@ -1393,6 +1393,13 @@ func (h *OperationsHandler) UpdateAttributes(ctx context.Context, path string, u
 	return nil
 }
 
+// BucketFull reports whether the bucket is refusing writes for its hard
+// quota, for object stores that can tell.
+func (h *OperationsHandler) BucketFull() bool {
+	full, ok := h.cosClient.(interface{ BucketFull() bool })
+	return ok && full.BucketFull()
+}
+
 // FileInfo represents file information
 type FileInfo struct {
 	name    string
