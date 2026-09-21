@@ -230,6 +230,7 @@ smb:
   encryption_required: false
   concurrent_requests: 0 # reads/writes at once per connection; 0 = default (64), 1 = serial
   drain_timeout: "30s"   # how long a shutdown waits for clients to finish
+  max_stream_bytes: 2048 # cap on a file's named streams, kept in object metadata
   limits:
     max_connections: 256
     max_connections_per_client: 64
@@ -383,9 +384,22 @@ accounts in `smb.users` and by `server.allowed_clients`.
 No oplocks or leases are granted, so clients do not cache file contents
 locally and write through to the gateway. That keeps SMB clients consistent
 with NFS clients and with changes made directly in the bucket, at the cost of
-some client-side caching performance. Also not supported yet: alternate data
-streams and security descriptors. Signing uses AES-CMAC and encryption
+some client-side caching performance. Signing uses AES-CMAC and encryption
 AES-128-CCM.
+
+Named data streams (alternate data streams) are supported, and kept in the
+object's metadata rather than as objects of their own. macOS stores Finder
+information, tags and extended attributes this way instead of writing an
+AppleDouble `._` file beside every file, and Windows keeps a download's
+"downloaded from the internet" mark. Streams move with renames and copies,
+go with the file when it is deleted, and are dropped when a file is
+replaced, as on Windows. Object metadata is small, so a file's streams are
+capped at `smb.max_stream_bytes` (2048 bytes, names and contents together,
+by default). A write past it fails as disk full, and macOS then reports that
+it could not copy a file's extended attributes. That rules out large
+resource forks and long extended attributes. IBM COS holds about 4 KB of
+metadata per object, which allows up to 2560. For an object store with
+Amazon S3's 2 KB limit, set it to 1024.
 
 ### Staging And Async Sync
 

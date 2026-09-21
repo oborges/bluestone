@@ -16,6 +16,8 @@ type StagedAttributes struct {
 	GID               uint32      `json:"gid"`
 	Btime             time.Time   `json:"btime,omitempty"`
 	WindowsAttributes uint32      `json:"windows_attributes,omitempty"`
+	// Streams are the file's named data streams.
+	Streams map[string][]byte `json:"streams,omitempty"`
 	// Atime and Mtime are times a client set explicitly. They are zero when
 	// no client has set them, and the staged file's own last write stands in.
 	Atime time.Time `json:"atime,omitempty"`
@@ -30,6 +32,7 @@ func StagedAttributesFrom(attrs types.POSIXAttributes) StagedAttributes {
 		GID:               uint32(attrs.GID),
 		Btime:             attrs.Btime,
 		WindowsAttributes: attrs.WindowsAttributes,
+		Streams:           types.CloneStreams(attrs.Streams),
 		Atime:             attrs.Atime,
 		Mtime:             attrs.Mtime,
 	}
@@ -43,6 +46,7 @@ func (a StagedAttributes) POSIX() *types.POSIXAttributes {
 		GID:               int(a.GID),
 		Btime:             a.Btime,
 		WindowsAttributes: a.WindowsAttributes,
+		Streams:           types.CloneStreams(a.Streams),
 		Atime:             a.Atime,
 		Mtime:             a.Mtime,
 	}

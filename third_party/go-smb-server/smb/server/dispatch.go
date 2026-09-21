@@ -359,6 +359,18 @@ func (c *request) handleCreate(ctx context.Context, msg []byte, hdr *wire.Header
 		return c.errBody(wire.StatusInsufficientResources)
 	}
 	name := wire.UTF16FromBytes(req.Name)
+	base, stream, err := splitStream(name)
+	if err != nil {
+		return c.errBody(wire.StatusObjectNameInvalid)
+	}
+	backend := tr.share.Backend()
+	streams, hasStreams := backend.(vfs.StreamOpener)
+	if stream != "" && !hasStreams {
+		// Passing "file:stream" through would create a file of that name.
+		return c.errBody(wire.StatusObjectNameInvalid)
+	}
+	// "file::$DATA" is the file itself.
+	name = streamPath(base, stream)
 	deleteOnClose := req.CreateOptions&wire.FileDeleteOnClose != 0
 	if deleteOnClose && req.DesiredAccess&(accessDelete|accessGenericAll|accessMaximumAllowed) == 0 {
 		// Deleting on close is deleting, which the open has to ask for
@@ -367,7 +379,7 @@ func (c *request) handleCreate(ctx context.Context, msg []byte, hdr *wire.Header
 	}
 	key := keyFor(tr.share.Name(), name)
 	files := c.srv.fileTable()
-	if files.deletePending(key) {
+	if files.deletePending(key) || (stream != "" && files.deletePending(keyFor(tr.share.Name(), base))) {
 		// The file is waiting for its last handle to close before it goes;
 		// Windows refuses every open of it meanwhile, including ones that
 		// would overwrite it. Checked before the backend opens it, so an
@@ -375,14 +387,19 @@ func (c *request) handleCreate(ctx context.Context, msg []byte, hdr *wire.Header
 		return c.errBody(wire.StatusDeletePending)
 	}
 	opts := vfs.OpenOptions{
-		Path:          name,
+		Path:          base,
 		Disposition:   req.CreateDisposition,
 		CreateDir:     req.CreateOptions&wire.FileDirectoryFile != 0,
 		DesiredAccess: req.DesiredAccess,
 		ShareAccess:   req.ShareAccess,
 		DeleteOnClose: deleteOnClose,
 	}
-	h, err := tr.share.Backend().Open(ctx, opts)
+	var h vfs.Handle
+	if stream != "" {
+		h, err = streams.OpenStream(ctx, opts, stream)
+	} else {
+		h, err = backend.Open(ctx, opts)
+	}
 	if err != nil {
 		return c.errBody(osErrToStatus(err))
 	}
@@ -402,7 +419,7 @@ func (c *request) handleCreate(ctx context.Context, msg []byte, hdr *wire.Header
 	c.log.Debug("create", "path", name, "disposition", req.CreateDisposition,
 		"desired_access", req.DesiredAccess, "options", req.CreateOptions)
 	oh := &openHandle{h: h, fileId: fid, sessionID: hdr.SessionId, path: name,
-		access: req.DesiredAccess, deleteOnClose: deleteOnClose, isDir: fi.IsDir}
+		access: req.DesiredAccess, deleteOnClose: deleteOnClose, isDir: fi.IsDir, stream: stream != ""}
 	files.add(key, oh)
 	tr.addOpen(oh)
 	*lastFileId = fid

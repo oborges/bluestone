@@ -1272,6 +1272,9 @@ func applyStagedUpdate(session *staging.WriteSession, update posix.AttributeUpda
 	if update.WindowsAttributes != nil {
 		session.SetWindowsAttributes(*update.WindowsAttributes & posix.WindowsAttributesStored)
 	}
+	if update.Streams != nil {
+		session.SetStreams(update.Streams)
+	}
 	if update.Atime != nil || update.Mtime != nil {
 		var atime, mtime time.Time
 		if update.Atime != nil {

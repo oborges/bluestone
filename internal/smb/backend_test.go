@@ -1221,3 +1221,136 @@ func TestSMBWritePastStagingQuotaIsDiskFull(t *testing.T) {
 		t.Fatalf("WriteAt() status = %#x, want STATUS_DISK_FULL", respErr.Code)
 	}
 }
+
+// storedStreams decodes the named streams in an object's metadata.
+func (g *testGateway) storedStreams(t *testing.T, key string) map[string][]byte {
+	t.Helper()
+	head, err := g.store.HeadObject(context.Background(), key)
+	if err != nil {
+		t.Fatalf("object %s: %v", key, err)
+	}
+	return posix.DecodePOSIXAttributes(head.Metadata, false).Streams
+}
+
+// bucketKeys lists every object in the bucket.
+func (g *testGateway) bucketKeys() []string {
+	g.store.mu.Lock()
+	defer g.store.mu.Unlock()
+	keys := make([]string, 0, len(g.store.objects))
+	for key := range g.store.objects {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// A named stream is kept in the file's metadata, never as an object of its
+// own, and reads back on a staged file and on one already in the bucket.
+func TestSMBNamedStreamsStayInMetadata(t *testing.T) {
+	g := startGateway(t)
+	if err := g.share.WriteFile("dl.exe", []byte("pretend binary"), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	const mark = "[ZoneTransfer]\r\nZoneId=3\r\n"
+	if err := g.share.WriteFile("dl.exe:Zone.Identifier", []byte(mark), 0o644); err != nil {
+		t.Fatalf("writing the stream: %v", err)
+	}
+	if got := g.readFile(t, "dl.exe:zone.identifier"); got != mark {
+		t.Fatalf("stream on the staged file = %q", got)
+	}
+	if got := g.readFile(t, "dl.exe"); got != "pretend binary" {
+		t.Fatalf("file data = %q after writing a stream", got)
+	}
+
+	g.runSyncWorker(t, "/dl.exe")
+	if keys := g.bucketKeys(); len(keys) != 1 || keys[0] != "dl.exe" {
+		t.Fatalf("bucket holds %v, want only the file itself", keys)
+	}
+	if got := string(g.storedStreams(t, "dl.exe")["Zone.Identifier"]); got != mark {
+		t.Fatalf("stream in the object's metadata = %q", got)
+	}
+
+	// Once in the bucket, the stream still reads back, and a new stream on
+	// the synced file goes into the object's metadata.
+	if got := g.readFile(t, "dl.exe:Zone.Identifier"); got != mark {
+		t.Fatalf("stream on the synced file = %q", got)
+	}
+	if err := g.share.WriteFile("dl.exe:AFP_AfpInfo", []byte("finder info"), 0o644); err != nil {
+		t.Fatalf("writing a stream on the synced file: %v", err)
+	}
+	if streams := g.storedStreams(t, "dl.exe"); string(streams["AFP_AfpInfo"]) != "finder info" || string(streams["Zone.Identifier"]) != mark {
+		t.Fatalf("streams in metadata after a second write = %q", streams)
+	}
+	if keys := g.bucketKeys(); len(keys) != 1 {
+		t.Fatalf("bucket holds %v, want only the file itself", keys)
+	}
+}
+
+// Streams follow the file when it is renamed, and go when it is deleted or
+// replaced, as on Windows.
+func TestSMBNamedStreamsFollowTheFile(t *testing.T) {
+	g := startGateway(t)
+	write := func(name, data string) {
+		t.Helper()
+		if err := g.share.WriteFile(name, []byte(data), 0o644); err != nil {
+			t.Fatalf("WriteFile(%s) error = %v", name, err)
+		}
+	}
+	hasStream := func(name string) bool {
+		t.Helper()
+		_, err := g.share.ReadFile(name)
+		return err == nil
+	}
+
+	write("a.txt", "main")
+	write("a.txt:note", "stream")
+	if err := g.share.Rename("a.txt", "b.txt"); err != nil {
+		t.Fatalf("Rename() error = %v", err)
+	}
+	if got := g.readFile(t, "b.txt:note"); got != "stream" {
+		t.Fatalf("stream after rename = %q", got)
+	}
+
+	// Creating the file over again replaces it, streams and all.
+	write("b.txt", "replaced")
+	if hasStream("b.txt:note") {
+		t.Fatal("stream survived the file being replaced")
+	}
+
+	write("b.txt:note", "again")
+	if err := g.share.Remove("b.txt:note"); err != nil {
+		t.Fatalf("removing the stream: %v", err)
+	}
+	if hasStream("b.txt:note") || g.readFile(t, "b.txt") != "replaced" {
+		t.Fatal("removing a stream did not leave the file alone")
+	}
+
+	write("b.txt:note", "again")
+	if err := g.share.Remove("b.txt"); err != nil {
+		t.Fatalf("Remove() error = %v", err)
+	}
+	write("b.txt", "recreated")
+	if hasStream("b.txt:note") {
+		t.Fatal("a recreated file inherited the deleted file's stream")
+	}
+}
+
+// Streams are capped, being kept in object metadata; a write past the cap
+// fails as disk full and leaves the streams already there alone.
+func TestSMBNamedStreamsAreCapped(t *testing.T) {
+	g := startGateway(t)
+	if err := g.share.WriteFile("big.txt", []byte("x"), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	if err := g.share.WriteFile("big.txt:small", []byte("fits"), 0o644); err != nil {
+		t.Fatalf("writing a small stream: %v", err)
+	}
+	err := g.share.WriteFile("big.txt:huge", bytes.Repeat([]byte("y"), config.DefaultMaxStreamBytes), 0o644)
+	var respErr *client.ResponseError
+	if !errors.As(err, &respErr) || respErr.Code != 0xC000007F {
+		t.Fatalf("writing past the cap = %v, want STATUS_DISK_FULL", err)
+	}
+	if got := g.readFile(t, "big.txt:small"); got != "fits" {
+		t.Fatalf("existing stream after a refused write = %q", got)
+	}
+}

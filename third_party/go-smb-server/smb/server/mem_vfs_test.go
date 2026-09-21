@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"io"
 	"io/fs"
 	"iter"
 	"path"
@@ -25,6 +26,7 @@ type memNode struct {
 	children map[string]*memNode
 	modTime  time.Time
 	attrs    uint32
+	streams  map[string][]byte
 }
 
 func newMemBackend() *memBackend {
@@ -104,6 +106,19 @@ func splitDir(clean string) (dir, base string) {
 func (b *memBackend) Remove(_ context.Context, p string) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if base, stream, ok := strings.Cut(p, ":"); ok {
+		dir, name := splitDir(memClean(base))
+		n, exists := b.mustDir(dir).children[name]
+		if !exists {
+			return fs.ErrNotExist
+		}
+		stored, _, found := n.findStream(stream)
+		if !found {
+			return fs.ErrNotExist
+		}
+		delete(n.streams, stored)
+		return nil
+	}
 	clean := memClean(p)
 	dir, base := splitDir(clean)
 	parent := b.mustDir(dir)
@@ -267,4 +282,107 @@ func matchGlob(pattern, name string) bool {
 		pi++
 	}
 	return pi == len(pattern)
+}
+
+// OpenStream implements vfs.StreamOpener: named streams live on the node.
+func (b *memBackend) OpenStream(ctx context.Context, opts vfs.OpenOptions, stream string) (vfs.Handle, error) {
+	baseOpts := vfs.OpenOptions{Path: opts.Path, Disposition: vfs.DispositionOpen}
+	switch opts.Disposition {
+	case vfs.DispositionCreate, vfs.DispositionOpenIf, vfs.DispositionOverwriteIf, vfs.DispositionSupersede:
+		baseOpts.Disposition = vfs.DispositionOpenIf
+	}
+	h, err := b.Open(ctx, baseOpts)
+	if err != nil {
+		return nil, err
+	}
+	n := h.(*memHandle).n
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	name, data, exists := n.findStream(stream)
+	switch opts.Disposition {
+	case vfs.DispositionOpen:
+		if !exists {
+			return nil, fs.ErrNotExist
+		}
+	case vfs.DispositionCreate:
+		if exists {
+			return nil, fs.ErrExist
+		}
+	case vfs.DispositionOverwrite:
+		if !exists {
+			return nil, fs.ErrNotExist
+		}
+		data = nil
+	case vfs.DispositionOverwriteIf, vfs.DispositionSupersede:
+		data = nil
+	}
+	if n.streams == nil {
+		n.streams = map[string][]byte{}
+	}
+	n.streams[name] = data
+	return &memStreamHandle{b: b, n: n, name: name}, nil
+}
+
+// findStream looks a stream up case-insensitively, returning the name it is
+// stored under, or the requested name for a new one.
+func (n *memNode) findStream(stream string) (string, []byte, bool) {
+	for name, data := range n.streams {
+		if strings.EqualFold(name, stream) {
+			return name, data, true
+		}
+	}
+	return stream, nil, false
+}
+
+// Streams implements vfs.StreamLister.
+func (h *memHandle) Streams(context.Context) ([]vfs.StreamInfo, error) {
+	h.b.mu.Lock()
+	defer h.b.mu.Unlock()
+	var out []vfs.StreamInfo
+	for name, data := range h.n.streams {
+		out = append(out, vfs.StreamInfo{Name: name, Size: int64(len(data))})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
+}
+
+type memStreamHandle struct {
+	b    *memBackend
+	n    *memNode
+	name string
+}
+
+func (h *memStreamHandle) Read(_ context.Context, offset int64, p []byte) (int, error) {
+	h.b.mu.Lock()
+	defer h.b.mu.Unlock()
+	data := h.n.streams[h.name]
+	if offset >= int64(len(data)) {
+		return 0, io.EOF
+	}
+	return copy(p, data[offset:]), nil
+}
+
+func (h *memStreamHandle) Write(_ context.Context, offset int64, p []byte) (int, error) {
+	h.b.mu.Lock()
+	defer h.b.mu.Unlock()
+	data := h.n.streams[h.name]
+	if end := offset + int64(len(p)); end > int64(len(data)) {
+		data = append(data, make([]byte, end-int64(len(data)))...)
+	}
+	copy(data[offset:], p)
+	h.n.streams[h.name] = data
+	return len(p), nil
+}
+
+func (h *memStreamHandle) Close(context.Context) error { return nil }
+
+func (h *memStreamHandle) Stat(context.Context) (vfs.FileInfo, error) {
+	h.b.mu.Lock()
+	defer h.b.mu.Unlock()
+	return vfs.FileInfo{Name: h.n.name + ":" + h.name, Size: int64(len(h.n.streams[h.name])),
+		Attributes: h.n.attrs, LastWrite: h.n.modTime}, nil
+}
+
+func (h *memStreamHandle) Enumerate(context.Context, string) iter.Seq2[vfs.FileInfo, error] {
+	return func(func(vfs.FileInfo, error) bool) {}
 }

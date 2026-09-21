@@ -382,3 +382,31 @@ type Space struct {
 type SpaceReporter interface {
 	Space(ctx context.Context) (Space, error)
 }
+
+// StreamOpener is a backend that keeps named data streams (alternate data
+// streams): data attached to a file under a name, which Windows uses for
+// the "downloaded from the internet" mark and macOS for Finder information,
+// resource forks and extended attributes. opts.Path names the file the
+// stream belongs to, and opts.Disposition applies to the stream itself:
+// opening a stream of a file that does not exist creates the file, empty,
+// when the disposition creates. The server advertises named streams only
+// for shares whose backend implements this, and refuses stream names for
+// the rest rather than passing "file:stream" through as a file name.
+//
+// A delete-on-close or disposition on a stream handle deletes the stream
+// alone: the server calls Remover.Remove with "file:stream".
+type StreamOpener interface {
+	OpenStream(ctx context.Context, opts OpenOptions, stream string) (Handle, error)
+}
+
+// StreamInfo describes one named stream of a file.
+type StreamInfo struct {
+	Name string
+	Size int64
+}
+
+// StreamLister is a handle that can list its file's named streams, which
+// Windows reads to copy a file's streams along with it.
+type StreamLister interface {
+	Streams(ctx context.Context) ([]StreamInfo, error)
+}

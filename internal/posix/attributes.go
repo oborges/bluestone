@@ -23,6 +23,9 @@ const (
 	MetaKeyBtime = "btime"
 	// MetaKeyWindowsAttributes stores Windows attribute flags as a decimal.
 	MetaKeyWindowsAttributes = "windows-attributes"
+	// MetaKeyStreams stores a file's named data streams, encoded by
+	// EncodeStreams.
+	MetaKeyStreams = "streams"
 )
 
 // Windows file attribute flags kept in WindowsAttributes. Only flags that
@@ -45,7 +48,7 @@ const legacyMetaKeyPrefix = "x-amz-meta-"
 
 var posixMetaKeys = []string{
 	MetaKeyMode, MetaKeyUID, MetaKeyGID, MetaKeyAtime, MetaKeyMtime, MetaKeyCtime,
-	MetaKeyBtime, MetaKeyWindowsAttributes,
+	MetaKeyBtime, MetaKeyWindowsAttributes, MetaKeyStreams,
 }
 
 // Default POSIX attributes
@@ -82,6 +85,9 @@ func EncodePOSIXAttributes(attrs *types.POSIXAttributes) map[string]string {
 	}
 	if flags := attrs.WindowsAttributes & WindowsAttributesStored; flags != 0 {
 		metadata[MetaKeyWindowsAttributes] = strconv.FormatUint(uint64(flags), 10)
+	}
+	if len(attrs.Streams) > 0 {
+		metadata[MetaKeyStreams] = EncodeStreams(attrs.Streams)
 	}
 	return metadata
 }
@@ -143,6 +149,9 @@ func DecodePOSIXAttributes(metadata map[string]string, isDir bool) *types.POSIXA
 			attrs.WindowsAttributes = uint32(flags) & WindowsAttributesStored
 		}
 	}
+	if value, ok := metaValue(metadata, MetaKeyStreams); ok {
+		attrs.Streams = DecodeStreams(value)
+	}
 
 	return attrs
 }
@@ -198,6 +207,9 @@ type AttributeUpdate struct {
 	Atime, Mtime      *time.Time
 	Btime             *time.Time
 	WindowsAttributes *uint32
+	// Streams, when not nil, replaces the file's named streams; an empty
+	// map removes them all.
+	Streams map[string][]byte
 }
 
 // Apply writes the update over attrs, stamping Ctime with now when anything
@@ -230,6 +242,10 @@ func (u AttributeUpdate) Apply(attrs *types.POSIXAttributes, now time.Time) {
 	}
 	if u.WindowsAttributes != nil {
 		attrs.WindowsAttributes = *u.WindowsAttributes & WindowsAttributesStored
+		changed = true
+	}
+	if u.Streams != nil {
+		attrs.Streams = types.CloneStreams(u.Streams)
 		changed = true
 	}
 	if changed {

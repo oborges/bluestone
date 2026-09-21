@@ -69,18 +69,17 @@ func (c *request) handleQueryInfo(ctx context.Context, msg []byte, tr *tree) uin
 			info = make([]byte, 8)
 			putLE32(info[0:4], toFileAttributes(fi))
 		case wire.FileStreamInformation:
-			if fi.IsDir {
-				// Directories have no data stream.
-				info = []byte{}
-				break
+			info, overflow, err := streamInformation(ctx, oh.h, fi, req.OutputBufferLength)
+			if err != nil {
+				return c.errBody(osErrToStatus(err))
 			}
-			streamName := wire.UTF16ToBytes("::$DATA")
-			info = make([]byte, 24+len(streamName))
-			putLE32(info[0:4], 0) // NextEntryOffset: the only entry
-			putLE32(info[4:8], uint32(len(streamName)))
-			put64LE(info[8:16], uint64(fi.Size))
-			put64LE(info[16:24], uint64(fi.Size))
-			copy(info[24:], streamName)
+			c.out = wire.QueryInfoResponseAppend(c.out, info)
+			if overflow {
+				// The client asks with a small buffer first and retries
+				// with a larger one when told the list did not fit.
+				return wire.StatusBufferOverflow
+			}
+			return wire.StatusSuccess
 		case wire.FileAllInformation:
 			info = wire.FileAllInformationAppend(nil, basic, standard, pathIndexNumber(oh.currentPath()), smbPath(oh.currentPath()))
 		case wire.FileNetworkOpenInformation:
@@ -100,7 +99,7 @@ func (c *request) handleQueryInfo(ctx context.Context, msg []byte, tr *tree) uin
 		if err != nil {
 			return c.errBody(osErrToStatus(err))
 		}
-		info := filesystemInfo(req.FileInfoClass, space)
+		info := filesystemInfo(req.FileInfoClass, space, supportsStreams(tr.share.Backend()))
 		if info == nil {
 			c.log.Debug("unsupported filesystem info class", "class", req.FileInfoClass)
 			return c.errBody(wire.StatusInvalidParameter)
@@ -184,7 +183,7 @@ func shareSpace(ctx context.Context, backend vfs.Backend) (vfs.Space, error) {
 	return space, nil
 }
 
-func filesystemInfo(class uint8, space vfs.Space) []byte {
+func filesystemInfo(class uint8, space vfs.Space, namedStreams bool) []byte {
 	const unitBytes = bytesPerSector * sectorsPerAllocationUnit
 	totalUnits := space.TotalBytes / unitBytes
 	availableUnits := space.AvailableBytes / unitBytes
@@ -195,8 +194,15 @@ func filesystemInfo(class uint8, space vfs.Space) []byte {
 		// behaves for Windows clients.
 		name := wire.UTF16ToBytes("NTFS")
 		out := make([]byte, 12+len(name))
-		putLE32(out[0:4], 0x00000002|0x00000004) // CASE_PRESERVED_NAMES | UNICODE_ON_DISK
-		putLE32(out[4:8], 255)                   // MaximumComponentNameLength
+		flags := uint32(0x00000002 | 0x00000004) // CASE_PRESERVED_NAMES | UNICODE_ON_DISK
+		if namedStreams {
+			// FILE_NAMED_STREAMS: macOS stores Finder information and
+			// extended attributes as streams when this is set, and writes
+			// AppleDouble "._" files beside each file when it is not.
+			flags |= 0x00040000
+		}
+		putLE32(out[0:4], flags)
+		putLE32(out[4:8], 255) // MaximumComponentNameLength
 		putLE32(out[8:12], uint32(len(name)))
 		copy(out[12:], name)
 		return out
@@ -388,7 +394,8 @@ func (c *request) handleSetInfo(ctx context.Context, msg []byte, tr *tree) uint3
 			}
 			newName := wire.UTF16FromBytes(req.Buffer[20 : 20+fnLen])
 			rn, ok := oh.h.(vfs.Renamer)
-			if !ok {
+			if !ok || oh.stream {
+				// Renaming a named stream within its file is not supported.
 				return c.errBody(wire.StatusNotSupported)
 			}
 			files := c.srv.fileTable()

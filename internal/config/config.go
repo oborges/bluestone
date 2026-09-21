@@ -59,11 +59,26 @@ type SMBConfig struct {
 	// DrainTimeout is how long a shutdown waits for requests in flight
 	// before closing the connections carrying them.
 	DrainTimeout string `mapstructure:"drain_timeout"`
+	// MaxStreamBytes caps a file's named data streams (alternate data
+	// streams), names and contents together. They are kept in the object's
+	// metadata, which IBM COS caps at about 4 KB per object with the
+	// gateway's own attributes, so the limit is at most 2560; set it to
+	// 1024 for object stores that follow Amazon S3's 2 KB metadata limit.
+	// 0 selects the default.
+	MaxStreamBytes int `mapstructure:"max_stream_bytes"`
 	// Limits bound what clients can make the server hold. 0 means no limit.
 	Limits SMBLimits `mapstructure:"limits"`
 	// Users are the accounts allowed to connect, authenticated with NTLM.
 	Users []SMBUser `mapstructure:"users"`
 }
+
+// DefaultMaxStreamBytes is the default cap on a file's named streams, and
+// MaxStreamBytesLimit the most IBM COS metadata can hold beside the
+// gateway's own attributes.
+const (
+	DefaultMaxStreamBytes = 2048
+	MaxStreamBytesLimit   = 2560
+)
 
 // SMBLimits bound what SMB clients can make the gateway hold, and how fast a
 // client may keep failing to authenticate. A value of 0 means no limit,
@@ -481,6 +496,7 @@ func bindEnvOverrides(v *viper.Viper) error {
 		"smb.encryption_required",
 		"smb.concurrent_requests",
 		"smb.drain_timeout",
+		"smb.max_stream_bytes",
 		"smb.limits.max_connections",
 		"smb.limits.max_connections_per_client",
 		"smb.limits.max_sessions_per_connection",
@@ -641,6 +657,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("smb.encryption_required", false)
 	v.SetDefault("smb.concurrent_requests", 0)
 	v.SetDefault("smb.drain_timeout", "30s")
+	v.SetDefault("smb.max_stream_bytes", DefaultMaxStreamBytes)
 	// Limits are generous enough that no ordinary client meets them, and
 	// small enough that one client cannot exhaust the gateway.
 	v.SetDefault("smb.limits.max_connections", 256)

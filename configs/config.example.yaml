@@ -118,6 +118,11 @@ smb:
   # before closing their connections. A copy in progress finishes; a client
   # that has stopped responding cannot hold up a restart for longer.
   drain_timeout: "30s"
+  # Cap on a file's named data streams (alternate data streams: macOS Finder
+  # information and extended attributes, Windows download marks), names and
+  # contents together. They are kept in the object's metadata: at most 2560
+  # on IBM COS, and 1024 for stores with Amazon S3's 2 KB metadata limit.
+  max_stream_bytes: 2048
   # What one client can make the gateway hold, and how fast it may keep
   # failing to log in. 0 means no limit; the defaults shown are generous
   # enough that no ordinary client meets them.

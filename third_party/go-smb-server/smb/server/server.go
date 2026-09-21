@@ -371,6 +371,8 @@ type openHandle struct {
 	// FILE_DELETE_ON_CLOSE: closing it marks the file delete-pending.
 	deleteOnClose bool
 	isDir         bool
+	// stream is set on a handle to a named stream rather than a file.
+	stream bool
 	// key names the file in the server's table of open files, and changes
 	// when the file is renamed. The table's lock guards it.
 	key fileKey
@@ -661,8 +663,16 @@ func (c *conn) sendCopy(resp []byte) {
 func (c *request) handleMessage(ctx context.Context, msg []byte) {
 	off := 0
 	first := true
+	// chainFailed is set when a request in the chain fails its signature
+	// check, which fails the rest of the chain.
 	chainFailed := false
 	lastStatus := uint32(wire.StatusSuccess)
+	// createErr is the status of a CREATE that failed. Related requests
+	// after it name the file it would have opened, so they fail the same
+	// way (MS-SMB2 section 3.3.5.2.7.2); any other failure, such as a READ
+	// at end of file, leaves the rest of the chain to run, so its CLOSE
+	// still closes the file.
+	createErr := uint32(wire.StatusSuccess)
 	var lastFileId [16]byte
 	prevRespStart := -1
 	// Responses are signed once the whole chain is built: appending the next
@@ -730,9 +740,6 @@ func (c *request) handleMessage(ctx context.Context, msg []byte) {
 				continue
 			}
 			lastStatus = status
-			if status != wire.StatusSuccess && status != wire.StatusMoreProcessingRequired {
-				chainFailed = true
-			}
 		}
 
 		if prevRespStart >= 0 {
@@ -750,6 +757,8 @@ func (c *request) handleMessage(ctx context.Context, msg []byte) {
 		switch {
 		case chainFailed:
 			status = lastStatus
+		case related && createErr != wire.StatusSuccess:
+			status = createErr
 		case hdr.Command == wire.CmdCancel:
 			status = c.handleCancel(sub, &hdr)
 		default:
@@ -758,8 +767,8 @@ func (c *request) handleMessage(ctx context.Context, msg []byte) {
 		c.srv.obs().RequestCompleted(hdr.Command, status, time.Since(started))
 		c.lastActive.Store(time.Now().UnixNano())
 		lastStatus = status
-		if status != wire.StatusSuccess && status != wire.StatusMoreProcessingRequired {
-			chainFailed = true
+		if hdr.Command == wire.CmdCreate {
+			createErr = status
 		}
 
 		// hdr.Credit still holds what the client asked for.

@@ -16,6 +16,7 @@ const (
 	StatusNoMemory               uint32 = 0xC0000017
 	StatusAccessDenied           uint32 = 0xC0000022
 	StatusBufferTooSmall         uint32 = 0xC0000023
+	StatusBufferOverflow         uint32 = 0x80000005
 	StatusObjectNameNotFound     uint32 = 0xC0000034
 	StatusObjectNameCollision    uint32 = 0xC0000035
 	StatusObjectPathNotFound     uint32 = 0xC000003A

@@ -19,9 +19,9 @@ import (
 	"github.com/oborges/bluestone/internal/cache"
 	"github.com/oborges/bluestone/internal/config"
 	"github.com/oborges/bluestone/internal/cos"
-	"github.com/oborges/bluestone/internal/ha"
 	"github.com/oborges/bluestone/internal/dashboard"
 	"github.com/oborges/bluestone/internal/feature"
+	"github.com/oborges/bluestone/internal/ha"
 	"github.com/oborges/bluestone/internal/health"
 	"github.com/oborges/bluestone/internal/lock"
 	"github.com/oborges/bluestone/internal/logging"
@@ -415,6 +415,7 @@ func main() {
 			Locks:              locks,
 			ConcurrentRequests: cfg.SMB.ConcurrentRequests,
 			DrainTimeout:       drainTimeout,
+			MaxStreamBytes:     cfg.SMB.MaxStreamBytes,
 			Limits: smb.Limits{
 				Connections:           cfg.SMB.Limits.MaxConnections,
 				ConnectionsPerClient:  cfg.SMB.Limits.MaxConnectionsPerClient,

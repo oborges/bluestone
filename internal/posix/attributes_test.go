@@ -70,7 +70,7 @@ func TestAttributeUpdateApply(t *testing.T) {
 
 	unchanged := base
 	AttributeUpdate{}.Apply(&unchanged, now)
-	if unchanged != base {
+	if !reflect.DeepEqual(unchanged, base) {
 		t.Fatalf("empty update changed attributes: %+v", unchanged)
 	}
 

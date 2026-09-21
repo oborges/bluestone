@@ -6,6 +6,8 @@ import (
 	"os"
 	"sync"
 	"time"
+
+	"github.com/oborges/bluestone/pkg/types"
 )
 
 // WriteSession represents an active write session for a file path
@@ -31,6 +33,8 @@ type WriteSession struct {
 	// syncs with; read them through Attributes.
 	btime             time.Time
 	windowsAttributes uint32
+	// streams are the file's named data streams.
+	streams map[string][]byte
 	// atime and mtime hold times a client set explicitly; a later write to
 	// the file clears mtime, so writing moves the modification time again.
 	atime time.Time
@@ -124,6 +128,11 @@ func (ws *WriteSession) SetWindowsAttributes(flags uint32) {
 	ws.updateAttributes(func() { ws.windowsAttributes = flags })
 }
 
+// SetStreams replaces the named data streams the staged file syncs with.
+func (ws *WriteSession) SetStreams(streams map[string][]byte) {
+	ws.updateAttributes(func() { ws.streams = types.CloneStreams(streams) })
+}
+
 // SetTimes changes the access and modification times the staged file syncs
 // with. Zero times are left alone, so a caller can set one without the other.
 func (ws *WriteSession) SetTimes(atime, mtime time.Time) {
@@ -176,6 +185,7 @@ func (ws *WriteSession) attributesLocked() StagedAttributes {
 		GID:               ws.GID,
 		Btime:             ws.btime,
 		WindowsAttributes: ws.windowsAttributes,
+		Streams:           types.CloneStreams(ws.streams),
 		Atime:             ws.atime,
 		Mtime:             ws.mtime,
 	}
@@ -184,6 +194,7 @@ func (ws *WriteSession) attributesLocked() StagedAttributes {
 func (ws *WriteSession) setAttributesLocked(attrs StagedAttributes) {
 	ws.Mode, ws.UID, ws.GID = attrs.Mode, attrs.UID, attrs.GID
 	ws.btime, ws.windowsAttributes = attrs.Btime, attrs.WindowsAttributes
+	ws.streams = types.CloneStreams(attrs.Streams)
 	ws.atime, ws.mtime = attrs.Atime, attrs.Mtime
 	ws.attributesSet = true
 }
