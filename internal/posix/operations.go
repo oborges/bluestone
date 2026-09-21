@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"strings"
 	"sync"
@@ -1443,6 +1444,25 @@ func (f *FileInfo) Attributes() types.POSIXAttributes {
 		attrs.Btime = f.modTime
 	}
 	return attrs
+}
+
+// NFSOwner reports the entry's stored owner to the NFS server, which would
+// otherwise take it from Sys() and show every file as root's.
+func (f *FileInfo) NFSOwner() (uid, gid uint32) {
+	return OwnerIDs(f.Attributes())
+}
+
+// OwnerIDs returns attrs' uid and gid as NFS carries them. Ids outside the
+// 32-bit range cannot be stored, so they report as 0.
+func OwnerIDs(attrs types.POSIXAttributes) (uid, gid uint32) {
+	return clampID(attrs.UID), clampID(attrs.GID)
+}
+
+func clampID(id int) uint32 {
+	if id < 0 || id > math.MaxUint32 {
+		return 0
+	}
+	return uint32(id)
 }
 
 var _ os.FileInfo = (*FileInfo)(nil)

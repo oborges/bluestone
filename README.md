@@ -380,8 +380,8 @@ account's uid is `id_map.base` plus its relative ID (the last part of its
 SID), and its gid comes from its primary group the same way, as Samba's
 `idmap_rid` does. A local account with a `uid` and `gid` gets those. Windows
 shows the owner on a file's Security tab: the domain account, or a Unix SID
-(`S-1-22-1-<uid>`) for a local one. Without an id map, files keep the
-default owner, as before.
+(`S-1-22-1-<uid>`) for a local one, and NFS clients see the same uid and gid.
+Without an id map, files keep the default owner, as before.
 
 Tested against Windows Server 2025 (SMB 3.1.1 with signing, or encryption), macOS
 (`mount_smbfs`), the Linux kernel client (`mount -t cifs`), and `smbclient`:

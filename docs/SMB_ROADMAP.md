@@ -156,8 +156,7 @@ controller with a gateway that had no local accounts:
   could.
 - Files record their creator: Windows showed the domain account as owner
   after a gateway restart, from the uid kept in the object's metadata.
-  NFS clients do not see stored owners yet: the NFS server reports every
-  file as root's, which predates this phase.
+  NFS clients see the same owner as a uid and gid.
 - Local accounts keep working alongside over NTLM, and Windows, macOS, the
   Linux kernel client and `smbclient` pass their suites with Kerberos
   advertised.
@@ -181,8 +180,10 @@ and no local user exists in the config.
 
 These are consequences of serving object storage, not gaps to close:
 
-- A cold directory listing reports the object's last-modified time until
-  something stats the file, because COS listings carry no user metadata.
+- A cold directory listing reports the object's last-modified time, and the
+  default owner and mode, until something stats the file, because COS
+  listings carry no user metadata. `ls -l` over NFSv4 shows what the listing
+  says; `stat` always shows what is stored.
 - NFS does not take part in the share-mode table, so an NFS client can open a
   file an SMB client holds exclusively.
 - Byte-range locks are refused rather than queued: a client that asked to

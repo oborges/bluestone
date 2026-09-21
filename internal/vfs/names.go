@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/oborges/bluestone/internal/posix"
 	"github.com/oborges/bluestone/pkg/types"
 )
 
@@ -213,3 +214,6 @@ func (e namedEntry) Name() string { return e.name }
 
 // Attributes keeps the renamed entry's attributes visible.
 func (e namedEntry) Attributes() types.POSIXAttributes { return FileAttributes(e.FileInfo) }
+
+// NFSOwner keeps the renamed entry's owner visible over NFS.
+func (e namedEntry) NFSOwner() (uid, gid uint32) { return posix.OwnerIDs(e.Attributes()) }
