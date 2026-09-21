@@ -2,6 +2,7 @@ package staging
 
 import (
 	"os"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -36,7 +37,7 @@ func TestSessionAttributesPersistThroughDirtyRenameAndRecovery(t *testing.T) {
 	session.SeedAttributes(StagedAttributes{Mode: 0755, UID: 42, GID: 7})
 	session.SeedAttributes(StagedAttributes{Mode: 0600, UID: 1, GID: 1}) // later seeds must not override
 	manager.MarkDirty("/a.txt", 4)
-	if got := readSidecarAttributes(t, manager, "/a.txt"); got == nil || *got != (StagedAttributes{Mode: 0755, UID: 42, GID: 7}) {
+	if got := readSidecarAttributes(t, manager, "/a.txt"); got == nil || !reflect.DeepEqual(*got, StagedAttributes{Mode: 0755, UID: 42, GID: 7}) {
 		t.Fatalf("sidecar attributes after MarkDirty = %+v, want seeded 755/42/7", got)
 	}
 
@@ -48,7 +49,7 @@ func TestSessionAttributesPersistThroughDirtyRenameAndRecovery(t *testing.T) {
 	if err := manager.RenameStagedPath("/a.txt", "/b.txt"); err != nil {
 		t.Fatalf("RenameStagedPath() error = %v", err)
 	}
-	if got := readSidecarAttributes(t, manager, "/b.txt"); got == nil || *got != (StagedAttributes{Mode: 0640, UID: 42, GID: 7}) {
+	if got := readSidecarAttributes(t, manager, "/b.txt"); got == nil || !reflect.DeepEqual(*got, StagedAttributes{Mode: 0640, UID: 42, GID: 7}) {
 		t.Fatalf("renamed sidecar attributes = %+v, want 640/42/7", got)
 	}
 	if err := manager.Shutdown(); err != nil {
@@ -153,5 +154,45 @@ func TestSetBirthTimeIfUnsetKeepsSeededAttributes(t *testing.T) {
 	session.SetBirthTimeIfUnset(time.Now())
 	if got := session.Attributes().Btime; !got.Equal(seeded) {
 		t.Fatalf("btime = %v, want the seeded %v", got, seeded)
+	}
+}
+
+// A staged file's named streams survive a gateway crash along with its
+// data, so they are uploaded with it on recovery.
+func TestStreamsPersistThroughRecovery(t *testing.T) {
+	cfg := createTestConfig(t)
+	manager, err := NewStagingManager(cfg)
+	if err != nil {
+		t.Fatalf("NewStagingManager() error = %v", err)
+	}
+	session, err := manager.GetOrCreateSession("/tagged.txt")
+	if err != nil {
+		t.Fatalf("GetOrCreateSession() error = %v", err)
+	}
+	if _, err := session.Write([]byte("x"), 0); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	manager.MarkDirty("/tagged.txt", 1)
+	want := map[string][]byte{"Zone.Identifier": []byte("ZoneId=3"), "AFP_AfpInfo": {0, 1, 2}}
+	session.SetStreams(want)
+
+	if got := readSidecarAttributes(t, manager, "/tagged.txt"); got == nil || !reflect.DeepEqual(got.Streams, want) {
+		t.Fatalf("sidecar streams = %+v, want %v", got, want)
+	}
+	if err := manager.Shutdown(); err != nil {
+		t.Fatalf("Shutdown() error = %v", err)
+	}
+
+	recovered, err := NewStagingManager(cfg)
+	if err != nil {
+		t.Fatalf("NewStagingManager() after restart error = %v", err)
+	}
+	defer recovered.Shutdown()
+	restored, ok := recovered.GetSession("/tagged.txt")
+	if !ok {
+		t.Fatal("dirty session not recovered")
+	}
+	if got := restored.Attributes().Streams; !reflect.DeepEqual(got, want) {
+		t.Fatalf("recovered streams = %v, want %v", got, want)
 	}
 }

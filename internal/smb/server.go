@@ -72,6 +72,9 @@ type ServerOptions struct {
 	// DrainTimeout is how long Stop waits for requests in flight to finish
 	// before closing the connections carrying them. 0 selects the default.
 	DrainTimeout time.Duration
+	// MaxStreamBytes caps a file's named streams, names and contents
+	// together; 0 selects config.DefaultMaxStreamBytes.
+	MaxStreamBytes int
 	// Logger receives server logs; nil discards them.
 	Logger *zap.Logger
 }
@@ -145,8 +148,10 @@ func NewServer(fs *vfs.Filesystem, opts ServerOptions) (*Server, error) {
 	if drainTimeout <= 0 {
 		drainTimeout = DefaultDrainTimeout
 	}
+	backend := NewBackend(fs, opts.Opens)
+	backend.maxStreamBytes = opts.MaxStreamBytes
 	serverOpts := []server.Option{
-		server.WithShares(smbvfs.NewDiskShare(opts.ShareName, NewBackend(fs, opts.Opens))),
+		server.WithShares(smbvfs.NewDiskShare(opts.ShareName, backend)),
 		server.WithAuth(ntlmssp.NewServer(newCredentials(opts.Users), opts.Domain)),
 		server.WithLogger(slog.New(zapHandler{logger: logger})),
 		server.WithObserver(obs),

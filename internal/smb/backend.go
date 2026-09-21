@@ -28,6 +28,10 @@ import (
 type Backend struct {
 	fs    *vfs.Filesystem
 	opens *lock.ShareTable
+	// maxStreamBytes caps a file's named streams; 0 selects the default.
+	maxStreamBytes int
+	// streamMu serializes changes to files' named streams.
+	streamMu sync.Mutex
 }
 
 // NewBackend returns an SMB share backend over fs. Opens are recorded in the
@@ -196,12 +200,32 @@ func (b *Backend) Open(_ context.Context, opts smbvfs.OpenOptions) (smbvfs.Handl
 	if err != nil {
 		return nil, err
 	}
+	if exists && replacesData(opts.Disposition) {
+		// Replacing a file's data replaces the file: its named streams go
+		// too, as on Windows. Truncating it through an open handle keeps
+		// them.
+		if streams := vfs.FileAttributes(info).Streams; len(streams) > 0 {
+			if err := b.fs.SetAttributes(p, posix.AttributeUpdate{Streams: map[string][]byte{}}); err != nil {
+				_ = opened.Close(context.Background())
+				return nil, err
+			}
+		}
+	}
 	if h, ok := opened.(*handle); ok {
 		h.reservation = reservation
 		h.opens = b.opens
 		reservation = nil // the handle releases it on close
 	}
 	return opened, nil
+}
+
+// replacesData reports whether a disposition replaces an existing file.
+func replacesData(disposition uint32) bool {
+	switch disposition {
+	case smbvfs.DispositionOverwrite, smbvfs.DispositionOverwriteIf, smbvfs.DispositionSupersede:
+		return true
+	}
+	return false
 }
 
 // openWritable opens a file for writing immediately; used when the CREATE
@@ -215,8 +239,12 @@ func (b *Backend) openWritable(p string, flag int) (smbvfs.Handle, error) {
 	return &handle{fs: b.fs, path: p, file: f, writable: true}, nil
 }
 
-// Remove implements smbvfs.Remover for delete-on-close.
+// Remove implements smbvfs.Remover for delete-on-close. "file:stream"
+// deletes that named stream alone.
 func (b *Backend) Remove(_ context.Context, name string) error {
+	if isStream, err := b.removeStream(name); isStream {
+		return err
+	}
 	return b.fs.Remove(sharePath(name))
 }
 

@@ -70,6 +70,18 @@ ssh gateway 'sudo sed -n "s/^ *password: \"\(.*\)\"$/\1/p" /etc/bluestone/config
   diff the two. One line is expected to differ: without leases the Windows
   client answers a second handle's "delete pending" query from its own
   cache instead of asking the server.
+- `windows-streams-test.ps1` checks named data streams through PowerShell's
+  `-Stream` support: writing, reading and listing them, what survives
+  overwrites, renames, copies and deletes, removing one, a download mark and
+  `Unblock-File`, streams on new files and directories, per-stream share
+  modes, and a stream past the gateway's cap. Run it against a share on
+  Windows itself and against the gateway, as with `windows-delete-test.ps1`;
+  only the 64 KiB stream should differ.
+- `macos-streams-test.sh SERVER[:PORT] [USER]` checks that macOS keeps
+  extended attributes, Finder information and tags as streams, through
+  copies and renames and on folders, without writing `._` files. It reports
+  what happens to an attribute past the cap. Set `BUCKET_CHECK` to a command
+  that lists the bucket under `macos-streams-test/` to see the objects too.
 - `windows-space-test.ps1` checks the share's size as Windows reads it
   (`DriveInfo` and `fsutil volume diskfree`), that free space falls as data
   is staged, and that a write past the staging quota fails with "not enough

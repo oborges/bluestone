@@ -254,6 +254,25 @@ proposed upstream.
   through a handle after renaming its file removed whatever had the old
   name, which lost the new version of a file saved by renaming the old one
   aside.
+- Named data streams. A CREATE naming "file:stream" or
+  "file:stream:$DATA" goes to a backend implementing `vfs.StreamOpener`;
+  "file::$DATA" is the file itself, and any other stream type is
+  STATUS_OBJECT_NAME_INVALID. FILE_FS_ATTRIBUTE_INFORMATION advertises
+  FILE_NAMED_STREAMS for those backends, and FILE_STREAM_INFORMATION lists
+  a handle's streams through `vfs.StreamLister`, returning whole entries and
+  STATUS_BUFFER_OVERFLOW when they do not fit. Windows asks with a 32-byte
+  buffer first; upstream cut the list short and reported success, so
+  Windows failed to list streams at all. A disposition on a stream deletes
+  the stream alone. A file with a stream open refuses renames, since the
+  stream's handle names the old path, and a stream cannot be renamed.
+  Backends without streams get no stream names at all: upstream passed
+  "file:stream" through as a file name, so Windows created objects named
+  after streams.
+- Compound requests: only a failed CREATE fails the related requests after
+  it (MS-SMB2 3.3.5.2.7.2). Upstream failed the rest of any chain after any
+  error, so macOS's CREATE, READ, CLOSE of an empty stream failed at the
+  READ's end of file, the CLOSE was never carried out, and the open leaked
+  until the client disconnected.
 
 ## Known gaps to close in Bluestone
 
@@ -275,5 +294,3 @@ Tracked with the rest of the SMB work in `docs/SMB_ROADMAP.md`.
   when their file is renamed. They are still released when the handle
   closes, but a lock taken before a rename does not conflict with NFS locks
   on the new name.
-- No alternate data streams, so macOS writes AppleDouble files into the
-  bucket.

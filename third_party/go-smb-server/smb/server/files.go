@@ -119,21 +119,25 @@ func (t *openFiles) release(oh *openHandle) (remove bool, path string) {
 
 // checkRename reports whether oh's file cannot be renamed to newPath:
 // pending when it is waiting to be deleted, busy when it is a directory with
-// anything open inside it or the rename would replace a file someone has
-// open. Windows refuses all three.
+// anything open inside it, a file with one of its named streams open, or
+// the rename would replace a file someone has open. Windows refuses the
+// first, second and last; open streams are refused here because their
+// handles would go on naming the old path.
 func (t *openFiles) checkRename(oh *openHandle, newPath string) (pending, busy bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if f, ok := t.files[oh.key]; ok && f.deletePending {
 		return true, false
 	}
-	prefix := oh.key.path + "\\"
+	children := oh.key.path + "\\"
+	// A handle to one of the file's named streams names it by its old path.
+	streams := oh.key.path + ":"
 	target := fileKey{share: oh.key.share, path: normalizeOpenPath(newPath)}
 	for key := range t.files {
 		if key.share != oh.key.share {
 			continue
 		}
-		if strings.HasPrefix(key.path, prefix) {
+		if strings.HasPrefix(key.path, children) || strings.HasPrefix(key.path, streams) {
 			return false, true
 		}
 		if key == target && key != oh.key {

@@ -446,3 +446,22 @@ func TestHAOnLeaseLost(t *testing.T) {
 		t.Error("validateHA() accepted an unknown on_lease_lost")
 	}
 }
+
+func TestSMBMaxStreamBytes(t *testing.T) {
+	setRequiredTestEnv(t)
+
+	cfg, err := Load(writeTestConfig(t, "staging:\n  enabled: false\n"))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.SMB.MaxStreamBytes != DefaultMaxStreamBytes {
+		t.Fatalf("max_stream_bytes default = %d, want %d", cfg.SMB.MaxStreamBytes, DefaultMaxStreamBytes)
+	}
+	for _, bad := range []int{-1, MaxStreamBytesLimit + 1} {
+		smb := SMBConfig{Enabled: true, Port: 445, ShareName: "bluestone", Domain: "BLUESTONE",
+			DrainTimeout: "30s", MaxStreamBytes: bad, Users: []SMBUser{{Username: "u", Password: "p"}}}
+		if err := validateSMB(&smb); err == nil {
+			t.Errorf("validateSMB() with max_stream_bytes %d = nil, want an error", bad)
+		}
+	}
+}

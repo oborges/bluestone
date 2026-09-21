@@ -79,6 +79,11 @@ The visible "this is not a real file server" failures.
 - Alternate data streams, at least enough that macOS stops writing
   AppleDouble `._` files into the bucket and Windows can keep its
   "downloaded from the internet" mark.
+  Done: streams are kept in object metadata, capped by
+  `smb.max_stream_bytes`. They match Windows' own server
+  (`windows-streams-test.ps1`) apart from the cap, and macOS keeps
+  Finder information, tags and extended attributes with no `._` files
+  (`macos-streams-test.sh`). Large resource forks do not fit.
 
 **Done when:** the Security tab opens, a large copy inside the share runs at
 COS-to-COS speed rather than client round-trip speed, a full bucket or

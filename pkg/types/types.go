@@ -60,6 +60,22 @@ type POSIXAttributes struct {
 	// WindowsAttributes holds Windows file attribute flags (read-only,
 	// hidden, system, archive) for protocols that expose them.
 	WindowsAttributes uint32
+	// Streams holds a file's named data streams (alternate data streams),
+	// by name, for protocols that expose them. Nil when there are none.
+	Streams map[string][]byte
+}
+
+// CloneStreams copies a set of named streams, so attribute copies do not
+// share one map.
+func CloneStreams(streams map[string][]byte) map[string][]byte {
+	if len(streams) == 0 {
+		return nil
+	}
+	out := make(map[string][]byte, len(streams))
+	for name, data := range streams {
+		out[name] = append([]byte(nil), data...)
+	}
+	return out
 }
 
 // CacheEntry represents a cached item
