@@ -413,11 +413,23 @@ func (c *request) handleSetInfo(ctx context.Context, msg []byte, tr *tree) uint3
 			// Every handle to the file now names it where it is, so a
 			// delete through one of them removes this file and not
 			// whatever takes the old name next.
+			oldPath := oh.currentPath()
 			files.renamed(oh, newName)
+			c.srv.selfNotify(tr, vfs.Change{Action: vfs.ChangeRenamed, Path: newName, OldPath: oldPath, IsDir: oh.isDir})
 
 		default:
 			c.log.Debug("unsupported set-info class", "class", req.FileInfoClass)
 			return c.errBody(wire.StatusNotSupported)
+		}
+		var changed uint32
+		switch req.FileInfoClass {
+		case wire.FileBasicInfoClass:
+			changed = FileNotifyChangeAttributes | FileNotifyChangeLastWrite | FileNotifyChangeLastAccess | FileNotifyChangeCreation
+		case wire.FileAllocationInformation, wire.FileEndOfFileInformation:
+			changed = FileNotifyChangeSize | FileNotifyChangeLastWrite
+		}
+		if changed != 0 && !oh.stream {
+			c.srv.selfNotify(tr, vfs.Change{Action: vfs.ChangeModified, Path: oh.currentPath(), IsDir: oh.isDir, Filter: changed})
 		}
 		c.out = wire.SetInfoResponseAppend(c.out)
 		return wire.StatusSuccess

@@ -95,6 +95,11 @@ staging area reports as disk full, and macOS no longer litters `._` files.
   re-enumerates the whole directory per watch, and Explorer opens a watch per
   window. Drive it from staging and metadata events instead, with one watcher
   per directory shared by its watchers.
+  Done: the filesystem layer publishes every change made through NFS or SMB,
+  and the object refresh scanner publishes changes found in the bucket. The
+  server routes them to watches with no listing at all. Checked with 21
+  Windows watchers: changes from SMB and NFS arrive, and there are no
+  directory listings while idle (`windows-notify-test.ps1`).
 - Leases: read and read-handle leases with working breaks, including breaks
   caused by NFS writes and by changes found in the bucket. This is where
   client-side caching comes from, and where cross-protocol consistency is

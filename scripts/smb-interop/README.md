@@ -82,6 +82,14 @@ ssh gateway 'sudo sed -n "s/^ *password: \"\(.*\)\"$/\1/p" /etc/bluestone/config
   copies and renames and on folders, without writing `._` files. It reports
   what happens to an attribute past the cap. Set `BUCKET_CHECK` to a command
   that lists the bucket under `macos-streams-test/` to see the objects too.
+- `windows-notify-test.ps1 -Unc \\SERVER\SHARE -User NAME` watches a folder with
+  `FileSystemWatcher` (what Explorer uses) and prints the changes it hears
+  about: those it makes over SMB, then any made elsewhere during a wait
+  (`-ExternalWait`), then any while idle with `-Watchers` more watchers
+  open. Make changes over NFS during the wait to check they arrive. Count
+  the gateway's `ListDirectory` log lines during the idle phase to check
+  that watching costs no listings. ssh buffers PowerShell's output, so time
+  the phases from the start, not from the printed markers.
 - `windows-space-test.ps1` checks the share's size as Windows reads it
   (`DriveInfo` and `fsutil volume diskfree`), that free space falls as data
   is staged, and that a write past the staging quota fails with "not enough

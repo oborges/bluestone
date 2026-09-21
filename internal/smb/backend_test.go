@@ -1354,3 +1354,61 @@ func TestSMBNamedStreamsAreCapped(t *testing.T) {
 		t.Fatalf("existing stream after a refused write = %q", got)
 	}
 }
+
+// Changes made through the filesystem, by NFS or by SMB clients, reach a
+// watcher on the share with the names SMB clients use, without anything
+// listing a directory.
+func TestSMBBackendReportsChanges(t *testing.T) {
+	g := startGateway(t)
+	backend := NewBackend(g.filesystem, nil)
+	var mu sync.Mutex
+	var got []smbvfs.Change
+	stop := backend.NotifyChanges(func(c smbvfs.Change) {
+		mu.Lock()
+		defer mu.Unlock()
+		got = append(got, c)
+	})
+	defer stop()
+
+	// As an NFS client would: through the filesystem directly.
+	if err := g.filesystem.MkdirAll("Docs", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// And through an SMB client.
+	if err := g.share.WriteFile(`Docs\a.txt`, []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.share.Rename(`Docs\a.txt`, `Docs\b.txt`); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.share.WriteFile(`Docs\b.txt:note`, []byte("s"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.share.Remove(`Docs\b.txt`); err != nil {
+		t.Fatal(err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	has := func(want smbvfs.Change) bool {
+		for _, c := range got {
+			if c.Action == want.Action && c.Path == want.Path && c.OldPath == want.OldPath &&
+				c.IsDir == want.IsDir && c.Filter&want.Filter == want.Filter {
+				return true
+			}
+		}
+		return false
+	}
+	for _, want := range []smbvfs.Change{
+		{Action: smbvfs.ChangeAdded, Path: "Docs", IsDir: true},
+		{Action: smbvfs.ChangeAdded, Path: `Docs\a.txt`},
+		{Action: smbvfs.ChangeModified, Path: `Docs\a.txt`, Filter: notifySize | notifyLastWrite},
+		{Action: smbvfs.ChangeRenamed, Path: `Docs\b.txt`, OldPath: `Docs\a.txt`},
+		{Action: smbvfs.ChangeModified, Path: `Docs\b.txt`, Filter: notifyStreamWrite},
+		{Action: smbvfs.ChangeRemoved, Path: `Docs\b.txt`},
+	} {
+		if !has(want) {
+			t.Errorf("missing %+v in %+v", want, got)
+		}
+	}
+}

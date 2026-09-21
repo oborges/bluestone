@@ -410,3 +410,39 @@ type StreamInfo struct {
 type StreamLister interface {
 	Streams(ctx context.Context) ([]StreamInfo, error)
 }
+
+// ChangeAction is what happened to a path, as FILE_NOTIFY_INFORMATION
+// reports it (MS-FSCC section 2.7.1).
+type ChangeAction uint32
+
+const (
+	ChangeAdded    ChangeAction = 1
+	ChangeRemoved  ChangeAction = 2
+	ChangeModified ChangeAction = 3
+	// ChangeRenamed is a move from OldPath to Path. The server reports it
+	// as a rename to a watch that sees both names, and as a removal or an
+	// addition to one that sees only one of them.
+	ChangeRenamed ChangeAction = 4
+)
+
+// Change is one change on a share. Paths are share-relative and
+// backslash-separated, as clients name them. Filter holds the
+// FILE_NOTIFY_CHANGE_* bits a ChangeModified matches (size, last write,
+// attributes, and so on); additions, removals and renames match the file
+// name or directory name bit by IsDir.
+type Change struct {
+	Action  ChangeAction
+	Path    string
+	OldPath string
+	IsDir   bool
+	Filter  uint32
+}
+
+// ChangeNotifier is a backend that reports changes to its share as they
+// happen, including changes made outside SMB. The server routes them to
+// the clients watching a directory, so a watch costs nothing while nothing
+// changes. fn must not block. A backend without it gets notifications for
+// changes made through the server only.
+type ChangeNotifier interface {
+	NotifyChanges(fn func(Change)) (stop func())
+}

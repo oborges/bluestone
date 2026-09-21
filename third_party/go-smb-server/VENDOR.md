@@ -273,6 +273,28 @@ proposed upstream.
   error, so macOS's CREATE, READ, CLOSE of an empty stream failed at the
   READ's end of file, the CLOSE was never carried out, and the open leaked
   until the client disconnected.
+- Change notification is driven by events instead of polling. Upstream
+  re-listed each watched directory every 500ms per request. It also started
+  every request from a fresh snapshot, so changes between requests were lost,
+  and it never linked FILE_NOTIFY_INFORMATION entries, so clients saw only
+  the first. It dropped changes past the buffer, ignored WATCH_TREE,
+  renames and most filters, and kept polling after the handle closed.
+  - A watch now belongs to the directory handle and keeps changes between
+    requests. It routes changes from a backend implementing
+    `vfs.ChangeNotifier`, subscribed once per share. For other backends the
+    server reports the changes made through it.
+  - Entries are linked and aligned, renames are reported as old and new
+    names (or as a removal or addition across directories), and tree
+    watches get subtree-relative names.
+  - Overflow completes with STATUS_NOTIFY_ENUM_DIR, and closing the handle
+    completes a waiting request with STATUS_NOTIFY_CLEANUP.
+- Final responses to async requests are signed. Upstream sent them
+  unsigned, and Windows rejected every change notification with "Invalid
+  Signature". The interim response grants the request's credits, and the
+  final one grants none. Upstream sent the interim with the request's
+  signature bytes.
+- CANCEL gets no response of its own (MS-SMB2 3.3.5.16), where upstream sent
+  one. It finds a request by message id as well as async id.
 
 ## Known gaps to close in Bluestone
 
@@ -284,8 +306,6 @@ Tracked with the rest of the SMB work in `docs/SMB_ROADMAP.md`.
 - No oplocks or leases, so clients cache nothing and every read crosses the
   wire. Granting them needs working breaks, including breaks caused by writes
   arriving over NFS.
-- CHANGE_NOTIFY polls the directory every 500ms per watch and compares
-  listings, which is expensive against object storage.
 - No durable or persistent handles and no multichannel, so a dropped
   connection loses open handles.
 - The dialect is fixed at 3.0.2: no SMB 3.1.1, so no pre-auth integrity and

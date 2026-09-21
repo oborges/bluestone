@@ -48,29 +48,43 @@ func (c *conn) cancelPending(asyncID uint64) *pendingOp {
 	return nil
 }
 
-func (c *conn) sendFinal(msg []byte) {
-	select {
-	case c.outbox <- msg:
-	case <-c.connDone:
-	}
-}
-
+// buildAsyncInterim is the STATUS_PENDING response that tells the client a
+// request will complete later. It carries the credits granted for the
+// request; interim responses are not signed (MS-SMB2 section 3.3.4.1.1).
 func (c *conn) buildAsyncInterim(hdr *wire.Header, asyncID uint64) []byte {
 	resp := *hdr
 	resp.Flags = wire.FlagServerToRedir | wire.FlagAsyncCommand
 	resp.Status = wire.StatusPending
 	resp.AsyncId = asyncID
-	resp.Credit = 0
+	resp.NextCommand = 0
+	resp.Signature = [16]byte{}
 	return resp.Append(nil)
 }
 
-func finalizeAsync(hdr *wire.Header, asyncID uint64, status uint32, body []byte) []byte {
-	resp := *hdr
+// sendAsyncFinal sends the final response to a request that went async. It
+// grants no credits, the interim response having granted them, and is
+// signed like any other response on a signed session: a client that
+// requires signing drops an unsigned one.
+func (c *conn) sendAsyncFinal(req wire.Header, asyncID uint64, status uint32, body []byte) {
+	resp := req
 	resp.Flags = wire.FlagServerToRedir | wire.FlagAsyncCommand
 	resp.Status = status
 	resp.AsyncId = asyncID
-	out := resp.Append(nil)
-	return append(out, body...)
+	resp.Credit = 0
+	resp.NextCommand = 0
+	resp.Signature = [16]byte{}
+	sess := c.getSession(req.SessionId)
+	signing := sess != nil && sess.signer != nil && !sess.requireEncrypt
+	if signing {
+		resp.Flags |= wire.FlagSigned
+	}
+	msg := append(resp.Append(nil), body...)
+	if signing {
+		if err := sess.signer.Sign(msg); err != nil {
+			c.log.Debug("sign async response failed", "err", err)
+		}
+	}
+	c.send(msg)
 }
 
 func le16(b []byte) uint16 { return uint16(b[0]) | uint16(b[1])<<8 }

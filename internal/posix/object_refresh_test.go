@@ -509,3 +509,45 @@ func copyStringMap(in map[string]string) map[string]string {
 	}
 	return out
 }
+
+// Changes a scan finds are reported, after the first scan sets the
+// baseline, so clients watching a directory hear of changes made directly
+// in the bucket. Paths with local staged writes are not.
+func TestObjectRefreshReportsChanges(t *testing.T) {
+	ctx := context.Background()
+	store := newFakeObjectStore()
+	store.put("kept.txt", []byte("a"), time.Unix(100, 0))
+	store.put("gone.txt", []byte("b"), time.Unix(100, 0))
+	store.put("dirty.txt", []byte("c"), time.Unix(100, 0))
+
+	ops, _ := newRefreshTestOps(t, store)
+	scanner := NewObjectRefreshScanner(ops, &config.ObjectRefreshConfig{}, func(path string) bool { return path == "/dirty.txt" })
+	var got []ObjectChange
+	scanner.OnChange(func(c ObjectChange) { got = append(got, c) })
+	scanner.RunOnce(ctx)
+	if len(got) != 0 {
+		t.Fatalf("baseline scan reported %v", got)
+	}
+
+	store.put("kept.txt", []byte("changed"), time.Unix(200, 0))
+	_ = store.DeleteObject(ctx, "gone.txt")
+	store.put("new.txt", []byte("d"), time.Unix(200, 0))
+	store.put("newdir/", nil, time.Unix(200, 0))
+	store.put("dirty.txt", []byte("changed"), time.Unix(200, 0))
+	scanner.RunOnce(ctx)
+
+	want := map[string]ObjectChange{
+		"/kept.txt": {Path: "/kept.txt", Kind: ObjectModified},
+		"/gone.txt": {Path: "/gone.txt", Kind: ObjectRemoved},
+		"/new.txt":  {Path: "/new.txt", Kind: ObjectAdded},
+		"/newdir":   {Path: "/newdir", Kind: ObjectAdded, IsDir: true},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("reported %v, want %v", got, want)
+	}
+	for _, c := range got {
+		if want[c.Path] != c {
+			t.Errorf("reported %+v, want %+v", c, want[c.Path])
+		}
+	}
+}

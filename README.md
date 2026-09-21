@@ -340,6 +340,14 @@ writes are accepted into staging before they reach COS, so a bucket that
 refuses them leaves the files dirty in staging, which then fills and
 reports disk full.
 
+Clients watching a directory, as Explorer and Finder windows do, are told of
+changes as they happen, whether made over SMB or NFS. The gateway reports
+changes from its own filesystem layer rather than by listing directories, so
+open windows cost nothing while nothing changes, however many there are.
+Changes made directly in the bucket, by tools that bypass the gateway, reach
+them only when the object refresh scanner (`object_refresh`) finds them, if
+it is enabled.
+
 Byte-range locks taken over SMB go into the same table as NFS locks, so the
 two protocols conflict with each other on the same bytes. A lock belongs to
 the handle that took it and is released when that handle closes or its session
