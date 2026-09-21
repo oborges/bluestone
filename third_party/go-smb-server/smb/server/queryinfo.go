@@ -405,6 +405,11 @@ func (c *request) handleSetInfo(ctx context.Context, msg []byte, tr *tree) uint3
 				// A directory with files open inside it, or a target
 				// someone has open: Windows refuses both, and renaming
 				// either would leave those handles naming the wrong file.
+				// Clients only caching those handles are told to let go,
+				// so a retry can succeed.
+				if c.srv.leasesEnabled {
+					c.srv.leaseTable().releaseHandles(keyFor(tr.share.Name(), newName), files.keyOf(oh))
+				}
 				return c.errBody(wire.StatusAccessDenied)
 			}
 			if err := rn.Rename(ctx, newName, replaceIfExist); err != nil {
