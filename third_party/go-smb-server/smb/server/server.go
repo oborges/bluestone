@@ -390,6 +390,10 @@ type openHandle struct {
 	// wrote records that a change to the file has been reported for this
 	// handle's writes, so a burst of writes is reported once.
 	wrote atomic.Bool
+	// io counts reads and writes on this handle still being handled
+	// alongside other requests. Only the read loop adds to it and waits on
+	// it, so the two never race.
+	io sync.WaitGroup
 
 	enumDone bool
 	enumMu   sync.Mutex
@@ -412,6 +416,9 @@ type request struct {
 	// after runs once out is queued: work that must not reach the client
 	// before this response does.
 	after []func()
+	// concurrent is set for a read or write handled alongside other
+	// requests rather than in turn on the read loop.
+	concurrent bool
 }
 
 // finish queues the response and runs what waited for it.
@@ -552,13 +559,17 @@ func (s *Server) serveConn(ctx context.Context, c net.Conn) {
 			case <-connCtx.Done():
 				return
 			}
+			// Registered on its handle before the next request is read, so
+			// a CLOSE right behind it waits for it rather than overtaking.
+			release := cn.holdHandle(queued)
 			cn.handlers.Add(1)
 			cn.running.Add(1)
 			go func() {
 				defer cn.handlers.Done()
 				defer cn.running.Add(-1)
 				defer func() { <-cn.inflight }()
-				r := &request{conn: cn}
+				defer release()
+				r := &request{conn: cn, concurrent: true}
 				r.handleMessage(connCtx, queued)
 				r.finish()
 			}()
@@ -733,6 +744,17 @@ func (c *request) handleMessage(ctx context.Context, msg []byte) {
 
 		c.chargeCredits(uint32(hdr.CreditCharge))
 
+		// Requests on one handle take effect in the order they arrive.
+		// Reads and writes may run alongside each other, but anything else
+		// naming the handle waits for those received before it: a CLOSE
+		// that overtook a write would fail it with STATUS_INVALID_HANDLE,
+		// and a truncate could land before the write it follows.
+		if !c.concurrent {
+			if oh := c.handleOf(&hdr, sub); oh != nil {
+				oh.io.Wait()
+			}
+		}
+
 		if sess := c.getSession(hdr.SessionId); sess != nil && sess.signer != nil {
 			if hdr.Flags&wire.FlagSigned != 0 {
 				ok, vErr := sess.signer.Verify(sub)
@@ -835,6 +857,41 @@ func (c *request) handleMessage(ctx context.Context, msg []byte) {
 		}
 		off += int(hdr.NextCommand)
 	}
+}
+
+// handleOf finds the open a request names, if it names one.
+func (c *conn) handleOf(hdr *wire.Header, msg []byte) *openHandle {
+	fo := fileIdOffset(hdr.Command)
+	if fo < 0 || fo+16 > len(msg) {
+		return nil
+	}
+	sess := c.getSession(hdr.SessionId)
+	if sess == nil {
+		return nil
+	}
+	tr := sess.getTree(hdr.TreeId)
+	if tr == nil {
+		return nil
+	}
+	var fid [16]byte
+	copy(fid[:], msg[fo:fo+16])
+	oh, _ := tr.open(fid)
+	return oh
+}
+
+// holdHandle registers a read or write about to be handled alongside other
+// requests on the handle it names, returning the function that releases it.
+func (c *conn) holdHandle(msg []byte) func() {
+	var hdr wire.Header
+	if err := hdr.Parse(msg); err != nil {
+		return func() {}
+	}
+	oh := c.handleOf(&hdr, msg)
+	if oh == nil {
+		return func() {}
+	}
+	oh.io.Add(1)
+	return oh.io.Done
 }
 
 // fileIdOffset returns where the FileId sits in a request, so a related
