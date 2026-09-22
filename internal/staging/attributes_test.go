@@ -108,8 +108,8 @@ func TestCreationTimeAndWindowsAttributesPersist(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetOrCreateSession() error = %v", err)
 	}
-	session.SetBirthTimeIfUnset(created)
-	session.SetBirthTimeIfUnset(created.Add(time.Hour)) // a second call keeps the first
+	session.SetCreationIfUnset(created, 0)
+	session.SetCreationIfUnset(created.Add(time.Hour), 0) // a second call keeps the first
 	if _, err := session.Write([]byte("x"), 0); err != nil {
 		t.Fatalf("Write() error = %v", err)
 	}
@@ -138,7 +138,7 @@ func TestCreationTimeAndWindowsAttributesPersist(t *testing.T) {
 	}
 }
 
-func TestSetBirthTimeIfUnsetKeepsSeededAttributes(t *testing.T) {
+func TestSetCreationIfUnsetKeepsSeededAttributes(t *testing.T) {
 	manager, err := NewStagingManager(createTestConfig(t))
 	if err != nil {
 		t.Fatalf("NewStagingManager() error = %v", err)
@@ -151,7 +151,7 @@ func TestSetBirthTimeIfUnsetKeepsSeededAttributes(t *testing.T) {
 		t.Fatalf("GetOrCreateSession() error = %v", err)
 	}
 	session.SeedAttributes(StagedAttributes{Mode: 0644, UID: 42, GID: 7, Btime: seeded})
-	session.SetBirthTimeIfUnset(time.Now())
+	session.SetCreationIfUnset(time.Now(), 0o644)
 	if got := session.Attributes().Btime; !got.Equal(seeded) {
 		t.Fatalf("btime = %v, want the seeded %v", got, seeded)
 	}

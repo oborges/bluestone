@@ -18,6 +18,7 @@ type Server struct {
 	nfsVersions        []uint32
 	concurrentHandlers int
 	locker             nfs.ByteRangeLocker
+	permissions        *nfs.Permissions
 	wg                 sync.WaitGroup
 	ctx                context.Context
 	cancel             context.CancelFunc
@@ -35,6 +36,9 @@ type ServerOptions struct {
 	// lock table so locks conflict across protocols; nil disables NFSv4
 	// locking.
 	Locker nfs.ByteRangeLocker
+	// Permissions, when set, enforces POSIX file permissions for each
+	// call's AUTH_SYS user; nil lets every client user do anything.
+	Permissions *nfs.Permissions
 }
 
 // NewServer creates a new NFS server
@@ -63,6 +67,7 @@ func NewServer(handler nfs.Handler, address string, logger *logging.KVLogger, nf
 		nfsVersions:        nfsVersions,
 		concurrentHandlers: opts.ConcurrentHandlers,
 		locker:             opts.Locker,
+		permissions:        opts.Permissions,
 		ctx:                ctx,
 		cancel:             cancel,
 	}, nil
@@ -74,10 +79,18 @@ func (s *Server) Start() error {
 	if s.concurrentHandlers > 0 {
 		concurrency = fmt.Sprintf("%d", s.concurrentHandlers)
 	}
+	permissions := "none"
+	if p := s.permissions; p != nil {
+		permissions = "posix"
+		if p.RootSquash {
+			permissions = "posix, root squashed"
+		}
+	}
 	s.logger.Info("Starting NFS server",
 		"address", s.listener.Addr().String(),
 		"versions", s.nfsVersions,
-		"concurrent_handlers", concurrency)
+		"concurrent_handlers", concurrency,
+		"permissions", permissions)
 
 	s.wg.Add(1)
 	go func() {
@@ -88,6 +101,7 @@ func (s *Server) Start() error {
 			EnabledNFSVersions: s.nfsVersions,
 			ConcurrentHandlers: s.concurrentHandlers,
 			Locker:             s.locker,
+			Permissions:        s.permissions,
 		}
 		if err := srv.Serve(s.listener); err != nil {
 			s.logger.Error("NFS server error", "error", err)

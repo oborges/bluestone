@@ -49,6 +49,9 @@ func onRemove(ctx context.Context, w *response, userHandle Handler) error {
 	toDelete := fs.Join(append(path, string(obj.Filename))...)
 	toDeleteHandle := userHandle.ToHandle(fs, append(path, string(obj.Filename)))
 
+	if err := checkParent(w, fs, append(path, string(obj.Filename))); err != nil {
+		return err
+	}
 	err = fs.Remove(toDelete)
 	if err != nil {
 		if os.IsNotExist(err) {

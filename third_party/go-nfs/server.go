@@ -31,6 +31,10 @@ type Server struct {
 	// across protocols. Nil disables NFSv4 locking (NFS4ERR_NOTSUPP).
 	Locker ByteRangeLocker
 
+	// Permissions, when set, enforces POSIX file permissions for the users
+	// calls come from. Nil lets every caller do anything.
+	Permissions *Permissions
+
 	// NFSv4 lock protocol state (stateids, seqids, client leases), created
 	// on first LOCK-family or RENEW operation.
 	lockMgr     *nfs4LockManager

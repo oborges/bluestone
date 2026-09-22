@@ -20,6 +20,18 @@ server:
   # value (64, like a kernel nfsd thread pool); 1 restores fully serial
   # request handling as an operational escape hatch.
   nfs_concurrent_handlers: 0
+  # POSIX file permissions for NFS clients. "posix" checks each call's user
+  # (its AUTH_SYS uid and groups) against a file's mode, owner and group, as
+  # a kernel NFS server does, and files belong to the user who creates them.
+  # "none" (default) lets every client user do anything. Existing files are
+  # owned by 1000:1000 unless chowned, so set owners before turning it on.
+  nfs_permissions: "none"
+  # With nfs_permissions: posix, act as the anonymous user (below) for root
+  # on clients, instead of letting root do anything.
+  nfs_root_squash: false
+  # Who squashed root, and calls without AUTH_SYS credentials, act as.
+  nfs_anon_uid: 65534
+  nfs_anon_gid: 65534
 
 cos:
   # IBM Cloud COS endpoint

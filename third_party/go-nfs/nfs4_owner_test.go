@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/go-git/go-billy/v5"
+	"github.com/willscott/go-nfs-client/nfs/rpc"
 	"github.com/willscott/go-nfs/helpers/memfs"
 )
 
@@ -17,18 +18,33 @@ import (
 type ownedFS struct {
 	billy.Filesystem
 	owners map[string][2]uint32
+	// modes overrides the permission bits memfs reports.
+	modes map[string]os.FileMode
 }
 
 type ownedFileInfo struct {
 	os.FileInfo
 	uid, gid uint32
+	perm     *os.FileMode
 }
 
 func (i ownedFileInfo) NFSOwner() (uint32, uint32) { return i.uid, i.gid }
 
+func (i ownedFileInfo) Mode() os.FileMode {
+	if i.perm == nil {
+		return i.FileInfo.Mode()
+	}
+	return i.FileInfo.Mode()&^os.ModePerm | *i.perm
+}
+
 func (o *ownedFS) owned(name string, info os.FileInfo) os.FileInfo {
-	ids := o.owners[o.Join("/", name)]
-	return ownedFileInfo{FileInfo: info, uid: ids[0], gid: ids[1]}
+	key := o.Join("/", name)
+	ids := o.owners[key]
+	out := ownedFileInfo{FileInfo: info, uid: ids[0], gid: ids[1]}
+	if m, ok := o.modes[key]; ok {
+		out.perm = &m
+	}
+	return out
 }
 
 func (o *ownedFS) Lstat(name string) (os.FileInfo, error) {
@@ -47,7 +63,13 @@ func (o *ownedFS) Stat(name string) (os.FileInfo, error) {
 	return o.owned(name, info), nil
 }
 
-func (o *ownedFS) Chmod(string, os.FileMode) error            { return nil }
+func (o *ownedFS) Chmod(name string, mode os.FileMode) error {
+	if o.modes == nil {
+		o.modes = map[string]os.FileMode{}
+	}
+	o.modes[o.Join("/", name)] = mode & os.ModePerm
+	return nil
+}
 func (o *ownedFS) Chtimes(string, time.Time, time.Time) error { return nil }
 func (o *ownedFS) Chown(name string, uid, gid int) error      { return o.Lchown(name, uid, gid) }
 func (o *ownedFS) Lchown(name string, uid, gid int) error {
@@ -72,8 +94,15 @@ func newOwnedFS(t *testing.T) *ownedFS {
 // runNFSv4 sends one compound and returns a reader at its first result.
 func runNFSv4(t *testing.T, fs billy.Filesystem, ops uint32, build func(req *nfs4Writer)) *nfs4Reader {
 	t.Helper()
+	return runNFSv4As(t, fs, nil, rpc.Auth{}, ops, build)
+}
+
+// runNFSv4As sends one compound with the given credentials to a server
+// enforcing perms (nil for none).
+func runNFSv4As(t *testing.T, fs billy.Filesystem, perms *Permissions, cred rpc.Auth, ops uint32, build func(req *nfs4Writer)) *nfs4Reader {
+	t.Helper()
 	handler := newNFSv4TestHandler(fs)
-	srv := &Server{Handler: handler, ID: [8]byte{1}}
+	srv := &Server{Handler: handler, ID: [8]byte{1}, Permissions: perms}
 	body := bytes.NewBuffer(nil)
 	req := newNFS4Writer(body)
 	req.writeOpaque(nil)
@@ -82,7 +111,7 @@ func runNFSv4(t *testing.T, fs billy.Filesystem, ops uint32, build func(req *nfs
 	build(req)
 	w := &response{
 		conn:     &conn{Server: srv},
-		req:      &request{xid: 1, Body: bytes.NewReader(body.Bytes())},
+		req:      &request{xid: 1, Header: rpc.Header{Cred: cred}, Body: bytes.NewReader(body.Bytes())},
 		errorFmt: basicErrorFormatter,
 		writer:   bytes.NewBuffer(nil),
 	}

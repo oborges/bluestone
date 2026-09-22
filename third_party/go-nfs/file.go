@@ -201,6 +201,10 @@ type SetFileAttributes struct {
 	SetSize  *uint64
 	SetAtime *time.Time
 	SetMtime *time.Time
+	// TimesToServer is set when every time being set is set to the
+	// server's current time, which needs only write permission; setting a
+	// time of the client's choosing needs ownership.
+	TimesToServer bool
 }
 
 // Apply uses a `Change` implementation to set defined attributes on a
@@ -379,5 +383,6 @@ func ReadSetFileAttributes(r io.Reader) (*SetFileAttributes, error) {
 		}
 		attrs.SetMtime = t.Native()
 	}
+	attrs.TimesToServer = aTime != 2 && mTime != 2 && (aTime == 1 || mTime == 1)
 	return &attrs, nil
 }

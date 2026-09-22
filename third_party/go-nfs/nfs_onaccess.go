@@ -34,6 +34,7 @@ func onAccess(ctx context.Context, w *response, userHandle Handler) error {
 	if !billy.CapabilityCheck(fs, billy.WriteCapability) {
 		mask = mask & (1 | 2 | 0x20)
 	}
+	mask = accessMask(w, fs, path, mask)
 
 	if err := xdr.Write(writer, mask); err != nil {
 		return &NFSStatusError{NFSStatusServerFault, err}

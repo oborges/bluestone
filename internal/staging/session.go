@@ -146,16 +146,19 @@ func (ws *WriteSession) SetTimes(atime, mtime time.Time) {
 	})
 }
 
-// SetBirthTimeIfUnset records the creation time of a file the gateway is
-// creating. Sessions that already have attributes, seeded from an existing
-// object or set by a client, keep theirs.
-func (ws *WriteSession) SetBirthTimeIfUnset(btime time.Time) {
+// SetCreationIfUnset records the creation time, and the mode (unless 0),
+// of a file the gateway is creating. Sessions that already have attributes,
+// seeded from an existing object or set by a client, keep theirs.
+func (ws *WriteSession) SetCreationIfUnset(btime time.Time, mode os.FileMode) {
 	ws.mu.Lock()
 	if ws.attributesSet {
 		ws.mu.Unlock()
 		return
 	}
 	ws.btime = btime
+	if mode != 0 {
+		ws.Mode = mode
+	}
 	ws.attributesSet = true
 	ws.mu.Unlock()
 	ws.persistAttributes()

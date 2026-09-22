@@ -32,6 +32,7 @@ import (
 	"github.com/oborges/bluestone/internal/staging"
 	"github.com/oborges/bluestone/internal/vfs"
 	"github.com/sonroyaalmerol/go-smb-server/smb/ntlmssp"
+	gonfs "github.com/willscott/go-nfs"
 	nfshelper "github.com/willscott/go-nfs/helpers"
 	"go.uber.org/zap"
 )
@@ -368,10 +369,19 @@ func main() {
 
 	nfsAddress := fmt.Sprintf(":%d", cfg.Server.NFSPort)
 	nfsVersions := cfg.Server.GetNFSVersions()
+	var nfsPermissions *gonfs.Permissions
+	if cfg.Server.EnforcesNFSPermissions() {
+		nfsPermissions = &gonfs.Permissions{
+			RootSquash: cfg.Server.NFSRootSquash,
+			AnonUID:    uint32(cfg.Server.NFSAnonUID),
+			AnonGID:    uint32(cfg.Server.NFSAnonGID),
+		}
+	}
 	nfsServer, err := nfs.NewServer(stableHandler, nfsAddress, nfsLogger, nfsVersions, nfs.ServerOptions{
 		AllowedClients:     cfg.Server.AllowedClients,
 		ConcurrentHandlers: cfg.Server.NFSConcurrentHandlers,
 		Locker:             nfs.NewLocker(locks),
+		Permissions:        nfsPermissions,
 	})
 	if err != nil {
 		logging.Fatal("Failed to create NFS server", zap.Error(err))

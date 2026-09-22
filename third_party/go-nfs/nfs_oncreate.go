@@ -76,6 +76,18 @@ func onCreate(ctx context.Context, w *response, userHandle Handler) error {
 		}
 	}
 
+	// Creating needs write and execute on the directory; recreating a file
+	// that is already there truncates it, which needs write on the file.
+	existed := false
+	if _, err := fs.Stat(newFilePath); err == nil {
+		existed = true
+		if err := checkData(w, fs, newFile, mayWrite); err != nil {
+			return err
+		}
+	} else if err := checkParent(w, fs, newFile); err != nil {
+		return err
+	}
+
 	file, err := fs.Create(newFilePath)
 	if err != nil {
 		Log.Errorf("Error Creating: %v", err)
@@ -88,6 +100,14 @@ func onCreate(ctx context.Context, w *response, userHandle Handler) error {
 
 	fp := userHandle.ToHandle(fs, newFile)
 	changer := userHandle.Change(fs)
+	if !existed {
+		if err := claimCreated(w, changer, fs, newFilePath); err != nil {
+			return &NFSStatusError{NFSStatusIO, err}
+		}
+	}
+	if err := checkSetAttr(w, fs, newFile, attrs); err != nil {
+		return err
+	}
 	if err := attrs.Apply(changer, fs, newFilePath); err != nil {
 		Log.Errorf("Error applying attributes: %v\n", err)
 		return &NFSStatusError{NFSStatusIO, err}

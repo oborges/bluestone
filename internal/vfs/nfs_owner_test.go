@@ -106,3 +106,21 @@ func TestNFSChownToRoot(t *testing.T) {
 		t.Errorf("after chown to root: stored owner %d:%d, want 0:0", attrs.UID, attrs.GID)
 	}
 }
+
+// A new file keeps the mode it was created with, rather than the 0600 a
+// staged file starts at.
+func TestNewFileKeepsCreationMode(t *testing.T) {
+	fs := newDirtyStagingTestFilesystemWithStore(t, newTestStagingManager(t), newFakeObjectStore())
+	f, err := fs.OpenFile("new.txt", os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+	info, err := fs.Stat("new.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o644 {
+		t.Errorf("new file mode %o, want 644", got)
+	}
+}

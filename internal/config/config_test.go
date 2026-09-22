@@ -216,6 +216,27 @@ logging:
 	return configPath
 }
 
+func TestLoadNFSPermissionDefaults(t *testing.T) {
+	setRequiredTestEnv(t)
+	cfg, err := Load(writeTestConfig(t, "staging:\n  enabled: false\n"))
+	if err != nil {
+		t.Fatalf("Load() returned error: %v", err)
+	}
+	if cfg.Server.EnforcesNFSPermissions() || cfg.Server.NFSRootSquash || cfg.Server.NFSAnonUID != 65534 || cfg.Server.NFSAnonGID != 65534 {
+		t.Fatalf("NFS permission defaults = %q squash %v anon %d:%d, want none, no squash, 65534:65534",
+			cfg.Server.NFSPermissions, cfg.Server.NFSRootSquash, cfg.Server.NFSAnonUID, cfg.Server.NFSAnonGID)
+	}
+	t.Setenv("BLUESTONE_SERVER_NFS_PERMISSIONS", "posix")
+	t.Setenv("BLUESTONE_SERVER_NFS_ROOT_SQUASH", "true")
+	cfg, err = Load(writeTestConfig(t, "staging:\n  enabled: false\n"))
+	if err != nil {
+		t.Fatalf("Load() with posix permissions returned error: %v", err)
+	}
+	if !cfg.Server.EnforcesNFSPermissions() || !cfg.Server.NFSRootSquash {
+		t.Fatalf("NFS permissions = %q squash %v, want posix with root squash", cfg.Server.NFSPermissions, cfg.Server.NFSRootSquash)
+	}
+}
+
 func TestLoadSMBDefaultsAndOverrides(t *testing.T) {
 	setRequiredTestEnv(t)
 

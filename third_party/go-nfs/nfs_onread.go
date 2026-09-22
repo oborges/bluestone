@@ -41,6 +41,9 @@ func onRead(ctx context.Context, w *response, userHandle Handler) error {
 	if err != nil {
 		return &NFSStatusError{NFSStatusStale, err}
 	}
+	if err := checkData(w, fs, path, mayRead); err != nil {
+		return err
+	}
 
 	fh, err := fs.Open(fs.Join(path...))
 	if err != nil {
