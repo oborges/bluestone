@@ -206,6 +206,10 @@ server:
   debug_port: 8082
   allowed_clients: [] # CIDRs/IPs allowed to connect; empty allows all
   nfs_concurrent_handlers: 0 # per-connection parallelism; 0 = default (64), 1 = serial
+  nfs_permissions: "none"    # "posix" enforces file permissions for NFS clients
+  nfs_root_squash: false     # with posix: root on clients acts as nfs_anon_uid
+  nfs_anon_uid: 65534
+  nfs_anon_gid: 65534
 ```
 
 Metrics, health, and debug HTTP servers bind to localhost. Enable only the
@@ -218,6 +222,32 @@ user authentication, so combine the allowlist with OS/VPC firewalling and
 trusted networks. `nfs_concurrent_handlers` is an operational escape hatch for
 the per-connection request parallelism: set it to `1` to restore fully serial
 handling if a client misbehaves with concurrent replies.
+
+By default any user on an allowed client can read, change and delete any
+file. `nfs_permissions: posix` makes the gateway check each call's user, the
+uid and groups its AUTH_SYS credentials carry, against the file's mode, owner
+and group, as a kernel NFS server does:
+
+- Reading a file needs read permission (or execute, to run a program), and
+  writing it needs write permission. A file's owner can always read and
+  write its data, since NFS carries no open file handle to remember what a
+  process was allowed when it opened the file.
+- Creating, deleting or renaming needs write and execute permission on the
+  directory; looking a name up needs execute, and listing needs read.
+- Only the owner may change a file's mode or times. Only root may change
+  its owner; the owner may change its group to one of their own groups.
+- A file or directory belongs to the user who creates it.
+- ACCESS answers what the user may really do, so clients refuse early.
+- Root may do anything, unless `nfs_root_squash` makes it act as
+  `nfs_anon_uid`:`nfs_anon_gid` (65534, nobody), as calls without AUTH_SYS
+  credentials do.
+
+AUTH_SYS trusts the client to name its user, so this protects users of a
+client from each other, not the export from a hostile client: that is still
+`allowed_clients` and the network's job. Files the gateway already holds are
+owned by 1000:1000 unless something changed them, so `chown` them before
+turning this on. Sticky and set-id bits are not kept, and SMB clients are not
+subject to these checks; SMB has its own share access rules.
 
 ### SMB
 

@@ -48,6 +48,9 @@ func onSymlink(ctx context.Context, w *response, userHandle Handler) error {
 		return &NFSStatusError{NFSStatusNotDir, nil}
 	}
 
+	if err := checkParent(w, fs, append(path, string(obj.Filename))); err != nil {
+		return err
+	}
 	err = fs.Symlink(string(target), newFilePath)
 	if err != nil {
 		return &NFSStatusError{NFSStatusAccess, err}
@@ -56,6 +59,12 @@ func onSymlink(ctx context.Context, w *response, userHandle Handler) error {
 	fp := userHandle.ToHandle(fs, append(path, string(obj.Filename)))
 	changer := userHandle.Change(fs)
 	if changer != nil {
+		if err := claimCreated(w, changer, fs, newFilePath); err != nil {
+			return &NFSStatusError{NFSStatusIO, err}
+		}
+		if err := checkSetAttr(w, fs, append(path, string(obj.Filename)), attrs); err != nil {
+			return err
+		}
 		if err := attrs.Apply(changer, fs, newFilePath); err != nil {
 			return &NFSStatusError{NFSStatusIO, err}
 		}

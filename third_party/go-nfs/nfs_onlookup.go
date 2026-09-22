@@ -38,6 +38,9 @@ func onLookup(ctx context.Context, w *response, userHandle Handler) error {
 	if err != nil {
 		return &NFSStatusError{NFSStatusStale, err}
 	}
+	if err := checkAccess(w, fs, p, mayExec); err != nil {
+		return err
+	}
 	dirInfo, err := fs.Lstat(fs.Join(p...))
 	if err != nil || !dirInfo.IsDir() {
 		return &NFSStatusError{NFSStatusNotDir, err}

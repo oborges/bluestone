@@ -351,7 +351,10 @@ func (fs *Filesystem) OpenFile(filename string, flag int, perm os.FileMode) (bil
 		// File will be created on first write
 		file.isNew = true
 		if useStagingPath && file.stagingSession != nil {
-			file.stagingSession.SetBirthTimeIfUnset(time.Now())
+			// A new file gets the mode it was created with. Staged files
+			// otherwise start at 0600, which NFS clients hide by setting a
+			// mode right after creating, and SMB does not.
+			file.stagingSession.SetCreationIfUnset(time.Now(), perm&os.ModePerm)
 		}
 	}
 

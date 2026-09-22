@@ -52,4 +52,36 @@ func TestValidateServerClientRulesAndConcurrency(t *testing.T) {
 	}
 }
 
+func TestValidateServerNFSPermissions(t *testing.T) {
+	base := ServerConfig{
+		NFSPort: 2049, NFSVersion: "4", MetricsPort: 8080, HealthPort: 8081, DebugPort: 8082,
+		MaxConnections: 1000, ReadTimeout: "30s", WriteTimeout: "30s", NFSAnonUID: 65534, NFSAnonGID: 65534,
+	}
+	for _, tc := range []struct {
+		name    string
+		mutate  func(*ServerConfig)
+		enforce bool
+		wantErr bool
+	}{
+		{name: "default", mutate: func(*ServerConfig) {}},
+		{name: "none", mutate: func(c *ServerConfig) { c.NFSPermissions = "none" }},
+		{name: "posix", mutate: func(c *ServerConfig) { c.NFSPermissions = "POSIX" }, enforce: true},
+		{name: "posix with root squash", mutate: func(c *ServerConfig) {
+			c.NFSPermissions, c.NFSRootSquash = "posix", true
+		}, enforce: true},
+		{name: "unknown mode", mutate: func(c *ServerConfig) { c.NFSPermissions = "acl" }, wantErr: true},
+		{name: "root squash without enforcement", mutate: func(c *ServerConfig) { c.NFSRootSquash = true }, wantErr: true},
+		{name: "negative anonymous uid", mutate: func(c *ServerConfig) { c.NFSAnonUID = -1 }, wantErr: true},
+	} {
+		cfg := base
+		tc.mutate(&cfg)
+		if err := validateServer(&cfg); (err != nil) != tc.wantErr {
+			t.Errorf("%s: validateServer() error = %v, wantErr %v", tc.name, err, tc.wantErr)
+		}
+		if got := cfg.EnforcesNFSPermissions(); got != tc.enforce && !tc.wantErr {
+			t.Errorf("%s: EnforcesNFSPermissions() = %v, want %v", tc.name, got, tc.enforce)
+		}
+	}
+}
+
 // Made with Bob

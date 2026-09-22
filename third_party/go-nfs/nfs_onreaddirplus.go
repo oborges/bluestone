@@ -50,6 +50,9 @@ func onReadDirPlus(ctx context.Context, w *response, userHandle Handler) error {
 	if err != nil {
 		return &NFSStatusError{NFSStatusStale, err}
 	}
+	if err := checkAccess(w, fs, p, mayRead); err != nil {
+		return err
+	}
 
 	contents, verifier, err := getDirListingWithVerifier(userHandle, obj.Handle, obj.CookieVerif)
 	if err != nil {

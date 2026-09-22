@@ -255,6 +255,9 @@ func init() {
 type nfs4CompoundState struct {
 	current *nfs4FileHandle
 	saved   *nfs4FileHandle
+	// call is the RPC the compound arrived in, whose credentials the
+	// operations act with.
+	call *response
 }
 
 type nfs4FileHandle struct {
@@ -298,7 +301,7 @@ func onNFSv4Compound(ctx context.Context, w *response, userHandle Handler) error
 		return writeNFSv4CompoundResponse(w, nfs4ErrMinorVersMismatch, tag, nil)
 	}
 
-	state := &nfs4CompoundState{}
+	state := &nfs4CompoundState{call: w}
 	results := make([]nfs4Result, 0, opCount)
 	compoundStatus := nfs4OK
 
@@ -411,12 +414,13 @@ func nfs4OpAccess(rd *nfs4Reader, wr *nfs4Writer, state *nfs4CompoundState) nfs4
 	if err != nil {
 		return nfs4ErrBadXDR
 	}
-	if _, status := state.requireCurrent(); status != nfs4OK {
+	current, status := state.requireCurrent()
+	if status != nfs4OK {
 		return status
 	}
 	supported := access4Read | access4Lookup | access4Modify | access4Extend | access4Delete | access4Execute
 	wr.writeUint32(supported)
-	wr.writeUint32(req & supported)
+	wr.writeUint32(accessMask(state.call, current.fs, current.path, req&supported))
 	return nfs4OK
 }
 
@@ -489,10 +493,19 @@ func nfs4OpCreate(rd *nfs4Reader, wr *nfs4Writer, userHandle Handler, state *nfs
 	childPath := appendPath(parent.path, name)
 	fullPath := nfs4Join(parent.fs, childPath)
 	before := nfs4ChangeID(parent.fs, parent.path)
+	if err := checkParent(state.call, parent.fs, childPath); err != nil {
+		return mapErrToNFS4Status(err)
+	}
 	if err := parent.fs.MkdirAll(fullPath, attrs.attrs.Mode(0777)); err != nil {
 		return mapErrToNFS4Status(err)
 	}
+	if err := claimCreated(state.call, userHandle.Change(parent.fs), parent.fs, fullPath); err != nil {
+		return mapErrToNFS4Status(err)
+	}
 	if attrs.attrs.SetUID != nil || attrs.attrs.SetGID != nil {
+		if err := checkSetAttr(state.call, parent.fs, childPath, &attrs.attrs); err != nil {
+			return mapErrToNFS4Status(err)
+		}
 		// The reply lists the attributes as set, so an owner asked for is
 		// applied too, not only the mode.
 		owner := SetFileAttributes{SetUID: attrs.attrs.SetUID, SetGID: attrs.attrs.SetGID}
@@ -555,6 +568,9 @@ func nfs4OpLookup(rd *nfs4Reader, userHandle Handler, state *nfs4CompoundState) 
 	}
 	if status := ensureDirectory(current); status != nfs4OK {
 		return status
+	}
+	if err := checkAccess(state.call, current.fs, current.path, mayExec); err != nil {
+		return mapErrToNFS4Status(err)
 	}
 
 	var childPath []string
@@ -675,6 +691,18 @@ func nfs4OpOpen(rd *nfs4Reader, wr *nfs4Writer, userHandle Handler, state *nfs4C
 	childPath := appendPath(parent.path, name)
 	fullPath := nfs4Join(parent.fs, childPath)
 	before := nfs4ChangeID(parent.fs, parent.path)
+	_, statErr := parent.fs.Lstat(fullPath)
+	existed := statErr == nil
+	if existed {
+		read, write := shareAccess&open4ShareAccessRead != 0, shareAccess&open4ShareAccessWrite != 0
+		if err := checkOpen(state.call, parent.fs, childPath, read, write); err != nil {
+			return mapErrToNFS4Status(err)
+		}
+	} else if openType == open4Create {
+		if err := checkParent(state.call, parent.fs, childPath); err != nil {
+			return mapErrToNFS4Status(err)
+		}
+	}
 	if openType == open4Create {
 		if _, err := parent.fs.Lstat(fullPath); err == nil && createMode == open4Guarded {
 			return nfs4ErrExist
@@ -688,6 +716,14 @@ func nfs4OpOpen(rd *nfs4Reader, wr *nfs4Writer, userHandle Handler, state *nfs4C
 			return mapErrToNFS4Status(err)
 		}
 		if err := file.Close(); err != nil {
+			return mapErrToNFS4Status(err)
+		}
+		if !existed {
+			if err := claimCreated(state.call, userHandle.Change(parent.fs), parent.fs, fullPath); err != nil {
+				return mapErrToNFS4Status(err)
+			}
+		}
+		if err := checkSetAttr(state.call, parent.fs, childPath, &createAttrs.attrs); err != nil {
 			return mapErrToNFS4Status(err)
 		}
 		if err := createAttrs.attrs.Apply(userHandle.Change(parent.fs), parent.fs, fullPath); err != nil {
@@ -780,6 +816,9 @@ func nfs4OpRead(rd *nfs4Reader, wr *nfs4Writer, state *nfs4CompoundState) nfs4St
 	if status != nfs4OK {
 		return status
 	}
+	if err := checkData(state.call, current.fs, current.path, mayRead); err != nil {
+		return mapErrToNFS4Status(err)
+	}
 	if count > nfs4MaxRead {
 		count = nfs4MaxRead
 	}
@@ -835,6 +874,9 @@ func nfs4OpReadDir(rd *nfs4Reader, wr *nfs4Writer, userHandle Handler, state *nf
 	}
 	if status := ensureDirectory(current); status != nfs4OK {
 		return status
+	}
+	if err := checkAccess(state.call, current.fs, current.path, mayRead); err != nil {
+		return mapErrToNFS4Status(err)
 	}
 	verifier := binary.BigEndian.Uint64(cookieVerf)
 	contents, actualVerifier, nfsErr := getDirListingWithVerifier(userHandle, current.handle, verifier)
@@ -928,6 +970,9 @@ func nfs4OpRemove(rd *nfs4Reader, wr *nfs4Writer, state *nfs4CompoundState) nfs4
 	if status := ensureDirectory(current); status != nfs4OK {
 		return status
 	}
+	if err := checkParent(state.call, current.fs, appendPath(current.path, name)); err != nil {
+		return mapErrToNFS4Status(err)
+	}
 	before := nfs4ChangeID(current.fs, current.path)
 	err = current.fs.Remove(nfs4Join(current.fs, appendPath(current.path, name)))
 	if err != nil {
@@ -959,6 +1004,12 @@ func nfs4OpRename(rd *nfs4Reader, wr *nfs4Writer, state *nfs4CompoundState) nfs4
 	}
 	if status := ensureDirectory(current); status != nfs4OK {
 		return status
+	}
+	if err := checkParent(state.call, state.saved.fs, appendPath(state.saved.path, oldName)); err != nil {
+		return mapErrToNFS4Status(err)
+	}
+	if err := checkParent(state.call, current.fs, appendPath(current.path, newName)); err != nil {
+		return mapErrToNFS4Status(err)
 	}
 	sourceBefore := nfs4ChangeID(state.saved.fs, state.saved.path)
 	targetBefore := nfs4ChangeID(current.fs, current.path)
@@ -1023,6 +1074,10 @@ func nfs4OpSetAttr(rd *nfs4Reader, wr *nfs4Writer, userHandle Handler, state *nf
 	if status != nfs4OK {
 		writeBitmap(wr, nil)
 		return status
+	}
+	if err := checkSetAttr(state.call, current.fs, current.path, &attrs.attrs); err != nil {
+		writeBitmap(wr, nil)
+		return mapErrToNFS4Status(err)
 	}
 	if err := attrs.attrs.Apply(userHandle.Change(current.fs), current.fs, nfs4Join(current.fs, current.path)); err != nil {
 		writeBitmap(wr, nil)
@@ -1091,6 +1146,9 @@ func nfs4OpWrite(rd *nfs4Reader, wr *nfs4Writer, w *response, state *nfs4Compoun
 	current, status := state.requireCurrent()
 	if status != nfs4OK {
 		return status
+	}
+	if err := checkData(state.call, current.fs, current.path, mayWrite); err != nil {
+		return mapErrToNFS4Status(err)
 	}
 	if len(data) > math.MaxInt32 {
 		return nfs4ErrFBig
@@ -1306,6 +1364,7 @@ func readNFSv4SetAttrs(rd *nfs4Reader) (nfs4SetAttrs, nfs4Status) {
 
 	attrs := nfs4SetAttrs{mask: trimBitmap(mask)}
 	attrReader := newNFS4Reader(bytes.NewReader(raw))
+	serverTimes, clientTimes := false, false
 	for _, attrID := range bitmapAttrs(mask) {
 		if !containsAttr(nfs4WriteAttrIDs, attrID) {
 			return nfs4SetAttrs{}, nfs4ErrAttrNotSupp
@@ -1338,19 +1397,22 @@ func readNFSv4SetAttrs(rd *nfs4Reader) (nfs4SetAttrs, nfs4Status) {
 				attrs.attrs.SetGID = &id
 			}
 		case fattr4TimeAccessSet:
-			tm, status := readNFSv4SetTime(attrReader)
+			tm, now, status := readNFSv4SetTime(attrReader)
 			if status != nfs4OK {
 				return nfs4SetAttrs{}, status
 			}
 			attrs.attrs.SetAtime = tm
+			serverTimes, clientTimes = serverTimes || now, clientTimes || !now
 		case fattr4TimeModifySet:
-			tm, status := readNFSv4SetTime(attrReader)
+			tm, now, status := readNFSv4SetTime(attrReader)
 			if status != nfs4OK {
 				return nfs4SetAttrs{}, status
 			}
 			attrs.attrs.SetMtime = tm
+			serverTimes, clientTimes = serverTimes || now, clientTimes || !now
 		}
 	}
+	attrs.attrs.TimesToServer = serverTimes && !clientTimes
 	return attrs, nfs4OK
 }
 
@@ -1369,28 +1431,30 @@ func parseNFS4Owner(s string) (uint32, bool) {
 	return uint32(id), true
 }
 
-func readNFSv4SetTime(rd *nfs4Reader) (*time.Time, nfs4Status) {
+// readNFSv4SetTime reads a settime4, reporting whether it asks for the
+// server's current time.
+func readNFSv4SetTime(rd *nfs4Reader) (*time.Time, bool, nfs4Status) {
 	setIt, err := rd.readUint32()
 	if err != nil {
-		return nil, nfs4ErrBadXDR
+		return nil, false, nfs4ErrBadXDR
 	}
 	switch setIt {
 	case 0:
 		now := time.Now()
-		return &now, nfs4OK
+		return &now, true, nfs4OK
 	case 1:
 		seconds, err := rd.readInt64()
 		if err != nil {
-			return nil, nfs4ErrBadXDR
+			return nil, false, nfs4ErrBadXDR
 		}
 		nseconds, err := rd.readUint32()
 		if err != nil {
-			return nil, nfs4ErrBadXDR
+			return nil, false, nfs4ErrBadXDR
 		}
 		tm := time.Unix(seconds, int64(nseconds))
-		return &tm, nfs4OK
+		return &tm, false, nfs4OK
 	default:
-		return nil, nfs4ErrInval
+		return nil, false, nfs4ErrInval
 	}
 }
 

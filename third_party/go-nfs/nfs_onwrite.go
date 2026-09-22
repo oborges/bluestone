@@ -41,6 +41,9 @@ func onWrite(ctx context.Context, w *response, userHandle Handler) error {
 	if err != nil {
 		return &NFSStatusError{NFSStatusStale, err}
 	}
+	if err := checkData(w, fs, path, mayWrite); err != nil {
+		return err
+	}
 	if !billy.CapabilityCheck(fs, billy.WriteCapability) {
 		return &NFSStatusError{NFSStatusROFS, os.ErrPermission}
 	}

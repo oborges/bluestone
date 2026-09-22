@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"path"
 	"strconv"
@@ -327,6 +328,20 @@ func validateServer(config *ServerConfig) error {
 
 	if config.NFSConcurrentHandlers < 0 {
 		return fmt.Errorf("invalid nfs_concurrent_handlers: %d (must be >= 0; 0 selects the default)", config.NFSConcurrentHandlers)
+	}
+
+	switch strings.ToLower(strings.TrimSpace(config.NFSPermissions)) {
+	case "", NFSPermissionsNone, NFSPermissionsPOSIX:
+	default:
+		return fmt.Errorf("invalid nfs_permissions %q: must be none or posix", config.NFSPermissions)
+	}
+	if config.NFSRootSquash && !config.EnforcesNFSPermissions() {
+		return fmt.Errorf("nfs_root_squash needs nfs_permissions: posix; without it every client user can do anything anyway")
+	}
+	for name, id := range map[string]int{"nfs_anon_uid": config.NFSAnonUID, "nfs_anon_gid": config.NFSAnonGID} {
+		if id < 0 || id > math.MaxUint32 {
+			return fmt.Errorf("invalid %s: %d (must be 0-%d; 0 selects 65534)", name, id, uint32(math.MaxUint32))
+		}
 	}
 
 	if config.MetricsPort < 1 || config.MetricsPort > 65535 {

@@ -67,6 +67,9 @@ func onMknod(ctx context.Context, w *response, userHandle Handler) error {
 	} else if !parent.IsDir() {
 		return &NFSStatusError{NFSStatusNotDir, nil}
 	}
+	if err := checkParent(w, fs, append(path, string(obj.Filename))); err != nil {
+		return err
+	}
 	fp := userHandle.ToHandle(fs, append(path, string(obj.Filename)))
 
 	switch nfs_ftype(ftype) {
@@ -90,6 +93,12 @@ func onMknod(ctx context.Context, w *response, userHandle Handler) error {
 		if err != nil {
 			return &NFSStatusError{NFSStatusAccess, err}
 		}
+		if err := claimCreated(w, cu, fs, newFilePath); err != nil {
+			return &NFSStatusError{NFSStatusServerFault, err}
+		}
+		if err := checkSetAttr(w, fs, append(path, string(obj.Filename)), attrs); err != nil {
+			return err
+		}
 		if err = attrs.Apply(cu, fs, newFilePath); err != nil {
 			return &NFSStatusError{NFSStatusServerFault, err}
 		}
@@ -102,6 +111,12 @@ func onMknod(ctx context.Context, w *response, userHandle Handler) error {
 		}
 		if err := cu.Socket(newFilePath); err != nil {
 			return &NFSStatusError{NFSStatusAccess, err}
+		}
+		if err := claimCreated(w, cu, fs, newFilePath); err != nil {
+			return &NFSStatusError{NFSStatusServerFault, err}
+		}
+		if err := checkSetAttr(w, fs, append(path, string(obj.Filename)), attrs); err != nil {
+			return err
 		}
 		if err = attrs.Apply(cu, fs, newFilePath); err != nil {
 			return &NFSStatusError{NFSStatusServerFault, err}
@@ -116,6 +131,12 @@ func onMknod(ctx context.Context, w *response, userHandle Handler) error {
 		err = cu.Mkfifo(newFilePath, uint32(attrs.Mode(parent.Mode())))
 		if err != nil {
 			return &NFSStatusError{NFSStatusAccess, err}
+		}
+		if err := claimCreated(w, cu, fs, newFilePath); err != nil {
+			return &NFSStatusError{NFSStatusServerFault, err}
+		}
+		if err := checkSetAttr(w, fs, append(path, string(obj.Filename)), attrs); err != nil {
+			return err
 		}
 		if err = attrs.Apply(cu, fs, newFilePath); err != nil {
 			return &NFSStatusError{NFSStatusServerFault, err}

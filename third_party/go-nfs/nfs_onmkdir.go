@@ -57,6 +57,9 @@ func onMkdir(ctx context.Context, w *response, userHandle Handler) error {
 		}
 	}
 
+	if err := checkParent(w, fs, newFolder); err != nil {
+		return err
+	}
 	if err := fs.MkdirAll(newFolderPath, attrs.Mode(mkdirDefaultMode)); err != nil {
 		// A full filesystem is reported as such, not as a permissions
 		// problem the client would send its user looking into.
@@ -69,6 +72,12 @@ func onMkdir(ctx context.Context, w *response, userHandle Handler) error {
 	fp := userHandle.ToHandle(fs, newFolder)
 	changer := userHandle.Change(fs)
 	if changer != nil {
+		if err := claimCreated(w, changer, fs, newFolderPath); err != nil {
+			return &NFSStatusError{NFSStatusIO, err}
+		}
+		if err := checkSetAttr(w, fs, newFolder, attrs); err != nil {
+			return err
+		}
 		if err := attrs.Apply(changer, fs, newFolderPath); err != nil {
 			return &NFSStatusError{NFSStatusIO, err}
 		}

@@ -78,6 +78,14 @@ func onRename(ctx context.Context, w *response, userHandle Handler) error {
 	fromLoc := fs.Join(append(fromPath, string(from.Filename))...)
 	toLoc := fs.Join(append(toPath, string(to.Filename))...)
 
+	// Renaming removes the entry from one directory and adds it to another,
+	// which needs write and execute on both.
+	if err := checkParent(w, fs, append(fromPath, string(from.Filename))); err != nil {
+		return err
+	}
+	if err := checkParent(w, fs, append(toPath, string(to.Filename))); err != nil {
+		return err
+	}
 	err = fs.Rename(fromLoc, toLoc)
 	if err != nil {
 		if os.IsNotExist(err) {

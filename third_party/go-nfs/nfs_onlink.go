@@ -59,9 +59,15 @@ func onLink(ctx context.Context, w *response, userHandle Handler) error {
 		return &NFSStatusError{NFSStatusAccess, err}
 	}
 
+	if err := checkParent(w, fs, append(path, string(obj.Filename))); err != nil {
+		return err
+	}
 	err = cos.Link(string(target), newFilePath)
 	if err != nil {
 		return &NFSStatusError{NFSStatusAccess, err}
+	}
+	if err := checkSetAttr(w, fs, append(path, string(obj.Filename)), attrs); err != nil {
+		return err
 	}
 	if err := attrs.Apply(changer, fs, newFilePath); err != nil {
 		return &NFSStatusError{NFSStatusIO, err}

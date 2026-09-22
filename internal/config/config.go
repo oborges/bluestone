@@ -348,6 +348,30 @@ type ServerConfig struct {
 	// parallel per client connection. 0 selects the built-in default (64);
 	// 1 restores fully serial per-connection handling.
 	NFSConcurrentHandlers int `mapstructure:"nfs_concurrent_handlers"`
+	// NFSPermissions is whether NFS enforces POSIX file permissions:
+	// "posix" checks each call's user (its AUTH_SYS uid and groups) against
+	// a file's mode, owner and group, as a kernel NFS server does, and
+	// makes files belong to the user who creates them. "none" (the
+	// default) lets every client user do anything, as before.
+	NFSPermissions string `mapstructure:"nfs_permissions"`
+	// NFSRootSquash makes root on NFS clients act as the anonymous user.
+	// It needs nfs_permissions: posix.
+	NFSRootSquash bool `mapstructure:"nfs_root_squash"`
+	// NFSAnonUID and NFSAnonGID are who squashed root, and calls without
+	// AUTH_SYS credentials, act as.
+	NFSAnonUID int `mapstructure:"nfs_anon_uid"`
+	NFSAnonGID int `mapstructure:"nfs_anon_gid"`
+}
+
+// Values for ServerConfig.NFSPermissions.
+const (
+	NFSPermissionsNone  = "none"
+	NFSPermissionsPOSIX = "posix"
+)
+
+// EnforcesNFSPermissions reports whether NFS enforces POSIX permissions.
+func (c *ServerConfig) EnforcesNFSPermissions() bool {
+	return strings.EqualFold(strings.TrimSpace(c.NFSPermissions), NFSPermissionsPOSIX)
 }
 
 // COSConfig represents IBM Cloud COS configuration
@@ -522,6 +546,10 @@ func bindEnvOverrides(v *viper.Viper) error {
 		"server.write_timeout",
 		"server.allowed_clients",
 		"server.nfs_concurrent_handlers",
+		"server.nfs_permissions",
+		"server.nfs_root_squash",
+		"server.nfs_anon_uid",
+		"server.nfs_anon_gid",
 		"cos.endpoint",
 		"cos.bucket",
 		"cos.region",
@@ -678,6 +706,10 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("server.max_connections", 1000)
 	v.SetDefault("server.allowed_clients", []string{})
 	v.SetDefault("server.nfs_concurrent_handlers", 0)
+	v.SetDefault("server.nfs_permissions", NFSPermissionsNone)
+	v.SetDefault("server.nfs_root_squash", false)
+	v.SetDefault("server.nfs_anon_uid", 65534)
+	v.SetDefault("server.nfs_anon_gid", 65534)
 	v.SetDefault("server.read_timeout", "30s")
 	v.SetDefault("server.write_timeout", "30s")
 
