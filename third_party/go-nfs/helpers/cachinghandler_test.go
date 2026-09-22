@@ -1,6 +1,8 @@
 package helpers
 
 import (
+	"fmt"
+	"sync"
 	"testing"
 
 	"github.com/willscott/go-nfs/helpers/memfs"
@@ -49,4 +51,36 @@ func TestCachingHandlerEvictsOrdinaryHandles(t *testing.T) {
 	if _, _, err := h.FromHandle(first); err == nil {
 		t.Fatal("an evicted handle resolved; the cache is unbounded")
 	}
+}
+
+// Handles are taken and resolved from several goroutines at once, as a
+// server handling a connection's requests in parallel does. Without a lock
+// around its maps this crashes the process rather than failing a test.
+func TestCachingHandlerIsSafeForConcurrentUse(t *testing.T) {
+	fs := memfs.New()
+	if err := fs.MkdirAll("/", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	h := NewCachingHandler(NewNullAuthHandler(fs), 500)
+	root := h.ToHandle(fs, []string{})
+
+	var wg sync.WaitGroup
+	for worker := 0; worker < 8; worker++ {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			for i := 0; i < 400; i++ {
+				handle := h.ToHandle(fs, []string{"dir", fmt.Sprint(worker), fmt.Sprint(i)})
+				if _, _, err := h.FromHandle(handle); err != nil {
+					continue // evicted under the load, which is fine
+				}
+				if _, _, err := h.FromHandle(root); err != nil {
+					t.Errorf("root handle went stale: %v", err)
+					return
+				}
+				_ = h.InvalidateHandle(fs, handle)
+			}
+		}(worker)
+	}
+	wg.Wait()
 }
