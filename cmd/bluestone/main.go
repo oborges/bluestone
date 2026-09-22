@@ -365,7 +365,12 @@ func main() {
 	// Handle cache: 10000 (file handles)
 	// Verifier cache: 10000 (directory listings)
 	authHandler := nfshelper.NewNullAuthHandler(instrumentedFS)
-	cachedHandler := nfshelper.NewCachingHandlerWithVerifierLimit(authHandler, 10000, 10000)
+	// Handles are cached, and an ordinary one that falls out is re-resolved
+	// by the client. Busy exports hand out far more than the old 10,000, so
+	// the cache holds more of them; export roots are pinned and never fall
+	// out, since an NFSv3 client keeps its root handle for the life of the
+	// mount.
+	cachedHandler := nfshelper.NewCachingHandlerWithVerifierLimit(authHandler, 100000, 10000)
 
 	// Wrap with stable verifier handler to prevent BadCookie errors
 	// This ensures the same verifier is returned for a directory across all pagination requests

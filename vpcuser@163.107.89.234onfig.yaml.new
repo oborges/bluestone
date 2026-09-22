@@ -1,0 +1,86 @@
+server:
+  nfs_port: 2049
+  nfs_version: "dual"
+  metrics_enabled: true
+  metrics_port: 8080
+  health_enabled: true
+  health_port: 8081
+  debug_enabled: true
+  debug_port: 8082
+  allowed_clients:
+    - "10.250.64.0/24"
+  nfs_permissions: "posix"
+
+cos:
+  endpoint: "s3.br-sao.cloud-object-storage.appdomain.cloud"
+  bucket: "bluestone-soak-d8b22c3d"
+  region: "br-sao"
+  auth_type: "hmac"
+  access_key: "d950877e3e73490cbf445269a104d1d2"
+  secret_key: "899224ebe072d4345283d3060b3daef0d39efbe942b5212b"
+  max_retries: 3
+  timeout: "30s"
+
+cache:
+  metadata:
+    enabled: true
+    size_mb: 512
+    ttl_seconds: 60
+    max_entries: 50000
+  data:
+    enabled: true
+    size_gb: 20
+    path: "/var/cache/bluestone"
+    chunk_size_kb: 1024
+
+performance:
+  read_ahead_kb: 1024
+  write_buffer_kb: 4096
+  multipart_threshold_mb: 100
+  multipart_chunk_mb: 10
+  worker_pool_size: 100
+  max_concurrent_reads: 50
+  max_concurrent_writes: 25
+
+logging:
+  level: "info"
+  format: "json"
+  output: "stdout"
+
+staging:
+  enabled: true
+  root_dir: "/mnt/staging/bluestone"
+  sync_interval: "30s"
+  sync_threshold_mb: 10
+  max_dirty_age: "5m"
+  max_staging_size_gb: 400
+  max_dirty_files: 50000
+  sync_worker_count: 8
+  sync_queue_size: 1000
+  max_sync_retries: 3
+  retry_backoff_initial: "1s"
+  retry_backoff_max: "60s"
+  clean_after_sync: true
+  stale_file_age: "24h"
+
+smb:
+  enabled: true
+  port: 445
+  share_name: "bluestone"
+  domain: "BLUESTONE"
+  encryption_required: false
+  concurrent_requests: 0
+  leases: true
+  durable_handles: true
+  max_dialect: "3.1.1"
+  users:
+    - username: "soak"
+      ntlm_hash: "f68257b5bc08547dae79d2526c7791f2"
+      uid: 3001
+      gid: 3001
+
+ha:
+  enabled: true
+  heartbeat_interval: "15s"
+  lease_timeout: "60s"
+  on_lease_lost: "stop"
