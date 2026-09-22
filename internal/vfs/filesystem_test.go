@@ -12,6 +12,7 @@ import (
 	"sync"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/oborges/bluestone/internal/cache"
 	"github.com/oborges/bluestone/internal/config"
@@ -373,6 +374,43 @@ func TestFilesystemRenameDirectoryWithDirtyChildIsBlocked(t *testing.T) {
 	}
 	if !manager.IsDirty(path) {
 		t.Fatal("dirty child path should remain dirty after blocked directory rename")
+	}
+}
+
+func TestFilesystemRenameConflictedPathFailsWithoutRetry(t *testing.T) {
+	cfg := testStagingConfig(t)
+	manager, err := staging.NewStagingManager(cfg)
+	if err != nil {
+		t.Fatalf("NewStagingManager() error = %v", err)
+	}
+	defer manager.Shutdown()
+
+	path := "/conflicted.txt"
+	session, err := manager.GetOrCreateSession(path)
+	if err != nil {
+		t.Fatalf("GetOrCreateSession() error = %v", err)
+	}
+	if _, err := session.Write([]byte("local data"), 0); err != nil {
+		t.Fatalf("session.Write() error = %v", err)
+	}
+	manager.MarkDirty(path, session.Size)
+	if _, err := manager.RecordConflict(path, staging.ExternalChangeSnapshot{
+		ObjectKey:    "conflicted.txt",
+		Size:         13,
+		LastModified: time.Unix(200, 0),
+		Reason:       "test_external_change",
+	}); err != nil {
+		t.Fatalf("RecordConflict() error = %v", err)
+	}
+
+	fs := newDirtyStagingTestFilesystem(t, manager)
+	err = fs.Rename("conflicted.txt", "renamed.txt")
+	if !errors.Is(err, staging.ErrPathConflicted) || !errors.Is(err, syscall.EIO) {
+		t.Fatalf("Rename(conflicted) error = %v, want ErrPathConflicted and EIO", err)
+	}
+	// EBUSY maps to NFS4ERR_DELAY/NFS3ERR_JUKEBOX, which clients retry forever.
+	if errors.Is(err, syscall.EBUSY) {
+		t.Fatalf("Rename(conflicted) error = %v, must not be EBUSY", err)
 	}
 }
 
