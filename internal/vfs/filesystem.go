@@ -848,7 +848,7 @@ func (fs *Filesystem) remove(filename string) error {
 
 	// The path itself is not dirty, so any dirty staged data under it means
 	// this is a directory with dirty children: block the rmdir.
-	if err := fs.ensureNoDirtyStagedData("rmdir", fullPath); err != nil {
+	if err := fs.ensureNoDirtyStagedChildrenForRmdir(fullPath); err != nil {
 		return err
 	}
 
@@ -954,7 +954,11 @@ func (fs *Filesystem) ensureNoDirtyStagedChildren(op, path string) error {
 	}
 }
 
-func (fs *Filesystem) ensureNoDirtyStagedData(op, path string) error {
+// ensureNoDirtyStagedChildrenForRmdir blocks removing a directory that has
+// dirty staged files below it. Those files are live, so the directory is not
+// empty: report ENOTEMPTY, which is what rmdir would say once they sync, rather
+// than EBUSY, which NFS clients retry until the sync lands only to fail anyway.
+func (fs *Filesystem) ensureNoDirtyStagedChildrenForRmdir(path string) error {
 	if fs.featureFlags == nil || !fs.featureFlags.IsStagingEnabled() || fs.stagingManager == nil {
 		return nil
 	}
@@ -965,9 +969,9 @@ func (fs *Filesystem) ensureNoDirtyStagedData(op, path string) error {
 	}
 
 	return &os.PathError{
-		Op:   op,
+		Op:   "rmdir",
 		Path: path,
-		Err:  fmt.Errorf("dirty staged data exists at %s; wait for sync before %s: %w", strings.Join(dirtyPaths, ","), op, syscall.EBUSY),
+		Err:  fmt.Errorf("directory not empty: dirty staged data exists at %s: %w", strings.Join(dirtyPaths, ","), syscall.ENOTEMPTY),
 	}
 }
 

@@ -63,6 +63,9 @@ func onRemove(ctx context.Context, w *response, userHandle Handler) error {
 		if errors.Is(err, syscall.EBUSY) {
 			return &NFSStatusError{NFSStatusJukebox, err}
 		}
+		if errors.Is(err, syscall.ENOTEMPTY) {
+			return &NFSStatusError{NFSStatusNotEmpty, err}
+		}
 		return &NFSStatusError{NFSStatusIO, err}
 	}
 

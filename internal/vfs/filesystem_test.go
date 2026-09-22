@@ -574,8 +574,8 @@ func TestFilesystemRemoveDirectoryWithDirtyChildIsBlocked(t *testing.T) {
 
 	fs := newDirtyStagingTestFilesystem(t, manager)
 	err = fs.Remove("dir")
-	if !errors.Is(err, syscall.EBUSY) {
-		t.Fatalf("Remove(directory) error = %v, want EBUSY", err)
+	if !errors.Is(err, syscall.ENOTEMPTY) {
+		t.Fatalf("Remove(directory) error = %v, want ENOTEMPTY", err)
 	}
 	if !manager.IsDirty(path) {
 		t.Fatal("dirty child path should remain dirty after blocked directory remove")

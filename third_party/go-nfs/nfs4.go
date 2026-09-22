@@ -56,6 +56,7 @@ const (
 	nfs4ErrTooSmall          nfs4Status = 10005
 	nfs4ErrServerFault       nfs4Status = 10006
 	nfs4ErrBadType           nfs4Status = 10007
+	nfs4ErrDelay             nfs4Status = 10008
 	nfs4ErrDenied            nfs4Status = 10010
 	nfs4ErrResource          nfs4Status = 10018
 	nfs4ErrNoFileHandle      nfs4Status = 10020
@@ -1522,11 +1523,18 @@ func mapErrToNFS4Status(err error) nfs4Status {
 	if errors.Is(err, os.ErrPermission) {
 		return nfs4ErrAccess
 	}
+	// Go reports ENOTEMPTY as os.ErrExist too, so test it first.
+	if errors.Is(err, syscall.ENOTEMPTY) {
+		return nfs4ErrNotEmpty
+	}
 	if errors.Is(err, os.ErrExist) {
 		return nfs4ErrExist
 	}
 	if errors.Is(err, syscall.ENOSPC) {
 		return nfs4ErrNoSpc
+	}
+	if errors.Is(err, syscall.EBUSY) {
+		return nfs4ErrDelay
 	}
 	if errors.Is(err, io.ErrShortBuffer) {
 		return nfs4ErrTooSmall
@@ -1574,6 +1582,8 @@ func nfsStatus3To4(status NFSStatus) nfs4Status {
 		return nfs4ErrServerFault
 	case NFSStatusBadType:
 		return nfs4ErrBadType
+	case NFSStatusJukebox:
+		return nfs4ErrDelay
 	default:
 		return nfs4ErrIO
 	}

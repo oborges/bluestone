@@ -2,9 +2,11 @@ package posix
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -150,5 +152,21 @@ func TestRenameDirectoryCopyFailureLeavesSourceAndCopiedDestinations(t *testing.
 	}
 	if _, headErr := store.HeadObject(ctx, "new/b.txt"); !os.IsNotExist(headErr) {
 		t.Fatalf("failed destination HeadObject error = %v, want not exist", headErr)
+	}
+}
+
+func TestDeleteDirectoryNotEmptyReportsENOTEMPTY(t *testing.T) {
+	ctx := context.Background()
+	store := newFakeObjectStore()
+	store.put("dir/", nil, time.Unix(100, 0))
+	store.put("dir/child.txt", []byte("payload"), time.Unix(100, 0))
+
+	ops, _ := newRefreshTestOps(t, store)
+	err := ops.DeleteDirectory(ctx, "/dir")
+	if !errors.Is(err, syscall.ENOTEMPTY) {
+		t.Fatalf("DeleteDirectory(non-empty) error = %v, want ENOTEMPTY", err)
+	}
+	if _, err := store.HeadObject(ctx, "dir/"); err != nil {
+		t.Fatalf("directory marker HeadObject error = %v, want it kept", err)
 	}
 }
