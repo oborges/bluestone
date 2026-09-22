@@ -222,3 +222,50 @@ func TestRenameDirectorySkipsPendingDeleteObjects(t *testing.T) {
 		t.Fatal("rename should remove the source objects, including the pending delete's")
 	}
 }
+
+// When the COS delete of an unlinked dirty file fails, the file's object is
+// still in COS and a listing cached before the unlink still names it; its
+// directory must still be removable while the sync worker retries.
+func TestRemoveDirectoryAfterFailedCOSDeleteOfDirtyFile(t *testing.T) {
+	cfg := testStagingConfig(t)
+	manager, err := staging.NewStagingManager(cfg)
+	if err != nil {
+		t.Fatalf("NewStagingManager() error = %v", err)
+	}
+	defer manager.Shutdown()
+
+	store := newFakeObjectStore()
+	store.put("dir/", nil)
+	// An earlier version of the file is already in COS.
+	store.put("dir/file", []byte("old"))
+	fs := newDirtyStagingTestFilesystemWithStore(t, manager, store)
+
+	// Cache the directory's listing, as a client listing it would.
+	if _, err := fs.ops.ListDirectory(fs.requestContext(), "/dir"); err != nil {
+		t.Fatalf("ListDirectory() error = %v", err)
+	}
+
+	const path = "/dir/file"
+	session, err := manager.GetOrCreateSession(path)
+	if err != nil {
+		t.Fatalf("GetOrCreateSession() error = %v", err)
+	}
+	if _, err := session.Write([]byte("new data"), 0); err != nil {
+		t.Fatalf("session.Write() error = %v", err)
+	}
+	manager.MarkDirty(path, session.Size)
+	manager.ReleaseSession(path)
+
+	store.setDeleteErr(errors.New("dial tcp: connection refused"))
+	if err := fs.Remove("dir/file"); err != nil {
+		t.Fatalf("Remove(file) error = %v", err)
+	}
+	if !manager.HasPendingDelete(path) {
+		t.Fatal("a failed COS delete should leave the delete pending")
+	}
+	store.setDeleteErr(nil)
+
+	if err := fs.Remove("dir"); err != nil {
+		t.Fatalf("Remove(dir) with only a pending-delete file error = %v", err)
+	}
+}

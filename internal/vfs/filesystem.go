@@ -775,6 +775,9 @@ func (fs *Filesystem) renameDirtyStagedFile(oldFull, newFull string) error {
 	// the sync worker completes it after the upload lands.
 	if fs.stagingManager.TryLockSync(oldFull) {
 		if err := fs.ops.DeleteFile(fs.requestContext(), oldFull); err != nil {
+			// Cached listings still name the source; drop them so it stays
+			// hidden until the retry lands.
+			fs.ops.InvalidateFileMutation(oldFull)
 			fs.logger.Error("COS delete of rename source failed; sync worker will retry",
 				zap.String("old_path", oldFull),
 				zap.Error(err))
@@ -912,6 +915,9 @@ func (fs *Filesystem) removeDirtyStagedFile(fullPath string) error {
 
 	if err := fs.ops.DeleteFile(fs.requestContext(), fullPath); err != nil {
 		// The tombstone persists; the sync worker retries the COS delete.
+		// Cached listings still name the file, which would keep its
+		// directory from being removed; drop them so it stays hidden.
+		fs.ops.InvalidateFileMutation(fullPath)
 		fs.logger.Error("COS delete failed after tombstone was accepted; sync worker will retry",
 			zap.String("path", fullPath),
 			zap.Error(err))
