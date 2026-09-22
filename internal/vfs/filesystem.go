@@ -581,8 +581,7 @@ func (fs *Filesystem) statFromStaging(fullPath string) os.FileInfo {
 		return stagedFileInfo(filepath.Base(fullPath), session)
 	}
 
-	if len(fs.stagingManager.GetSessionsInDirectory(fullPath)) > 0 ||
-		len(fs.stagingManager.DirtyPathsUnder(fullPath)) > 0 {
+	if fs.hasLiveSessionIn(fullPath) || len(fs.stagingManager.DirtyPathsUnder(fullPath)) > 0 {
 		attrs := posix.DefaultAttributes(true)
 		return &stagingDirInfo{
 			name:    filepath.Base(fullPath),
@@ -591,6 +590,17 @@ func (fs *Filesystem) statFromStaging(fullPath string) os.FileInfo {
 		}
 	}
 	return nil
+}
+
+// hasLiveSessionIn reports whether dir holds a staged session whose delete
+// was not accepted.
+func (fs *Filesystem) hasLiveSessionIn(dir string) bool {
+	for _, session := range fs.stagingManager.GetSessionsInDirectory(dir) {
+		if !fs.stagingManager.HasPendingDelete(session.Path) {
+			return true
+		}
+	}
+	return false
 }
 
 // copyFile copies src to dst inside the bucket, without the bytes passing

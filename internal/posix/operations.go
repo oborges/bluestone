@@ -29,6 +29,10 @@ type OperationsHandler struct {
 	perfConfig    *config.PerformanceConfig
 	readGroup     singleflight.Group
 	listings      listingFence
+	// pendingDelete reports paths whose delete was accepted but whose object
+	// may still be in COS (a staged file removed while its upload was in
+	// flight). Such objects are left out of listings and directory checks.
+	pendingDelete func(path string) bool
 }
 
 // ObjectStore is the COS API surface used by POSIX operations and refresh scans.
@@ -66,6 +70,20 @@ func NewOperationsHandler(
 		translator:    NewPathTranslator(""),
 		perfConfig:    perfConfig,
 	}
+}
+
+// SetPendingDeleteCheck registers the check for paths whose delete was
+// accepted but may not have reached COS yet, so their objects stay out of
+// listings, emptiness checks and directory renames until the delete lands.
+// Must be called before serving requests.
+func (h *OperationsHandler) SetPendingDeleteCheck(fn func(path string) bool) {
+	h.pendingDelete = fn
+}
+
+// isPendingDelete reports whether the object at key is only waiting to be
+// deleted.
+func (h *OperationsHandler) isPendingDelete(key string) bool {
+	return h.pendingDelete != nil && h.pendingDelete(h.translator.ToFSPath(key))
 }
 
 func (h *OperationsHandler) maxFullObjectReadBytes() int64 {
@@ -357,6 +375,19 @@ func (h *OperationsHandler) Stat(ctx context.Context, path string) (_ *FileInfo,
 
 	metrics.RecordCOSListObjects()
 	objects, err := h.cosClient.ListObjects(ctx, prefix, 1)
+	if err == nil && len(objects) > 0 && h.isPendingDelete(objects[0].Key) {
+		// An object waiting to be deleted does not keep its directory
+		// alive; the directory exists only if something else is under it.
+		metrics.RecordCOSListObjects()
+		objects, err = h.cosClient.ListObjects(ctx, prefix, h.maxDirectoryEntries()+1)
+		visible := objects[:0]
+		for _, obj := range objects {
+			if !h.isPendingDelete(obj.Key) {
+				visible = append(visible, obj)
+			}
+		}
+		objects = visible
+	}
 	trackBackendErr(err)
 	if err == nil && len(objects) > 0 {
 		// It's an implicit directory - has children
@@ -1089,9 +1120,18 @@ fetchFromCOS:
 	// Convert to FileInfo
 	entries := make([]*FileInfo, 0, len(objects))
 	seen := make(map[string]bool)
+	hidPendingDelete := false
 
 	for _, obj := range objects {
 		log.Debug("Processing object", zap.String("key", obj.Key))
+
+		// A file whose delete was accepted while its upload was in flight
+		// can land in COS after the delete; it stays out of the listing (and
+		// so out of rmdir's emptiness check) until the delete completes.
+		if h.isPendingDelete(obj.Key) {
+			hidPendingDelete = true
+			continue
+		}
 
 		// Remove prefix to get relative path
 		relPath := obj.Key
@@ -1162,6 +1202,12 @@ fetchFromCOS:
 		// The directory changed while this listing was in flight; return it
 		// but do not let it outlive the change.
 		log.Info("Directory listed, not cached: changed during listing", zap.Int("entries", len(entries)))
+		return entries, nil
+	}
+	if hidPendingDelete {
+		// Recreating the path cancels the delete without touching this
+		// listing, making the object visible again; don't cache the omission.
+		log.Info("Directory listed, not cached: pending deletes hidden", zap.Int("entries", len(entries)))
 		return entries, nil
 	}
 	h.metadataCache.SetDirEntries(path, osEntries)
@@ -1304,6 +1350,11 @@ func (h *OperationsHandler) renameDirectory(ctx context.Context, oldPath, newPat
 	copied := 0
 	for _, obj := range objects {
 		if obj == nil || !strings.HasPrefix(obj.Key, oldPrefix) {
+			continue
+		}
+		// A file whose delete is pending must not reappear under the new
+		// name; its source object is still removed below.
+		if h.isPendingDelete(obj.Key) {
 			continue
 		}
 		destKey := newPrefix + strings.TrimPrefix(obj.Key, oldPrefix)
