@@ -922,6 +922,12 @@ func (sm *StagingManager) RecoverFromDisk() error {
 
 	recovered := 0
 	for _, entry := range entries {
+		if !entry.IsDir() && strings.Contains(entry.Name(), ".data.detach-") {
+			// A copy that a crash interrupted before it replaced the
+			// staging file; the staging file itself is intact.
+			_ = os.Remove(filepath.Join(activeDir, entry.Name()))
+			continue
+		}
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".data") {
 			continue
 		}

@@ -85,8 +85,19 @@ func (sm *StagingManager) RenameStagedPath(oldPath, newPath string) error {
 
 	// Atomically move the staged bytes, replacing any destination bytes. Open
 	// descriptors (source session, in-flight uploads) follow the inode and
-	// stay valid.
-	if err := os.Rename(oldStaging, newStaging); err != nil {
+	// stay valid. The source session's lock is held across the move, so a
+	// write that moves the session to a new staging file (while an upload
+	// reads the current one) cannot land at the old path after the move.
+	sm.mu.RLock()
+	source := sm.sessions[oldPath]
+	sm.mu.RUnlock()
+	moveStagedData := func() error { return os.Rename(oldStaging, newStaging) }
+	if source != nil {
+		moveStagedData = func() error {
+			return source.moveStagingFile(newStaging, func() error { return os.Rename(oldStaging, newStaging) })
+		}
+	}
+	if err := moveStagedData(); err != nil {
 		return fmt.Errorf("failed to move staged data: %w", err)
 	}
 
