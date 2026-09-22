@@ -718,12 +718,13 @@ func (fs *Filesystem) rename(oldpath, newpath string) error {
 
 	stagingEnabled := fs.featureFlags != nil && fs.featureFlags.IsStagingEnabled() && fs.stagingManager != nil
 	if stagingEnabled {
-		// Conflicted staged paths keep busy semantics until resolved.
+		// A conflict stays until an operator resolves it, so report it as a
+		// hard error: EBUSY would have NFS clients retry the rename forever.
 		if fs.stagingManager.IsConflicted(oldFull) || fs.stagingManager.IsConflicted(newFull) {
 			return &os.PathError{
 				Op:   "rename",
 				Path: oldFull,
-				Err:  fmt.Errorf("staged path has unresolved conflict: %w", syscall.EBUSY),
+				Err:  fmt.Errorf("%w: %w", staging.ErrPathConflicted, syscall.EIO),
 			}
 		}
 
