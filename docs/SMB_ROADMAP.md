@@ -50,6 +50,16 @@ so it carries the least risk of regressing interop.
   it. Applies to NFS as well, and so belongs with the gateway rather than
   with SMB alone.
 
+Done. Accounts keep an NT hash rather than a password (`bluestone -smb-hash`),
+and a plaintext one warns at startup. `smb.limits` bounds connections,
+sessions, share connections and open files, and repeated failed logins from
+one address are slowed down and then blocked; both are covered by tests. The
+SMB server has a health check and `smb_*` metrics for sessions, opens, locks,
+requests by command, errors by status, bytes moved and latency. Failures are
+reported as what went wrong, a full staging area included. A shutdown drains
+clients rather than cutting them off, and losing the bucket lease stops both
+servers, which a two-node failover drill checked.
+
 **Done when:** limits are enforced and covered by tests, `/health` and the
 metrics endpoint describe the SMB server, a full staging disk surfaces as a
 disk-full error on Windows, and losing the HA lease stops both servers.
@@ -63,10 +73,20 @@ The visible "this is not a real file server" failures.
   accept sets without storing them. Explorer's Security tab, and the
   installers and Office paths that ask for an owner on open, currently get
   `STATUS_NOT_SUPPORTED`.
+  Done: the Security tab opens (`windows-acl-test.ps1`). The descriptor
+  names the file's owner, from the id map where there is one, and grants
+  everyone full access, or read and execute on a read-only share. Changing
+  permissions from Windows is refused rather than accepted and dropped,
+  since the gateway stores no Windows ACLs.
 - Server-side copy (`FSCTL_SRV_COPYCHUNK`): copy within the share without the
   bytes leaving the gateway, using a COS server-side copy where the source is
   clean. Today Explorer and robocopy pull every byte to the client and push
   it back.
+  Done: a copy inside the share never sends the bytes to the client, and a
+  whole-file copy becomes a copy inside the bucket, so no bytes move at all.
+  That covers the usual Windows copy, which creates the destination and sets
+  its length first. A copy from a file with staged changes, or into one
+  something has written to, is copied by the gateway itself.
 - Disk full and quota reporting, so Windows warns before a write fails.
   Done: the share reports the staging area's size and the room below its
   high watermark, and a write past it is `STATUS_DISK_FULL`. A bucket over
