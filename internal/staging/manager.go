@@ -498,7 +498,10 @@ func (sm *StagingManager) IsConflicted(path string) bool {
 	return sm.dirtyIndex.IsConflicted(path)
 }
 
-// DirtyPathsUnder returns dirty staged paths at path or below it.
+// DirtyPathsUnder returns dirty staged paths at path or below it. Paths with
+// a pending delete are left out: their bytes will not persist, even while an
+// upload of them is still in flight, so they neither keep a directory alive
+// nor block removing or renaming it.
 func (sm *StagingManager) DirtyPathsUnder(path string) []string {
 	if sm == nil {
 		return nil
@@ -523,6 +526,9 @@ func (sm *StagingManager) DirtyPathsUnder(path string) []string {
 		dirtyPath := filepath.ToSlash(filepath.Clean(metadata.Path))
 		if !strings.HasPrefix(dirtyPath, "/") {
 			dirtyPath = "/" + dirtyPath
+		}
+		if sm.HasPendingDelete(dirtyPath) {
+			continue
 		}
 		if dirtyPath == path || path == "/" || strings.HasPrefix(dirtyPath, prefix) {
 			paths = append(paths, dirtyPath)

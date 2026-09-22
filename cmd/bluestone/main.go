@@ -287,6 +287,10 @@ func main() {
 		// narrower invalidation.
 		syncWorker.SetObjectMutatedCallback(operations.InvalidateFileMutation)
 		syncWorker.SetObjectSyncedCallback(operations.InvalidateObjectAfterSync)
+		// An upload in flight when its file was deleted lands after the
+		// delete was accepted; keep that object out of listings and rmdir's
+		// emptiness check until the tombstone removes it.
+		operations.SetPendingDeleteCheck(stagingManager.HasPendingDelete)
 		// A bucket over its hard quota refuses uploads; refuse writes at
 		// the client meanwhile instead of staging data that cannot sync.
 		stagingManager.SetBucketFullCheck(cosClient.BucketFull)

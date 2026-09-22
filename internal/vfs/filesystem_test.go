@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -768,14 +769,20 @@ func (s *fakeObjectStore) ListObjects(ctx context.Context, prefix string, maxKey
 	if s.lookupErr != nil {
 		return nil, s.lookupErr
 	}
-	var result []*types.ObjectMetadata
-	for key, data := range s.objects {
+	// Like COS: keys in lexical order, and maxKeys <= 0 means no limit.
+	keys := make([]string, 0, len(s.objects))
+	for key := range s.objects {
 		if strings.HasPrefix(key, prefix) {
-			result = append(result, &types.ObjectMetadata{Key: key, Size: int64(len(data))})
+			keys = append(keys, key)
 		}
-		if len(result) >= maxKeys {
-			break
-		}
+	}
+	sort.Strings(keys)
+	if maxKeys > 0 && len(keys) > maxKeys {
+		keys = keys[:maxKeys]
+	}
+	result := make([]*types.ObjectMetadata, 0, len(keys))
+	for _, key := range keys {
+		result = append(result, &types.ObjectMetadata{Key: key, Size: int64(len(s.objects[key]))})
 	}
 	return result, nil
 }
@@ -832,6 +839,9 @@ func newDirtyStagingTestFilesystemWithStore(t *testing.T, manager *staging.Stagi
 		objectStore = store
 	}
 	ops := posix.NewOperationsHandler(objectStore, metadataCache, nil, perfConfig)
+	if manager != nil {
+		ops.SetPendingDeleteCheck(manager.HasPendingDelete)
+	}
 	return NewFilesystem(
 		ops,
 		logging.NewKVLogger(zap.NewNop()),

@@ -581,8 +581,7 @@ func (fs *Filesystem) statFromStaging(fullPath string) os.FileInfo {
 		return stagedFileInfo(filepath.Base(fullPath), session)
 	}
 
-	if len(fs.stagingManager.GetSessionsInDirectory(fullPath)) > 0 ||
-		len(fs.stagingManager.DirtyPathsUnder(fullPath)) > 0 {
+	if fs.hasLiveSessionIn(fullPath) || len(fs.stagingManager.DirtyPathsUnder(fullPath)) > 0 {
 		attrs := posix.DefaultAttributes(true)
 		return &stagingDirInfo{
 			name:    filepath.Base(fullPath),
@@ -591,6 +590,17 @@ func (fs *Filesystem) statFromStaging(fullPath string) os.FileInfo {
 		}
 	}
 	return nil
+}
+
+// hasLiveSessionIn reports whether dir holds a staged session whose delete
+// was not accepted.
+func (fs *Filesystem) hasLiveSessionIn(dir string) bool {
+	for _, session := range fs.stagingManager.GetSessionsInDirectory(dir) {
+		if !fs.stagingManager.HasPendingDelete(session.Path) {
+			return true
+		}
+	}
+	return false
 }
 
 // copyFile copies src to dst inside the bucket, without the bytes passing
@@ -765,6 +775,9 @@ func (fs *Filesystem) renameDirtyStagedFile(oldFull, newFull string) error {
 	// the sync worker completes it after the upload lands.
 	if fs.stagingManager.TryLockSync(oldFull) {
 		if err := fs.ops.DeleteFile(fs.requestContext(), oldFull); err != nil {
+			// Cached listings still name the source; drop them so it stays
+			// hidden until the retry lands.
+			fs.ops.InvalidateFileMutation(oldFull)
 			fs.logger.Error("COS delete of rename source failed; sync worker will retry",
 				zap.String("old_path", oldFull),
 				zap.Error(err))
@@ -902,6 +915,9 @@ func (fs *Filesystem) removeDirtyStagedFile(fullPath string) error {
 
 	if err := fs.ops.DeleteFile(fs.requestContext(), fullPath); err != nil {
 		// The tombstone persists; the sync worker retries the COS delete.
+		// Cached listings still name the file, which would keep its
+		// directory from being removed; drop them so it stays hidden.
+		fs.ops.InvalidateFileMutation(fullPath)
 		fs.logger.Error("COS delete failed after tombstone was accepted; sync worker will retry",
 			zap.String("path", fullPath),
 			zap.Error(err))
