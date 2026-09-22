@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"io/fs"
 	"reflect"
+	"sync"
 
 	"github.com/willscott/go-nfs"
 
@@ -38,8 +39,15 @@ func NewCachingHandlerWithVerifierLimit(h nfs.Handler, limit int, verifierLimit 
 }
 
 // CachingHandler implements to/from handle via an LRU cache.
+//
+// It is safe for concurrent use: a server that handles a connection's
+// requests in parallel calls ToHandle and FromHandle from several
+// goroutines, and the maps below are not synchronized by themselves. Without
+// the lock that crashes the process with "concurrent map read and map
+// write" under load.
 type CachingHandler struct {
 	nfs.Handler
+	mu              sync.Mutex
 	activeHandles   *lru.Cache[uuid.UUID, entry]
 	reverseHandles  map[string][]uuid.UUID
 	activeVerifiers *lru.Cache[uint64, verifier]
@@ -73,6 +81,8 @@ type entry struct {
 // but we can generalize with a stateful local cache of handed out IDs.
 func (c *CachingHandler) ToHandle(f billy.Filesystem, path []string) []byte {
 	joinedPath := f.Join(path...)
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
 	if isRoot(path) {
 		if id, ok := c.rootByPath[joinedPath]; ok {
@@ -119,6 +129,8 @@ func (c *CachingHandler) FromHandle(fh []byte) (billy.Filesystem, []string, erro
 	if err != nil {
 		return nil, []string{}, err
 	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
 	if entry, ok := c.rootHandles[id]; ok {
 		newP := make([]string, len(entry.p))
@@ -187,6 +199,8 @@ func (c *CachingHandler) evictReverseCache(path string, handle uuid.UUID) {
 func (c *CachingHandler) InvalidateHandle(fs billy.Filesystem, handle []byte) error {
 	//Remove from cache
 	id, _ := uuid.FromBytes(handle)
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	entry, ok := c.activeHandles.Get(id)
 	if ok {
 		rk := entry.f.Join(entry.p...)
