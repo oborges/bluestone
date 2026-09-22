@@ -47,6 +47,14 @@ type WriteSession struct {
 	// truncation only adds zeros and does not set it; truncating to zero
 	// clears it.
 	written bool
+	// uploadReaders counts upload snapshots still reading the staging file
+	// File addresses. Changing the file while any are outstanding first moves
+	// the session to a new staging file (see detachFromUploadsLocked), so an
+	// upload never sees its bytes truncated or rewritten.
+	uploadReaders int
+	// fileGeneration increments whenever the session moves to a new staging
+	// file, so snapshots of the old one release against the right counter.
+	fileGeneration uint64
 }
 
 // NewWriteSession creates a new write session
@@ -232,6 +240,19 @@ func (ws *WriteSession) Rekey(newPath, newStagingPath string) {
 	ws.StagingPath = newStagingPath
 }
 
+// moveStagingFile runs move, which renames the staging file to
+// newStagingPath, and points the session there, with no change to the file
+// possible in between.
+func (ws *WriteSession) moveStagingFile(newStagingPath string, move func() error) error {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+	if err := move(); err != nil {
+		return err
+	}
+	ws.StagingPath = newStagingPath
+	return nil
+}
+
 // Write writes data to the staging file at the specified offset
 func (ws *WriteSession) Write(data []byte, offset int64) (int, error) {
 	currentSize := ws.GetSize()
@@ -248,6 +269,10 @@ func (ws *WriteSession) Write(data []byte, offset int64) (int, error) {
 
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
+
+	if err := ws.detachFromUploadsLocked(ws.Size); err != nil {
+		return 0, err
+	}
 
 	// Seek to offset
 	if _, err := ws.File.Seek(offset, 0); err != nil {
@@ -403,6 +428,10 @@ func (ws *WriteSession) Truncate(size int64) error {
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
 
+	if err := ws.detachFromUploadsLocked(min(size, ws.Size)); err != nil {
+		return err
+	}
+
 	// Truncate the file
 	if err := ws.File.Truncate(size); err != nil {
 		return fmt.Errorf("failed to truncate: %w", err)
@@ -436,6 +465,12 @@ func (ws *WriteSession) Prefetch(fetcher func() error) error {
 
 	if ws.Prefetched {
 		return nil
+	}
+
+	// The fetcher rewrites the staging file from its path, replacing
+	// whatever it holds.
+	if err := ws.detachFromUploadsLocked(0); err != nil {
+		return err
 	}
 
 	if err := fetcher(); err != nil {

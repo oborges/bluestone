@@ -397,21 +397,18 @@ func (sw *SyncWorker) syncFileLocked(path string, workerID int) error {
 		snapshotLastModified = metadata.LastModified
 	}
 
-	// Sync the session (flushes to staging file)
-	if err := session.Sync(); err != nil {
-		return fmt.Errorf("failed to sync session: %w", err)
+	// Flush the session and open its staged bytes. The snapshot's file does
+	// not change while the upload reads it: writing to or truncating the
+	// session meanwhile moves the session to a new staging file.
+	snapshot, err := session.OpenUploadSnapshot()
+	if err != nil {
+		return fmt.Errorf("failed to open staged bytes: %w", err)
 	}
-	stagingPath, size, _, _, _, _, lastWrite, multipartPartSize := session.Snapshot()
+	defer snapshot.Close()
+	file, size, lastWrite, multipartPartSize := snapshot.File, snapshot.Size, snapshot.LastWrite, snapshot.PartSize
 	if multipartPartSize <= 0 {
 		multipartPartSize = 20 * 1024 * 1024
 	}
-
-	// Read staging file using file stream to prevent OOM on large files
-	file, err := os.Open(stagingPath)
-	if err != nil {
-		return fmt.Errorf("failed to open staging file: %w", err)
-	}
-	defer file.Close()
 
 	if size >= multipartPartSize {
 		// Upload with every attribute the staged file carries, not just mode
@@ -441,12 +438,7 @@ func (sw *SyncWorker) syncFileLocked(path string, workerID int) error {
 		}
 	} else {
 		uploadStart := time.Now()
-		var monolithicReader io.ReadSeeker = file
-		mmapReader, err := NewMMapReader(file, 0, size)
-		if err == nil && size > 0 {
-			defer mmapReader.Close()
-			monolithicReader = mmapReader
-		}
+		monolithicReader := io.NewSectionReader(file, 0, size)
 
 		// Upload with every attribute the staged file carries, not just mode
 		// and owner: the upload replaces the object's metadata.
@@ -567,10 +559,11 @@ func (sw *SyncWorker) uploadMultipartOnce(path string, file *os.File, size, part
 			currentPartSize = remaining
 		}
 
-		uploadReader, closeReader := sw.multipartPartReader(file, offset, currentPartSize)
+		// Parts are read with pread rather than mmap: a mapping faults
+		// (SIGBUS, which kills the process) if the file ever shrinks under it.
+		uploadReader := io.NewSectionReader(file, offset, currentPartSize)
 		partStart := time.Now()
 		etag, err := sw.cosClient.UploadPart(sw.ctx, path, uploadID, partNumber, uploadReader)
-		closeReader()
 		if err != nil {
 			abortReason = fmt.Sprintf("upload_part_failed part=%d", partNumber)
 			sw.logMultipartEvent("error", path, uploadID, "active", workerID, partNumber, currentPartSize, "", abortReason, err)
@@ -603,14 +596,6 @@ func (sw *SyncWorker) uploadMultipartOnce(path string, file *os.File, size, part
 	completed = true
 	sw.logMultipartEvent("complete", path, uploadID, "completed", workerID, 0, size, "", fmt.Sprintf("parts=%d", len(completedParts)), nil)
 	return nil
-}
-
-func (sw *SyncWorker) multipartPartReader(file *os.File, offset, size int64) (io.ReadSeeker, func()) {
-	mmapReader, err := NewMMapReader(file, offset, size)
-	if err == nil {
-		return mmapReader, func() { _ = mmapReader.Close() }
-	}
-	return io.NewSectionReader(file, offset, size), func() {}
 }
 
 func (sw *SyncWorker) logMultipartEvent(event, path, uploadID, state string, workerID int, partNumber, partSize int64, etag, reason string, err error) {
