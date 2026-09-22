@@ -60,6 +60,9 @@ type changeFeed struct {
 	mu   sync.RWMutex
 	subs map[int]func(Change)
 	next int
+	// dirTimes follows the changes to give directories new modification
+	// times.
+	dirTimes dirTimes
 }
 
 // SubscribeChanges calls fn with every change made through the filesystem,
@@ -86,12 +89,13 @@ func (fs *Filesystem) SubscribeChanges(fn func(Change)) (cancel func()) {
 	}
 }
 
-// publish passes a change to the subscribers. With none, it costs a read
-// lock.
+// publish records a change's effect on directory times and passes it to the
+// subscribers. With none, it costs a read lock.
 func (feed *changeFeed) publish(c Change) {
 	if feed == nil {
 		return
 	}
+	feed.dirTimes.record(c)
 	feed.mu.RLock()
 	defer feed.mu.RUnlock()
 	for _, fn := range feed.subs {
@@ -145,10 +149,8 @@ func (fs *Filesystem) Rename(oldpath, newpath string) error {
 	if err := fs.rename(oldpath, newpath); err != nil {
 		return err
 	}
-	if fs.changes.active() {
-		newFull := fs.keyPath(newpath)
-		fs.changed(Change{Action: ChangeRenamed, Path: newFull, OldPath: oldFull, IsDir: fs.isDirPath(newFull)})
-	}
+	newFull := fs.keyPath(newpath)
+	fs.changed(Change{Action: ChangeRenamed, Path: newFull, OldPath: oldFull, IsDir: fs.changes.active() && fs.isDirPath(newFull)})
 	return nil
 }
 
@@ -183,9 +185,9 @@ func (fs *Filesystem) SetAttributes(name string, update posix.AttributeUpdate) e
 	if update.Streams != nil {
 		kind |= ChangeStreams
 	}
-	if kind != 0 && fs.changes.active() {
+	if kind != 0 {
 		fullPath := fs.keyPath(name)
-		fs.changed(Change{Action: ChangeModified, Path: fullPath, IsDir: fs.isDirPath(fullPath), Kind: kind})
+		fs.changed(Change{Action: ChangeModified, Path: fullPath, IsDir: fs.changes.active() && fs.isDirPath(fullPath), Kind: kind})
 	}
 	return nil
 }

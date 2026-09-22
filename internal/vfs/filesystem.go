@@ -529,11 +529,12 @@ func isReservedPath(fullPath string) bool {
 
 // Stat returns file information
 func (fs *Filesystem) Stat(filename string) (os.FileInfo, error) {
-	info, err := fs.statPath(fs.keyPath(filename), filename)
+	fullPath := fs.keyPath(filename)
+	info, err := fs.statPath(fullPath, filename)
 	if err != nil {
 		return nil, err
 	}
-	return fs.presentEntry(info), nil
+	return fs.presentEntry(fs.withDirTime(fullPath, info)), nil
 }
 
 // statPath answers Stat for a resolved key path.
@@ -1206,6 +1207,9 @@ func (fs *Filesystem) ReadDir(path string) ([]os.FileInfo, error) {
 			"entries", len(entries))
 	}
 
+	for i, entry := range result {
+		result[i] = fs.withDirTime(fs.Join(fullPath, entry.Name()), entry)
+	}
 	return fs.presentEntries(result), nil
 }
 
