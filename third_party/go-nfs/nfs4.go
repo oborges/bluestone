@@ -64,6 +64,7 @@ const (
 	nfs4ErrAttrNotSupp       nfs4Status = 10032
 	nfs4ErrNoGrace           nfs4Status = 10033
 	nfs4ErrBadXDR            nfs4Status = 10036
+	nfs4ErrBadOwner          nfs4Status = 10039
 	nfs4ErrOpenMode          nfs4Status = 10038
 	nfs4ErrBadName           nfs4Status = 10041
 	nfs4ErrOpIllegal         nfs4Status = 10044
@@ -243,7 +244,7 @@ var (
 		fattr4MountedOnFileID,
 	}
 	nfs4SupportedAttrBitmap = bitmapFromAttrs(nfs4SupportedAttrIDs...)
-	nfs4WriteAttrIDs        = []uint32{fattr4Size, fattr4Mode, fattr4TimeAccessSet, fattr4TimeModifySet}
+	nfs4WriteAttrIDs        = []uint32{fattr4Size, fattr4Mode, fattr4Owner, fattr4OwnerGroup, fattr4TimeAccessSet, fattr4TimeModifySet}
 )
 
 func init() {
@@ -490,6 +491,14 @@ func nfs4OpCreate(rd *nfs4Reader, wr *nfs4Writer, userHandle Handler, state *nfs
 	before := nfs4ChangeID(parent.fs, parent.path)
 	if err := parent.fs.MkdirAll(fullPath, attrs.attrs.Mode(0777)); err != nil {
 		return mapErrToNFS4Status(err)
+	}
+	if attrs.attrs.SetUID != nil || attrs.attrs.SetGID != nil {
+		// The reply lists the attributes as set, so an owner asked for is
+		// applied too, not only the mode.
+		owner := SetFileAttributes{SetUID: attrs.attrs.SetUID, SetGID: attrs.attrs.SetGID}
+		if err := owner.Apply(userHandle.Change(parent.fs), parent.fs, fullPath); err != nil {
+			return mapErrToNFS4Status(err)
+		}
 	}
 	after := nfs4ChangeID(parent.fs, parent.path)
 	childHandle := userHandle.ToHandle(parent.fs, childPath)
@@ -1314,6 +1323,20 @@ func readNFSv4SetAttrs(rd *nfs4Reader) (nfs4SetAttrs, nfs4Status) {
 				return nfs4SetAttrs{}, nfs4ErrBadXDR
 			}
 			attrs.attrs.SetMode = &mode
+		case fattr4Owner, fattr4OwnerGroup:
+			raw, err := attrReader.readOpaque(nfs4OpaqueLimit)
+			if err != nil {
+				return nfs4SetAttrs{}, nfs4ErrBadXDR
+			}
+			id, ok := parseNFS4Owner(string(raw))
+			if !ok {
+				return nfs4SetAttrs{}, nfs4ErrBadOwner
+			}
+			if attrID == fattr4Owner {
+				attrs.attrs.SetUID = &id
+			} else {
+				attrs.attrs.SetGID = &id
+			}
 		case fattr4TimeAccessSet:
 			tm, status := readNFSv4SetTime(attrReader)
 			if status != nfs4OK {
@@ -1329,6 +1352,21 @@ func readNFSv4SetAttrs(rd *nfs4Reader) (nfs4SetAttrs, nfs4Status) {
 		}
 	}
 	return attrs, nfs4OK
+}
+
+// parseNFS4Owner reads an owner or owner_group string. The server reports
+// owners as numeric ids, as clients using AUTH_SYS expect (RFC 7530
+// section 5.9), so it takes them back in that form; with no name service
+// to map "user@domain" names, those are refused with NFS4ERR_BADOWNER.
+func parseNFS4Owner(s string) (uint32, bool) {
+	if s == "" || len(s) > 10 {
+		return 0, false
+	}
+	id, err := strconv.ParseUint(s, 10, 32)
+	if err != nil {
+		return 0, false
+	}
+	return uint32(id), true
 }
 
 func readNFSv4SetTime(rd *nfs4Reader) (*time.Time, nfs4Status) {
