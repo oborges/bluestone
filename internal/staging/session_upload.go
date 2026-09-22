@@ -111,6 +111,12 @@ func (ws *WriteSession) detachFromUploadsLocked(keepBytes int64) error {
 		if _, err := io.CopyN(tmp, ws.File, keepBytes); err != nil {
 			return fmt.Errorf("failed to copy staging file for write during upload: %w", err)
 		}
+		// The copied bytes were durable in the old file; make them durable
+		// here before the rename replaces it, or a crash could leave the
+		// rename without the data.
+		if err := tmp.Sync(); err != nil {
+			return fmt.Errorf("failed to sync staging file for write during upload: %w", err)
+		}
 	}
 	if err := os.Rename(tmp.Name(), ws.StagingPath); err != nil {
 		return fmt.Errorf("failed to replace staging file for write during upload: %w", err)
