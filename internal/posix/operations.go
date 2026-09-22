@@ -9,6 +9,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/oborges/bluestone/internal/cache"
@@ -988,7 +989,7 @@ func (h *OperationsHandler) DeleteDirectory(ctx context.Context, path string) (e
 	}
 	if len(entries) > 0 {
 		log.Warn("Directory not empty", zap.Int("entries", len(entries)))
-		return fmt.Errorf("directory not empty")
+		return fmt.Errorf("directory not empty: %w", syscall.ENOTEMPTY)
 	}
 
 	objectKey := ToDirectoryKey(h.translator.ToObjectKey(path))
