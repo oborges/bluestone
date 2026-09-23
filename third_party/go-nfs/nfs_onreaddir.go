@@ -5,11 +5,13 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"io"
 	"io/fs"
 	"os"
 	"path"
 	"sort"
+	"syscall"
 
 	"github.com/willscott/go-nfs-client/nfs/xdr"
 )
@@ -158,10 +160,7 @@ func getDirListingWithVerifier(userHandle Handler, fsHandle []byte, verifier uin
 	// load the entries.
 	contents, err := fs.ReadDir(path)
 	if err != nil {
-		if os.IsPermission(err) {
-			return nil, 0, &NFSStatusError{NFSStatusAccess, err}
-		}
-		return nil, 0, &NFSStatusError{NFSStatusNotDir, err}
+		return nil, 0, readDirError(err)
 	}
 
 	sort.Slice(contents, func(i, j int) bool {
@@ -191,4 +190,22 @@ func hashPathAndContents(path string, contents []fs.FileInfo) uint64 {
 
 	verify := vHash.Sum(nil)[0:8]
 	return binary.BigEndian.Uint64(verify)
+}
+
+// readDirError says what went wrong listing a directory. Everything used to
+// be reported as "not a directory", which sends a client looking for a
+// problem with the path rather than with the server: a listing that is
+// refused, or that the filesystem cannot produce, is neither missing nor a
+// file.
+func readDirError(err error) error {
+	switch {
+	case os.IsNotExist(err):
+		return &NFSStatusError{NFSStatusNoEnt, err}
+	case os.IsPermission(err):
+		return &NFSStatusError{NFSStatusAccess, err}
+	case errors.Is(err, syscall.ENOTDIR):
+		return &NFSStatusError{NFSStatusNotDir, err}
+	default:
+		return &NFSStatusError{NFSStatusIO, err}
+	}
 }
