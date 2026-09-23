@@ -95,6 +95,10 @@ func (h *OperationsHandler) maxFullObjectReadBytes() int64 {
 	return int64(limitMB) * 1024 * 1024
 }
 
+// ErrDirectoryTooLarge reports a directory with more entries than
+// max_directory_entries, which the gateway will not list.
+var ErrDirectoryTooLarge = errors.New("directory has too many entries to list")
+
 func (h *OperationsHandler) maxDirectoryEntries() int {
 	if h.perfConfig != nil && h.perfConfig.MaxDirectoryEntries > 0 {
 		return h.perfConfig.MaxDirectoryEntries
@@ -1034,7 +1038,8 @@ func (h *OperationsHandler) ListDirectory(ctx context.Context, path string) (_ [
 	if entry, ok := h.metadataCache.Get(path); ok && entry.ChildEntries != nil {
 		maxEntries := h.maxDirectoryEntries()
 		if len(entry.ChildEntries) > maxEntries {
-			return nil, fmt.Errorf("cached directory listing for %s exceeds max_directory_entries=%d", path, maxEntries)
+			return nil, fmt.Errorf("cached directory listing for %s has more than max_directory_entries=%d: %w",
+				path, maxEntries, ErrDirectoryTooLarge)
 		}
 		cacheHit = true
 		metrics.RecordCacheHit("metadata")
@@ -1085,7 +1090,10 @@ fetchFromCOS:
 	cosStart := time.Now()
 	metrics.RecordCOSListObjects()
 	maxEntries := h.maxDirectoryEntries()
-	objects, err := h.cosClient.ListObjects(ctx, prefix, maxEntries+1)
+	// Two more than the limit: the directory's own marker object is listed
+	// under its prefix but is not one of its entries, and one spare entry
+	// tells a directory at the limit from one over it.
+	objects, err := h.cosClient.ListObjects(ctx, prefix, maxEntries+2)
 	if err != nil {
 		// Serve a stale listing during an object-store outage rather than
 		// failing the readdir; local staged entries are merged on top by the
@@ -1109,9 +1117,6 @@ fetchFromCOS:
 		}
 		log.Error("Failed to list directory", zap.Error(err))
 		return nil, err
-	}
-	if len(objects) > maxEntries {
-		return nil, fmt.Errorf("directory listing for %s exceeds max_directory_entries=%d", path, maxEntries)
 	}
 
 	log.Info("Got objects from COS",
@@ -1191,6 +1196,16 @@ fetchFromCOS:
 			zap.Int64("size", obj.Size))
 
 		entries = append(entries, info)
+	}
+
+	// Counted after the entries are built: the objects listed under the
+	// prefix include the directory's own marker, which is not an entry, so
+	// counting them made a directory of exactly max_directory_entries fail.
+	if len(entries) > maxEntries {
+		log.Error("Directory listing exceeds max_directory_entries",
+			zap.Int("entries", len(entries)), zap.Int("limit", maxEntries))
+		return nil, fmt.Errorf("directory listing for %s has more than max_directory_entries=%d: %w",
+			path, maxEntries, ErrDirectoryTooLarge)
 	}
 
 	// Cache the full FileInfo entries (NEW: O(1) retrieval on cache hit)
