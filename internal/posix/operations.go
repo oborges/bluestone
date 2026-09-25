@@ -253,7 +253,7 @@ func (h *OperationsHandler) Stat(ctx context.Context, path string) (_ *FileInfo,
 			}
 
 			// Fallback: construct from attributes
-			mode := os.FileMode(0644)
+			mode := DefaultAttributes(entry.IsDir).Mode
 			modTime := DefaultAttributes(entry.IsDir).Mtime
 			size := int64(0)
 			if entry.Attributes != nil {
@@ -476,7 +476,7 @@ func fileInfoFromCacheEntry(path string, entry *cache.MetadataEntry) *FileInfo {
 			return info
 		}
 	}
-	mode := os.FileMode(0644)
+	mode := DefaultAttributes(entry.IsDir).Mode
 	modTime := DefaultAttributes(entry.IsDir).Mtime
 	if entry.Attributes != nil {
 		mode = entry.Attributes.Mode

@@ -178,6 +178,14 @@ func (c *MetadataCache) SetDirEntries(path string, entries []os.FileInfo) {
 		ChildEntries: entries,
 		CachedAt:     time.Now(),
 	}
+	// The listing shares the directory's own key, so keep the stat already
+	// cached there: Stat answers from this entry too, and without it would
+	// have no mode to report.
+	if prev, ok := c.Get(path); ok && prev != nil && !prev.Negative && prev.IsDir {
+		entry.FileInfo = prev.FileInfo
+		entry.Attributes = prev.Attributes
+		entry.IsImplicit = prev.IsImplicit
+	}
 	c.cache.Set(path, entry)
 	// Only log on initial cache, not on hot path
 	if len(entries) > 50 {
