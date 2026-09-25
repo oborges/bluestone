@@ -30,7 +30,7 @@ var (
 	errBusy     = fmt.Errorf("data is syncing: %w", syscall.EBUSY)
 )
 
-func TestMapErrToNFS4Status(t *testing.T) {
+func TestNFS4StatusFromErr(t *testing.T) {
 	for _, tc := range []struct {
 		err  error
 		want nfs4Status
@@ -43,7 +43,7 @@ func TestMapErrToNFS4Status(t *testing.T) {
 		{&NFSStatusError{NFSStatusNotEmpty, nil}, nfs4ErrNotEmpty},
 		{errors.New("mystery"), nfs4ErrIO},
 	} {
-		if got := mapErrToNFS4Status(tc.err); got != tc.want {
+		if got := nfs4StatusFromErr(tc.err); got != tc.want {
 			t.Errorf("mapErrToNFS4Status(%v) = %d, want %d", tc.err, got, tc.want)
 		}
 	}
@@ -59,13 +59,8 @@ func TestNFSv4RemoveReportsNotEmptyAndDelay(t *testing.T) {
 	} {
 		fs := newOwnedFS(t)
 		fs.Filesystem = &failRemoveFS{Filesystem: fs.Filesystem, err: tc.err}
-		resp := runNFSv4As(t, fs, nil, authSys(0, 0), 2, func(req *nfs4Writer) {
-			req.writeUint32(uint32(opPutRootFH))
-			req.writeUint32(uint32(opRemove))
-			req.writeOpaque([]byte("f"))
-		})
-		assertOpStatus(t, resp, opPutRootFH)
-		if got := opStatus(t, resp, opRemove); got != tc.want {
+		got, _ := runNFSv4As(t, fs, nil, authSys(0, 0), nfs4TestOp{nfs4OpPutRootFH, nil}, nfs4TestOp{nfs4OpRemove, nfs4RemoveArgs{Name: "f"}})
+		if got != tc.want {
 			t.Errorf("REMOVE failing with %v = %d, want %d", tc.err, got, tc.want)
 		}
 	}
