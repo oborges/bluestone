@@ -100,7 +100,7 @@ func (s *Server) Start() error {
 			Handler:            s.handler,
 			EnabledNFSVersions: s.nfsVersions,
 			ConcurrentHandlers: s.concurrentHandlers,
-			Locker:             s.locker,
+			NFSv4Locker:        s.locker,
 			Permissions:        s.permissions,
 		}
 		if err := srv.Serve(s.listener); err != nil {

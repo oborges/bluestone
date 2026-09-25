@@ -6,19 +6,17 @@ import (
 	"testing"
 
 	"github.com/willscott/go-nfs-client/nfs/rpc"
+	"github.com/willscott/go-nfs-client/nfs/xdr"
 )
 
 // authSys encodes AUTH_SYS credentials as a client sends them.
 func authSys(uid, gid uint32, groups ...uint32) rpc.Auth {
-	body := bytes.NewBuffer(nil)
-	w := newNFS4Writer(body)
-	w.writeUint32(42) // stamp
-	w.writeOpaque([]byte("client"))
-	w.writeUint32(uid)
-	w.writeUint32(gid)
-	w.writeUint32(uint32(len(groups)))
-	for _, g := range groups {
-		w.writeUint32(g)
+	var body bytes.Buffer
+	if groups == nil {
+		groups = []uint32{}
+	}
+	if err := xdr.Write(&body, authSysParms{Stamp: 42, Machine: "client", UID: uid, GID: gid, Groups: groups}); err != nil {
+		panic(err)
 	}
 	return rpc.Auth{Flavor: authUnix, Body: body.Bytes()}
 }
@@ -98,39 +96,23 @@ var (
 	bob      = authSys(1001, 1001)
 )
 
-// putFile starts a compound at the root and looks name up.
-func putFile(req *nfs4Writer, name string) {
-	req.writeUint32(uint32(opPutRootFH))
-	req.writeUint32(uint32(opLookup))
-	req.writeOpaque([]byte(name))
-}
-
-func readOp(req *nfs4Writer) {
-	req.writeUint32(uint32(opRead))
-	req.writeFixedOpaque(make([]byte, 16))
-	req.writeUint64(0)
-	req.writeUint32(16)
-}
-
-func writeOp(req *nfs4Writer) {
-	req.writeUint32(uint32(opWrite))
-	req.writeFixedOpaque(make([]byte, 16))
-	req.writeUint64(0)
-	req.writeUint32(uint32(fileSync))
-	req.writeOpaque([]byte("x"))
-}
+var (
+	readOp  = nfs4TestOp{nfs4OpRead, nfs4ReadArgs{Count: 16}}
+	writeOp = nfs4TestOp{nfs4OpWrite, nfs4WriteArgs{Stable: uint32(fileSync), Data: []byte("x")}}
+)
 
 // thirdOpStatus runs a three-op compound (PUTROOTFH, LOOKUP name, op) as
 // cred and returns the last op's status.
-func thirdOpStatus(t *testing.T, fs *ownedFS, perms *Permissions, cred rpc.Auth, name string, op nfs4Op, build func(*nfs4Writer)) nfs4Status {
+func thirdOpStatus(t *testing.T, fs *ownedFS, perms *Permissions, cred rpc.Auth, name string, op nfs4TestOp) nfs4Status {
 	t.Helper()
-	resp := runNFSv4As(t, fs, perms, cred, 3, func(req *nfs4Writer) {
-		putFile(req, name)
-		build(req)
-	})
-	assertOpStatus(t, resp, opPutRootFH)
-	assertOpStatus(t, resp, opLookup)
-	return opStatus(t, resp, op)
+	_, resp := runNFSv4As(t, fs, perms, cred, append(putFile(name), op)...)
+	nfs4ExpectOp(t, resp, nfs4OpPutRootFH, nfs4OK, nil)
+	nfs4ExpectOp(t, resp, nfs4OpLookup, nfs4OK, nil)
+	var header nfs4ResultHeader
+	if err := xdr.Read(resp, &header); err != nil || header.Op != op.op {
+		t.Fatalf("result = %+v, %v; want op %d", header, err, op.op)
+	}
+	return header.Status
 }
 
 func TestNFSv4DataPermissions(t *testing.T) {
@@ -139,120 +121,98 @@ func TestNFSv4DataPermissions(t *testing.T) {
 		perms *Permissions
 		cred  rpc.Auth
 		file  string
-		op    nfs4Op
-		build func(*nfs4Writer)
+		op    nfs4TestOp
 		want  nfs4Status
 	}{
-		{"read a world-readable file", enforced, bob, "f", opRead, readOp, nfs4OK},
-		{"read another user's private file", enforced, bob, "secret", opRead, readOp, nfs4ErrAccess},
-		{"write another user's file", enforced, bob, "f", opWrite, writeOp, nfs4ErrAccess},
-		{"owner writes their read-only file", enforced, bob, "mine", opWrite, writeOp, nfs4OK},
-		{"root reads anything", enforced, authSys(0, 0), "secret", opRead, readOp, nfs4OK},
-		{"squashed root reads as nobody", &Permissions{RootSquash: true}, authSys(0, 0), "secret", opRead, readOp, nfs4ErrAccess},
-		{"no credentials act as nobody", enforced, rpc.Auth{}, "secret", opRead, readOp, nfs4ErrAccess},
-		{"without enforcement anyone writes", nil, bob, "f", opWrite, writeOp, nfs4OK},
+		{"read a world-readable file", enforced, bob, "f", readOp, nfs4OK},
+		{"read another user's private file", enforced, bob, "secret", readOp, nfs4ErrAccess},
+		{"write another user's file", enforced, bob, "f", writeOp, nfs4ErrAccess},
+		{"owner writes their read-only file", enforced, bob, "mine", writeOp, nfs4OK},
+		{"root reads anything", enforced, authSys(0, 0), "secret", readOp, nfs4OK},
+		{"squashed root reads as nobody", &Permissions{RootSquash: true}, authSys(0, 0), "secret", readOp, nfs4ErrAccess},
+		{"no credentials act as nobody", enforced, rpc.Auth{}, "secret", readOp, nfs4ErrAccess},
+		{"without enforcement anyone writes", nil, bob, "f", writeOp, nfs4OK},
 	} {
-		if got := thirdOpStatus(t, permFS(t), tc.perms, tc.cred, tc.file, tc.op, tc.build); got != tc.want {
+		if got := thirdOpStatus(t, permFS(t), tc.perms, tc.cred, tc.file, tc.op); got != tc.want {
 			t.Errorf("%s: status %d, want %d", tc.name, got, tc.want)
 		}
 	}
 }
 
-// openCreate is an OPEN that creates name in the current directory.
-func openCreate(name string) func(*nfs4Writer) {
-	return func(req *nfs4Writer) {
-		req.writeUint32(uint32(opOpen))
-		req.writeUint32(0)                                            // seqid
-		req.writeUint32(open4ShareAccessRead | open4ShareAccessWrite) // share_access
-		req.writeUint32(open4ShareDenyNone)
-		req.writeUint64(1)             // clientid
-		req.writeOpaque([]byte("own")) // owner
-		req.writeUint32(open4Create)
-		req.writeUint32(open4Unchecked)
-		writeBitmap(req, nil)
-		req.writeOpaque(nil)
-		req.writeUint32(claimNull)
-		req.writeOpaque([]byte(name))
+// openOp is an OPEN of name in the current directory, creating it if
+// create is set.
+func openOp(name string, access uint32, create bool) nfs4TestOp {
+	args := nfs4OpenArgs{
+		ShareAccess: access,
+		Owner:       nfs4Owner{ClientID: 1, Owner: "own"},
+		Claim:       nfs4ClaimNull,
+		File:        name,
 	}
+	if create {
+		args.OpenType = nfs4OpenCreate
+		args.How = nfs4CreateHow{Mode: nfs4CreateUnchecked}
+	}
+	return nfs4TestOp{nfs4OpOpen, args}
 }
 
 func TestNFSv4CreatePermissions(t *testing.T) {
 	fs := permFS(t)
-	if got := thirdOpStatus(t, fs, enforced, bob, "closed", opOpen, openCreate("new")); got != nfs4ErrAccess {
+	readWrite := nfs4ShareAccessRead | nfs4ShareAccessWrite
+	if got := thirdOpStatus(t, fs, enforced, bob, "closed", openOp("new", readWrite, true)); got != nfs4ErrAccess {
 		t.Errorf("create in a directory bob may not write: status %d, want NFS4ERR_ACCESS", got)
 	}
-	if got := thirdOpStatus(t, fs, enforced, bob, "shared", opOpen, openCreate("new")); got != nfs4OK {
+	if got := thirdOpStatus(t, fs, enforced, bob, "shared", openOp("new", readWrite, true)); got != nfs4OK {
 		t.Fatalf("create in a world-writable directory: status %d", got)
 	}
 	if owner := fs.owners["/shared/new"]; owner != [2]uint32{1001, 1001} {
 		t.Errorf("new file owned by %v, want its creator 1001:1001", owner)
 	}
-	remove := func(req *nfs4Writer) {
-		req.writeUint32(uint32(opRemove))
-		req.writeOpaque([]byte("x"))
-	}
-	if got := thirdOpStatus(t, fs, enforced, bob, "closed", opRemove, remove); got != nfs4ErrAccess {
+	remove := nfs4TestOp{nfs4OpRemove, nfs4RemoveArgs{Name: "x"}}
+	if got := thirdOpStatus(t, fs, enforced, bob, "closed", remove); got != nfs4ErrAccess {
 		t.Errorf("remove from a directory bob may not write: status %d, want NFS4ERR_ACCESS", got)
 	}
 	// Opening an existing file checks its mode, with no exception for the
 	// owner: bob's read-only file cannot be opened for writing.
-	openExisting := func(req *nfs4Writer) {
-		req.writeUint32(uint32(opOpen))
-		req.writeUint32(0)
-		req.writeUint32(open4ShareAccessWrite)
-		req.writeUint32(open4ShareDenyNone)
-		req.writeUint64(1)
-		req.writeOpaque([]byte("own"))
-		req.writeUint32(open4NoCreate)
-		req.writeUint32(claimNull)
-		req.writeOpaque([]byte("mine"))
-	}
-	resp := runNFSv4As(t, fs, enforced, bob, 2, func(req *nfs4Writer) {
-		req.writeUint32(uint32(opPutRootFH))
-		openExisting(req)
-	})
-	assertOpStatus(t, resp, opPutRootFH)
-	if got := opStatus(t, resp, opOpen); got != nfs4ErrAccess {
-		t.Errorf("open bob's 0444 file for writing: status %d, want NFS4ERR_ACCESS", got)
+	status, _ := runNFSv4As(t, fs, enforced, bob, nfs4TestOp{nfs4OpPutRootFH, nil}, openOp("mine", nfs4ShareAccessWrite, false))
+	if status != nfs4ErrAccess {
+		t.Errorf("open bob's 0444 file for writing: status %d, want NFS4ERR_ACCESS", status)
 	}
 }
 
-// setAttrOp writes a SETATTR of mode and/or owner.
-func setAttrOp(mode *uint32, owner string) func(*nfs4Writer) {
-	return func(req *nfs4Writer) {
-		req.writeUint32(uint32(opSetAttr))
-		req.writeFixedOpaque(make([]byte, 16))
-		vals := bytes.NewBuffer(nil)
-		vw := newNFS4Writer(vals)
-		attrs := []uint32{}
-		if mode != nil {
-			attrs = append(attrs, fattr4Mode)
-			vw.writeUint32(*mode)
+// setAttrOp is a SETATTR of mode and/or owner.
+func setAttrOp(t *testing.T, mode *uint32, owner string) nfs4TestOp {
+	var vals bytes.Buffer
+	var mask nfs4Bitmap
+	if mode != nil {
+		mask.set(nfs4AttrMode)
+		if err := xdr.Write(&vals, *mode); err != nil {
+			t.Fatal(err)
 		}
-		if owner != "" {
-			attrs = append(attrs, fattr4Owner)
-			vw.writeOpaque([]byte(owner))
-		}
-		writeBitmap(req, bitmapFromAttrs(attrs...))
-		req.writeOpaque(vals.Bytes())
 	}
+	if owner != "" {
+		mask.set(nfs4AttrOwner)
+		if err := xdr.Write(&vals, owner); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return nfs4TestOp{nfs4OpSetAttr, nfs4SetAttrArgs{Attrs: nfs4FAttr{Mask: mask, Vals: vals.Bytes()}}}
 }
 
 func TestNFSv4SetAttrPermissions(t *testing.T) {
 	mode := uint32(0o600)
 	for _, tc := range []struct {
-		name  string
-		cred  rpc.Auth
-		file  string
-		build func(*nfs4Writer)
-		want  nfs4Status
+		name string
+		cred rpc.Auth
+		file string
+		op   nfs4TestOp
+		want nfs4Status
 	}{
-		{"chmod another user's file", bob, "f", setAttrOp(&mode, ""), nfs4ErrPerm},
-		{"chmod your own file", bob, "mine", setAttrOp(&mode, ""), nfs4OK},
-		{"give your file away", bob, "mine", setAttrOp(nil, "1000"), nfs4ErrPerm},
-		{"root gives a file away", authSys(0, 0), "f", setAttrOp(nil, "1001"), nfs4OK},
+		{"chmod another user's file", bob, "f", setAttrOp(t, &mode, ""), nfs4ErrPerm},
+		{"chmod your own file", bob, "mine", setAttrOp(t, &mode, ""), nfs4OK},
+		{"give your file away", bob, "mine", setAttrOp(t, nil, "1000"), nfs4ErrPerm},
+		{"root gives a file away", authSys(0, 0), "f", setAttrOp(t, nil, "1001"), nfs4OK},
 	} {
-		if got := thirdOpStatus(t, permFS(t), enforced, tc.cred, tc.file, opSetAttr, tc.build); got != tc.want {
+		if got := thirdOpStatus(t, permFS(t), enforced, tc.cred, tc.file, tc.op); got != tc.want {
 			t.Errorf("%s: status %d, want %d", tc.name, got, tc.want)
 		}
 	}
@@ -260,34 +220,24 @@ func TestNFSv4SetAttrPermissions(t *testing.T) {
 
 // ACCESS reports what the caller may actually do.
 func TestNFSv4AccessReportsPermissions(t *testing.T) {
-	const all = access4Read | access4Lookup | access4Modify | access4Extend | access4Delete | access4Execute
+	const all = nfs4AccessRead | nfs4AccessLookup | nfs4AccessModify | nfs4AccessExtend | nfs4AccessDelete | nfs4AccessExecute
 	for _, tc := range []struct {
 		file string
 		want uint32
 	}{
-		{"f", access4Read},
+		{"f", nfs4AccessRead},
 		{"secret", 0},
-		{"mine", access4Read},
-		{"shared", access4Read | access4Lookup | access4Modify | access4Extend | access4Delete},
-		{"closed", access4Read | access4Lookup},
+		{"mine", nfs4AccessRead},
+		{"shared", nfs4AccessRead | nfs4AccessLookup | nfs4AccessModify | nfs4AccessExtend | nfs4AccessDelete},
+		{"closed", nfs4AccessRead | nfs4AccessLookup},
 	} {
-		resp := runNFSv4As(t, permFS(t), enforced, bob, 3, func(req *nfs4Writer) {
-			putFile(req, tc.file)
-			req.writeUint32(uint32(opAccess))
-			req.writeUint32(all)
-		})
-		assertOpStatus(t, resp, opPutRootFH)
-		assertOpStatus(t, resp, opLookup)
-		assertOpStatus(t, resp, opAccess)
-		if _, err := resp.readUint32(); err != nil { // supported
-			t.Fatal(err)
-		}
-		granted, err := resp.readUint32()
-		if err != nil {
-			t.Fatal(err)
-		}
-		if granted != tc.want {
-			t.Errorf("ACCESS on %s: %#x, want %#x", tc.file, granted, tc.want)
+		_, resp := runNFSv4As(t, permFS(t), enforced, bob, append(putFile(tc.file), nfs4TestOp{nfs4OpAccess, nfs4AccessArgs{Access: all}})...)
+		nfs4ExpectOp(t, resp, nfs4OpPutRootFH, nfs4OK, nil)
+		nfs4ExpectOp(t, resp, nfs4OpLookup, nfs4OK, nil)
+		var res nfs4AccessRes
+		nfs4ExpectOp(t, resp, nfs4OpAccess, nfs4OK, &res)
+		if res.Access != tc.want {
+			t.Errorf("ACCESS on %s: %#x, want %#x", tc.file, res.Access, tc.want)
 		}
 	}
 }
