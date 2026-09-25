@@ -2,7 +2,7 @@ package nfs
 
 import (
 	"bytes"
-	"context"
+	"io"
 	"os"
 	"strconv"
 	"testing"
@@ -10,6 +10,7 @@ import (
 
 	"github.com/go-git/go-billy/v5"
 	"github.com/willscott/go-nfs-client/nfs/rpc"
+	"github.com/willscott/go-nfs-client/nfs/xdr"
 	"github.com/willscott/go-nfs/helpers/memfs"
 )
 
@@ -91,117 +92,62 @@ func newOwnedFS(t *testing.T) *ownedFS {
 	return &ownedFS{Filesystem: fs, owners: map[string][2]uint32{"/f": {1000, 1000}}}
 }
 
-// runNFSv4 sends one compound and returns a reader at its first result.
-func runNFSv4(t *testing.T, fs billy.Filesystem, ops uint32, build func(req *nfs4Writer)) *nfs4Reader {
-	t.Helper()
-	return runNFSv4As(t, fs, nil, rpc.Auth{}, ops, build)
-}
-
-// runNFSv4As sends one compound with the given credentials to a server
-// enforcing perms (nil for none).
-func runNFSv4As(t *testing.T, fs billy.Filesystem, perms *Permissions, cred rpc.Auth, ops uint32, build func(req *nfs4Writer)) *nfs4Reader {
+// runNFSv4As sends ops as one compound with the given credentials to a
+// server enforcing perms (nil for none), and returns the compound status and
+// a reader at its first result.
+func runNFSv4As(t *testing.T, fs billy.Filesystem, perms *Permissions, cred rpc.Auth, ops ...nfs4TestOp) (nfs4Status, io.Reader) {
 	t.Helper()
 	handler := newNFSv4TestHandler(fs)
 	srv := &Server{Handler: handler, ID: [8]byte{1}, Permissions: perms}
-	body := bytes.NewBuffer(nil)
-	req := newNFS4Writer(body)
-	req.writeOpaque(nil)
-	req.writeUint32(0)
-	req.writeUint32(ops)
-	build(req)
-	w := &response{
-		conn:     &conn{Server: srv},
-		req:      &request{xid: 1, Header: rpc.Header{Cred: cred}, Body: bytes.NewReader(body.Bytes())},
-		errorFmt: basicErrorFormatter,
-		writer:   bytes.NewBuffer(nil),
-	}
-	if err := onNFSv4Compound(context.Background(), w, handler); err != nil {
-		t.Fatalf("compound: %v", err)
-	}
-	resp := newNFS4Reader(bytes.NewReader(w.writer.Bytes()))
-	for i := 0; i < 4; i++ { // xid, message type, reply state, auth flavor
-		if _, err := resp.readUint32(); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if _, err := resp.readOpaque(nfs4OpaqueLimit); err != nil { // verifier
-		t.Fatal(err)
-	}
-	if _, err := resp.readUint32(); err != nil { // accept status
-		t.Fatal(err)
-	}
-	if _, err := resp.readUint32(); err != nil { // compound status
-		t.Fatal(err)
-	}
-	if _, err := resp.readOpaque(nfs4OpaqueLimit); err != nil { // tag
-		t.Fatal(err)
-	}
-	if _, err := resp.readUint32(); err != nil { // result count
-		t.Fatal(err)
-	}
-	return resp
+	req := &request{xid: 1, Header: rpc.Header{Cred: cred}, Body: bytes.NewReader(nfs4CompoundRequest(t, ops...))}
+	return nfs4CompoundReply(t, srv, handler, req)
 }
 
-// writeOwnerAttrs writes an fattr4 setting owner and owner_group.
-func writeOwnerAttrs(req *nfs4Writer, owner, group string) {
-	writeBitmap(req, bitmapFromAttrs(fattr4Owner, fattr4OwnerGroup))
-	vals := bytes.NewBuffer(nil)
-	vw := newNFS4Writer(vals)
-	vw.writeOpaque([]byte(owner))
-	vw.writeOpaque([]byte(group))
-	req.writeOpaque(vals.Bytes())
-}
-
-func opStatus(t *testing.T, resp *nfs4Reader, want nfs4Op) nfs4Status {
+// ownerAttrs is an fattr4 setting owner and owner_group.
+func ownerAttrs(t *testing.T, owner, group string) nfs4FAttr {
 	t.Helper()
-	op, err := resp.readUint32()
-	if err != nil || nfs4Op(op) != want {
-		t.Fatalf("op = %d, %v; want %d", op, err, want)
-	}
-	status, err := resp.readUint32()
-	if err != nil {
+	var vals bytes.Buffer
+	if err := xdr.Write(&vals, [2]string{owner, group}); err != nil {
 		t.Fatal(err)
 	}
-	return nfs4Status(status)
+	return nfs4FAttr{Mask: nfs4BitmapOf(nfs4AttrOwner, nfs4AttrOwnerGroup), Vals: vals.Bytes()}
+}
+
+// putFile starts a compound at the root and looks name up.
+func putFile(name string) []nfs4TestOp {
+	return []nfs4TestOp{{nfs4OpPutRootFH, nil}, {nfs4OpLookup, nfs4LookupArgs{Name: name}}}
 }
 
 // SETATTR changes a file's owner and group, given as numeric ids, and
 // GETATTR then reports them.
 func TestNFSv4SetAttrOwner(t *testing.T) {
 	fs := newOwnedFS(t)
-	resp := runNFSv4(t, fs, 4, func(req *nfs4Writer) {
-		req.writeUint32(uint32(opPutRootFH))
-		req.writeUint32(uint32(opLookup))
-		req.writeOpaque([]byte("f"))
-		req.writeUint32(uint32(opSetAttr))
-		req.writeFixedOpaque(make([]byte, 16))
-		writeOwnerAttrs(req, "1234", "5678")
-		req.writeUint32(uint32(opGetAttr))
-		writeBitmap(req, bitmapFromAttrs(fattr4Owner, fattr4OwnerGroup))
-	})
-	assertOpStatus(t, resp, opPutRootFH)
-	assertOpStatus(t, resp, opLookup)
-	assertOpStatus(t, resp, opSetAttr)
-	set, err := resp.readBitmap()
-	if err != nil || !bitmapHas(set, fattr4Owner) || !bitmapHas(set, fattr4OwnerGroup) {
-		t.Fatalf("attributes set = %v, %v; want owner and owner_group", set, err)
+	ops := append(putFile("f"),
+		nfs4TestOp{nfs4OpSetAttr, nfs4SetAttrArgs{Attrs: ownerAttrs(t, "1234", "5678")}},
+		nfs4TestOp{nfs4OpGetAttr, nfs4GetAttrArgs{Request: nfs4BitmapOf(nfs4AttrOwner, nfs4AttrOwnerGroup)}},
+	)
+	status, resp := runNFSv4As(t, fs, nil, rpc.Auth{}, ops...)
+	if status != nfs4OK {
+		t.Fatalf("status %d", status)
+	}
+	nfs4ExpectOp(t, resp, nfs4OpPutRootFH, nfs4OK, nil)
+	nfs4ExpectOp(t, resp, nfs4OpLookup, nfs4OK, nil)
+	var set nfs4Bitmap
+	nfs4ExpectOp(t, resp, nfs4OpSetAttr, nfs4OK, &set)
+	if !set.has(nfs4AttrOwner) || !set.has(nfs4AttrOwnerGroup) {
+		t.Fatalf("attributes set = %v, want owner and owner_group", set)
 	}
 	if got := fs.owners["/f"]; got != [2]uint32{1234, 5678} {
 		t.Fatalf("stored owner %v, want [1234 5678]", got)
 	}
-	assertOpStatus(t, resp, opGetAttr)
-	if _, err := resp.readBitmap(); err != nil {
+	var attrs nfs4FAttr
+	nfs4ExpectOp(t, resp, nfs4OpGetAttr, nfs4OK, &attrs)
+	var got [2]string
+	if err := xdr.Read(bytes.NewReader(attrs.Vals), &got); err != nil {
 		t.Fatal(err)
 	}
-	vals, err := resp.readOpaque(1024)
-	if err != nil {
-		t.Fatal(err)
-	}
-	vr := newNFS4Reader(bytes.NewReader(vals))
-	owner, _ := vr.readOpaque(64)
-	group, _ := vr.readOpaque(64)
-	if string(owner) != "1234" || string(group) != "5678" {
-		t.Fatalf("GETATTR owner %q group %q, want 1234 and 5678", owner, group)
+	if got != [2]string{"1234", "5678"} {
+		t.Fatalf("GETATTR owner and group %q, want 1234 and 5678", got)
 	}
 }
 
@@ -210,17 +156,8 @@ func TestNFSv4SetAttrOwner(t *testing.T) {
 func TestNFSv4SetAttrBadOwner(t *testing.T) {
 	for _, owner := range []string{"alice@example.com", "", "-1", "4294967296", "12a"} {
 		fs := newOwnedFS(t)
-		resp := runNFSv4(t, fs, 3, func(req *nfs4Writer) {
-			req.writeUint32(uint32(opPutRootFH))
-			req.writeUint32(uint32(opLookup))
-			req.writeOpaque([]byte("f"))
-			req.writeUint32(uint32(opSetAttr))
-			req.writeFixedOpaque(make([]byte, 16))
-			writeOwnerAttrs(req, owner, "5678")
-		})
-		assertOpStatus(t, resp, opPutRootFH)
-		assertOpStatus(t, resp, opLookup)
-		if status := opStatus(t, resp, opSetAttr); status != nfs4ErrBadOwner {
+		ops := append(putFile("f"), nfs4TestOp{nfs4OpSetAttr, nfs4SetAttrArgs{Attrs: ownerAttrs(t, owner, "5678")}})
+		if status, _ := runNFSv4As(t, fs, nil, rpc.Auth{}, ops...); status != nfs4ErrBadOwner {
 			t.Errorf("owner %q: status %d, want NFS4ERR_BADOWNER", owner, status)
 		}
 		if got := fs.owners["/f"]; got != [2]uint32{1000, 1000} {
@@ -232,15 +169,13 @@ func TestNFSv4SetAttrBadOwner(t *testing.T) {
 // A directory created with an owner gets it, as the reply says.
 func TestNFSv4CreateWithOwner(t *testing.T) {
 	fs := newOwnedFS(t)
-	resp := runNFSv4(t, fs, 2, func(req *nfs4Writer) {
-		req.writeUint32(uint32(opPutRootFH))
-		req.writeUint32(uint32(opCreate))
-		req.writeUint32(uint32(nf4Dir))
-		req.writeOpaque([]byte("d"))
-		writeOwnerAttrs(req, strconv.Itoa(4321), "8765")
-	})
-	assertOpStatus(t, resp, opPutRootFH)
-	assertOpStatus(t, resp, opCreate)
+	status, _ := runNFSv4As(t, fs, nil, rpc.Auth{},
+		nfs4TestOp{nfs4OpPutRootFH, nil},
+		nfs4TestOp{nfs4OpCreate, nfs4CreateArgs{Type: FileTypeDirectory, Name: "d", Attrs: ownerAttrs(t, strconv.Itoa(4321), "8765")}},
+	)
+	if status != nfs4OK {
+		t.Fatalf("CREATE: status %d", status)
+	}
 	if got := fs.owners["/d"]; got != [2]uint32{4321, 8765} {
 		t.Fatalf("new directory owner %v, want [4321 8765]", got)
 	}
