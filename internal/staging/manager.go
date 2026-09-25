@@ -1140,6 +1140,19 @@ func (sm *StagingManager) CleanupSession(path string, deleteStagingFile bool) er
 
 	sm.mu.Lock()
 	session, exists := sm.sessions[path]
+	if exists && !session.stagingPathIs(sm.stagingFilePath(path)) {
+		// A rename has already moved this session's bytes to another path
+		// and is still re-keying it under this name. Cleaning up here would
+		// close the session the rename is about to hand over and delete the
+		// destination's staged bytes, losing the file. Leave it to the
+		// rename, which owns the session now.
+		sm.mu.Unlock()
+		logging.Info("Skipping cleanup of a session a rename has moved",
+			zap.String("path", path),
+			zap.String("event", "cleanup_skip"),
+			zap.String("reason", "renamed_away"))
+		return nil
+	}
 	if exists {
 		delete(sm.sessions, path)
 	}
