@@ -240,6 +240,16 @@ func (ws *WriteSession) Rekey(newPath, newStagingPath string) {
 	ws.StagingPath = newStagingPath
 }
 
+// stagingPathIs reports whether the session's staging file is still the one
+// named here. A rename repoints a session at the destination's staging file
+// before the manager's map catches up, so a caller holding the old name can
+// use this to tell that the session has moved on.
+func (ws *WriteSession) stagingPathIs(stagingPath string) bool {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+	return ws.StagingPath == stagingPath
+}
+
 // moveStagingFile runs move, which renames the staging file to
 // newStagingPath, and points the session there, with no change to the file
 // possible in between.
