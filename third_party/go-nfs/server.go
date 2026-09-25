@@ -29,16 +29,16 @@ type Server struct {
 	// Locker holds the byte ranges behind NFSv4 LOCK, LOCKT and LOCKU.
 	// Supply a table shared with other protocol servers so locks conflict
 	// across protocols. Nil disables NFSv4 locking (NFS4ERR_NOTSUPP).
-	Locker ByteRangeLocker
+	NFSv4Locker ByteRangeLocker
 
 	// Permissions, when set, enforces POSIX file permissions for the users
 	// calls come from. Nil lets every caller do anything.
 	Permissions *Permissions
 
-	// NFSv4 lock protocol state (stateids, seqids, client leases), created
-	// on first LOCK-family or RENEW operation.
-	lockMgr     *nfs4LockManager
-	lockMgrOnce sync.Once
+	// NFSv4 protocol state (open and lock stateids, client leases),
+	// created on first use.
+	nfs4StateMgr  *nfs4StateManager
+	nfs4StateOnce sync.Once
 }
 
 // RegisterMessageHandler registers a handler for a specific NFSv3/MOUNTv3
