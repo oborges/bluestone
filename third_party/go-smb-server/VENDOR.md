@@ -397,6 +397,14 @@ proposed upstream.
 - `smb/server`: CLOSE releases the open's byte-range locks (MS-SMB2
   3.3.5.10). They stayed until the tree or session went, so a client that
   closed a file without unlocking it kept other clients, and NFS, out.
+- `smb/server`: the connection's read loop no longer polls with a 200 ms
+  read deadline. A deadline that expired partway through a frame made the
+  loop start over and read the rest of that frame as the next header, which
+  closed the connection: a large WRITE that took longer than 200 ms to
+  arrive dropped the client, failing its in-flight requests with EAGAIN or
+  ECONNABORTED. Reads now block, and the connection is closed when the
+  server's context ends. Read errors other than a hang-up are logged at warn
+  rather than debug, so a dropped connection is visible.
 
 ## Known gaps to close in Bluestone
 

@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"sync"
@@ -557,23 +558,27 @@ func (s *Server) serveConn(ctx context.Context, c net.Conn) {
 	defer cn.cleanup()
 	go cn.writeLoop()
 
+	// Reads block without a deadline, and the connection is closed when the
+	// server stops. A deadline that expired partway through a frame would
+	// leave the rest of that frame to be read as the next header, which
+	// drops the connection; a large WRITE on a busy network can easily take
+	// longer to arrive than any polling interval.
+	go func() {
+		<-connCtx.Done()
+		_ = c.Close()
+	}()
+
 	for {
-		if err := ctx.Err(); err != nil {
-			return
-		}
-		_ = cn.fc.Underlying().SetReadDeadline(time.Now().Add(200 * time.Millisecond))
 		msg, err := cn.fc.ReadMessage()
 		if err != nil {
-			var ne net.Error
-			if errors.As(err, &ne) && ne.Timeout() {
-				continue
-			}
-			if !errors.Is(err, net.ErrClosed) {
-				cn.log.Debug("read error", "err", err)
+			// A client hanging up, or the server closing the connection, is
+			// routine. Anything else ends the client's connection and fails
+			// what it had in flight, so it is worth seeing.
+			if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
+				cn.log.Warn("connection closed on read error", "remote", c.RemoteAddr().String(), "err", err)
 			}
 			return
 		}
-		_ = cn.fc.Underlying().SetReadDeadline(time.Time{})
 
 		if isSMB1Negotiate(msg) {
 			// Windows opens with an SMB1 multi-protocol negotiate listing
