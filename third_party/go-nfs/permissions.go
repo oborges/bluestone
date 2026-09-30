@@ -89,42 +89,29 @@ func credentials(w *response) (Credentials, bool) {
 	return c, true
 }
 
+// authSysParms is an authsys_parms body. The machine name is padded to
+// four bytes, which xdr.ReadOpaque would not skip; decoding the struct
+// does.
+type authSysParms struct {
+	Stamp   uint32
+	Machine string
+	UID     uint32
+	GID     uint32
+	Groups  []uint32
+}
+
 // parseAuthUnix reads an authsys_parms body: stamp, machine name, uid, gid
 // and up to 16 supplementary groups.
 func parseAuthUnix(body []byte) (Credentials, error) {
-	// The machine name is padded to four bytes, which xdr.ReadOpaque does
-	// not skip.
-	r := newNFS4Reader(bytes.NewReader(body))
-	if _, err := r.readUint32(); err != nil { // stamp
+	var p authSysParms
+	// 255 bounds the machine name; the group list is checked below.
+	if err := xdrReadLimited(bytes.NewReader(body), &p, 255); err != nil {
 		return Credentials{}, err
 	}
-	if _, err := r.readOpaque(255); err != nil { // machine name
-		return Credentials{}, err
-	}
-	uid, err := r.readUint32()
-	if err != nil {
-		return Credentials{}, err
-	}
-	gid, err := r.readUint32()
-	if err != nil {
-		return Credentials{}, err
-	}
-	count, err := r.readUint32()
-	if err != nil {
-		return Credentials{}, err
-	}
-	if count > 16 {
+	if len(p.Groups) > 16 {
 		return Credentials{}, errors.New("nfs: AUTH_SYS lists more than 16 groups")
 	}
-	c := Credentials{UID: uid, GID: gid, Groups: make([]uint32, 0, count)}
-	for i := uint32(0); i < count; i++ {
-		g, err := r.readUint32()
-		if err != nil {
-			return Credentials{}, err
-		}
-		c.Groups = append(c.Groups, g)
-	}
-	return c, nil
+	return Credentials{UID: p.UID, GID: p.GID, Groups: p.Groups}, nil
 }
 
 func (c Credentials) inGroup(gid uint32) bool {
