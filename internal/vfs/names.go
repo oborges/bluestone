@@ -136,12 +136,21 @@ func (fs *Filesystem) keyPath(name string) string {
 // whole directory for every name made each operation cost as much as the
 // directory is large: over SMB a directory of 50,000 files could not be
 // created or deleted in six hours.
+//
+// A cached listing of dir answers in memory, as it always did: that is
+// cheaper than the lookup when the name is spelled differently.
 func (fs *Filesystem) matchChild(dir, key string) string {
-	if _, err := fs.statPath(fs.Join(dir, key), key); err == nil {
-		return key
+	candidates, cached := fs.ops.CachedChildNames(dir)
+	if cached {
+		candidates = append(candidates, fs.stagedChildNames(dir)...)
+	} else {
+		if _, err := fs.statPath(fs.Join(dir, key), key); err == nil {
+			return key
+		}
+		candidates = fs.foldCandidates(dir, key)
 	}
 	match := ""
-	for _, name := range fs.foldCandidates(dir, key) {
+	for _, name := range candidates {
 		if name == key {
 			return name
 		}

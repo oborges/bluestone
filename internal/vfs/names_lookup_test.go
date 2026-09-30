@@ -25,6 +25,20 @@ type countingStore struct {
 	*fakeObjectStore
 	mu     sync.Mutex
 	listed int
+	heads  int
+}
+
+func (s *countingStore) HeadObject(ctx context.Context, key string) (*types.ObjectMetadata, error) {
+	s.mu.Lock()
+	s.heads++
+	s.mu.Unlock()
+	return s.fakeObjectStore.HeadObject(ctx, key)
+}
+
+func (s *countingStore) headCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.heads
 }
 
 func (s *countingStore) ListObjects(ctx context.Context, prefix string, maxKeys int) ([]*types.ObjectMetadata, error) {
@@ -293,5 +307,32 @@ func TestFoldPrefixesCoverEveryEqualFoldSpelling(t *testing.T) {
 	}
 	if got := foldPrefixes("f012345", maxFoldPrefixes); len(got) != 2 || got[0] != "f012345" || got[1] != "F012345" {
 		t.Errorf("foldPrefixes(f012345) = %q, want the whole name in both cases", got)
+	}
+}
+
+// Once a directory's listing is cached, a name spelled differently from the
+// entry it matches resolves from that listing without calling COS, as it
+// did before names were looked up by exact spelling first.
+func TestWindowsNamesUseACachedListing(t *testing.T) {
+	store := &countingStore{fakeObjectStore: newFakeObjectStore()}
+	store.put("big/", nil)
+	for i := 0; i < 500; i++ {
+		store.put(fmt.Sprintf("big/f%05d", i), []byte("x"))
+	}
+	win, _, _ := newCountingWindowsView(t, store)
+	// A client that browsed there has listed the share root and big.
+	for _, dir := range []string{"/", "big"} {
+		if _, err := win.ReadDir(dir); err != nil {
+			t.Fatal(err)
+		}
+	}
+	heads, listed := store.headCount(), store.keysListed()
+	for i := 0; i < 100; i++ {
+		if got, want := win.KeyPath(fmt.Sprintf("BIG/F%05d", i)), fmt.Sprintf("/big/f%05d", i); got != want {
+			t.Fatalf("KeyPath = %q, want %q", got, want)
+		}
+	}
+	if h, l := store.headCount()-heads, store.keysListed()-listed; h != 0 || l != 0 {
+		t.Errorf("resolving 100 names against cached listings made %d HEADs and listed %d keys; want none", h, l)
 	}
 }
