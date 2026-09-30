@@ -16,6 +16,20 @@ type ChildLister interface {
 	ListChildren(ctx context.Context, prefix string, maxKeys int) ([]*types.ObjectMetadata, []string, error)
 }
 
+// CachedChildNames returns the names in dir's cached listing, and whether
+// one is cached. It never calls COS.
+func (h *OperationsHandler) CachedChildNames(dir string) ([]string, bool) {
+	entry, ok := h.metadataCache.Get(dir)
+	if !ok || entry.ChildEntries == nil {
+		return nil, false
+	}
+	names := make([]string, len(entry.ChildEntries))
+	for i, child := range entry.ChildEntries {
+		names[i] = child.Name()
+	}
+	return names, true
+}
+
 // ChildNamesWithPrefix returns the names of dir's entries that begin with
 // namePrefix. A cached listing of dir answers without a COS call; otherwise
 // only the keys under that prefix are listed, so the cost follows the number
