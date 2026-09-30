@@ -4,6 +4,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/oborges/bluestone/internal/posix"
 	"github.com/oborges/bluestone/pkg/types"
@@ -125,9 +128,20 @@ func (fs *Filesystem) keyPath(name string) string {
 // matchChild returns the entry of dir that key names: an exact match, else
 // the first case-insensitive match in byte order, else key itself (a name
 // that does not exist yet).
+//
+// Most names a client sends exist exactly as spelled, and confirming that
+// takes one lookup. Only a name that does not exist as spelled needs the
+// directory searched for another spelling, and then only the entries that
+// begin with a case variant of its first characters are listed. Listing the
+// whole directory for every name made each operation cost as much as the
+// directory is large: over SMB a directory of 50,000 files could not be
+// created or deleted in six hours.
 func (fs *Filesystem) matchChild(dir, key string) string {
+	if _, err := fs.statPath(fs.Join(dir, key), key); err == nil {
+		return key
+	}
 	match := ""
-	for _, name := range fs.childNames(dir) {
+	for _, name := range fs.foldCandidates(dir, key) {
 		if name == key {
 			return name
 		}
@@ -141,6 +155,76 @@ func (fs *Filesystem) matchChild(dir, key string) string {
 	return key
 }
 
+// maxFoldPrefixes bounds the case variants of a name's start that
+// foldCandidates lists, and so the listings one lookup makes.
+const maxFoldPrefixes = 8
+
+// foldCandidates returns the entries of dir that could match key
+// case-insensitively: listed entries beginning with a case variant of key's
+// first characters, and staged entries.
+func (fs *Filesystem) foldCandidates(dir, key string) []string {
+	if !utf8.ValidString(key) {
+		// EqualFold reads invalid bytes as U+FFFD, which no prefix of
+		// the stored bytes captures: search the whole directory.
+		return fs.childNames(dir)
+	}
+	var (
+		mu    sync.Mutex
+		wg    sync.WaitGroup
+		names []string
+	)
+	for _, prefix := range foldPrefixes(key, maxFoldPrefixes) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// A listing that fails contributes nothing, as in childNames.
+			found, err := fs.ops.ChildNamesWithPrefix(fs.requestContext(), dir, prefix)
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			names = append(names, found...)
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	return append(names, fs.stagedChildNames(dir)...)
+}
+
+// foldPrefixes returns every case variant of the start of key, taking as
+// much of key as keeps the variants to at most limit (and always its first
+// character). strings.EqualFold matches character by character through
+// simple case folding, so any name equal to key under it begins with one of
+// these.
+func foldPrefixes(key string, limit int) []string {
+	prefixes := []string{""}
+	for i, r := range key {
+		orbit := foldOrbit(r)
+		if i > 0 && len(prefixes)*len(orbit) > limit {
+			break
+		}
+		next := make([]string, 0, len(prefixes)*len(orbit))
+		for _, prefix := range prefixes {
+			for _, variant := range orbit {
+				next = append(next, prefix+string(variant))
+			}
+		}
+		prefixes = next
+	}
+	return prefixes
+}
+
+// foldOrbit returns the runes that simple case folding treats as equal to
+// r, r first: a letter's cases, and for some letters more than two (k, K and
+// the Kelvin sign).
+func foldOrbit(r rune) []rune {
+	orbit := []rune{r}
+	for f := unicode.SimpleFold(r); f != r; f = unicode.SimpleFold(f) {
+		orbit = append(orbit, f)
+	}
+	return orbit
+}
+
 // childNames lists the entry names of a directory key path: listed objects,
 // staged files, and directories implied by staged files below it. Entries
 // with a pending delete are left out.
@@ -151,6 +235,14 @@ func (fs *Filesystem) childNames(dir string) []string {
 			names = append(names, entry.Name())
 		}
 	}
+	return append(names, fs.stagedChildNames(dir)...)
+}
+
+// stagedChildNames lists the entry names of a directory key path that exist
+// only in staging so far: staged files, and directories implied by staged
+// files below it. Entries with a pending delete are left out.
+func (fs *Filesystem) stagedChildNames(dir string) []string {
+	var names []string
 	if fs.featureFlags == nil || !fs.featureFlags.IsStagingEnabled() || fs.stagingManager == nil {
 		return names
 	}

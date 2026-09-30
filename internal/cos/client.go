@@ -586,6 +586,62 @@ func (c *Client) ListObjects(ctx context.Context, prefix string, maxKeys int) ([
 	return objects, nil
 }
 
+// ListChildren lists what is immediately under prefix: the objects directly
+// beneath it, and the prefixes of anything deeper, each once, as S3's "/"
+// delimiter groups them. Unlike ListObjects it does not enumerate the
+// subtree, so its cost follows the number of children. maxKeys (0 for no
+// limit) bounds objects and prefixes together.
+func (c *Client) ListChildren(ctx context.Context, prefix string, maxKeys int) ([]*types.ObjectMetadata, []string, error) {
+	log := logging.WithOperation("ListChildren").With(
+		zap.String("prefix", prefix),
+		zap.Int("maxKeys", maxKeys),
+	)
+
+	var objects []*types.ObjectMetadata
+	var prefixes []string
+	var continuationToken *string
+	reqMaxKeys := int64(1000)
+	if maxKeys > 0 && maxKeys < 1000 {
+		reqMaxKeys = int64(maxKeys)
+	}
+	full := func() bool { return maxKeys > 0 && len(objects)+len(prefixes) >= maxKeys }
+
+	for {
+		result, err := c.s3Client.ListObjectsV2WithContext(ctx, &s3.ListObjectsV2Input{
+			Bucket:            aws.String(c.bucket),
+			Prefix:            aws.String(prefix),
+			Delimiter:         aws.String("/"),
+			MaxKeys:           aws.Int64(reqMaxKeys),
+			ContinuationToken: continuationToken,
+		})
+		if err != nil {
+			log.Error("failed to list children", zap.Error(err))
+			return nil, nil, fmt.Errorf("failed to list children: %w", err)
+		}
+		for _, obj := range result.Contents {
+			objects = append(objects, &types.ObjectMetadata{
+				Key:          aws.StringValue(obj.Key),
+				Size:         aws.Int64Value(obj.Size),
+				LastModified: aws.TimeValue(obj.LastModified),
+				ETag:         aws.StringValue(obj.ETag),
+			})
+			if full() {
+				return objects, prefixes, nil
+			}
+		}
+		for _, common := range result.CommonPrefixes {
+			prefixes = append(prefixes, aws.StringValue(common.Prefix))
+			if full() {
+				return objects, prefixes, nil
+			}
+		}
+		if !aws.BoolValue(result.IsTruncated) {
+			return objects, prefixes, nil
+		}
+		continuationToken = result.NextContinuationToken
+	}
+}
+
 // CopyObject copies an object within COS
 func (c *Client) CopyObject(ctx context.Context, sourceKey, destKey string) error {
 	return c.copyObject(ctx, sourceKey, destKey, nil)
