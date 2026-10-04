@@ -12,6 +12,13 @@ import (
 // with AUTH_SYS credentials for uid and gid.
 func mountV3As(t *testing.T, fs *ownedFS, uid, gid uint32) *nfsc.Target {
 	t.Helper()
+	_, target := serveV3As(t, fs, uid, gid)
+	return target
+}
+
+// serveV3As is mountV3As that also returns the server behind the mount.
+func serveV3As(t *testing.T, fs *ownedFS, uid, gid uint32) (*Server, *nfsc.Target) {
+	t.Helper()
 	listener, err := net.Listen("tcp", "localhost:0")
 	if err != nil {
 		t.Fatal(err)
@@ -32,7 +39,7 @@ func mountV3As(t *testing.T, fs *ownedFS, uid, gid uint32) *nfsc.Target {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = mounter.Unmount() })
-	return target
+	return srv, target
 }
 
 // The same rules hold over NFSv3, through a real client.

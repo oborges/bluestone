@@ -151,6 +151,8 @@ type nfs4StateManager struct {
 	states map[[nfs4OtherSize]byte]*nfs4State
 	// byOwner finds an owner's state for a file.
 	byOwner map[nfs4OwnerKey]map[string]*nfs4State
+	// opensByPath finds the open states of a file, whoever holds them.
+	opensByPath map[string]map[*nfs4State]struct{}
 	// clientSeen tracks lease renewal for lazy expiry.
 	clientSeen map[uint64]time.Time
 	lastSweep  time.Time
@@ -162,11 +164,12 @@ type nfs4StateManager struct {
 
 func newNFS4StateManager(locker ByteRangeLocker) *nfs4StateManager {
 	return &nfs4StateManager{
-		locker:     locker,
-		states:     make(map[[nfs4OtherSize]byte]*nfs4State),
-		byOwner:    make(map[nfs4OwnerKey]map[string]*nfs4State),
-		clientSeen: make(map[uint64]time.Time),
-		now:        time.Now,
+		locker:      locker,
+		states:      make(map[[nfs4OtherSize]byte]*nfs4State),
+		byOwner:     make(map[nfs4OwnerKey]map[string]*nfs4State),
+		opensByPath: make(map[string]map[*nfs4State]struct{}),
+		clientSeen:  make(map[uint64]time.Time),
+		now:         time.Now,
 	}
 }
 
@@ -239,6 +242,12 @@ func (sm *nfs4StateManager) dropStateLocked(st *nfs4State) {
 			delete(sm.byOwner, key)
 		}
 	}
+	if opens, ok := sm.opensByPath[st.path]; ok {
+		delete(opens, st)
+		if len(opens) == 0 {
+			delete(sm.opensByPath, st.path)
+		}
+	}
 }
 
 // ownerStateLocked returns owner's state of the given kind for path,
@@ -261,6 +270,12 @@ func (sm *nfs4StateManager) ownerStateLocked(kind nfs4StateKind, owner nfs4Owner
 		sm.byOwner[key] = make(map[string]*nfs4State)
 	}
 	sm.byOwner[key][path] = st
+	if kind == nfs4OpenState {
+		if sm.opensByPath[path] == nil {
+			sm.opensByPath[path] = make(map[*nfs4State]struct{})
+		}
+		sm.opensByPath[path][st] = struct{}{}
+	}
 	return st
 }
 
@@ -324,6 +339,18 @@ func (sm *nfs4StateManager) close(id nfs4StateID) (nfs4StateID, nfs4Status) {
 	next := st.advance()
 	sm.dropStateLocked(st)
 	return next, nfs4OK
+}
+
+// forgetOpens drops the open states of the file at path, which a REMOVE or
+// RENAME has just retired. The file's handle is invalidated with it, so the
+// CLOSE that would end them cannot arrive: without this they stay for as
+// long as their client keeps its lease.
+func (sm *nfs4StateManager) forgetOpens(path string) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	for st := range sm.opensByPath[path] {
+		sm.dropStateLocked(st)
+	}
 }
 
 // lock acquires or upgrades a range for (owner, path). On conflict it
