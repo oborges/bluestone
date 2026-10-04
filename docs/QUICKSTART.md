@@ -50,6 +50,13 @@ see [Linux Service Installation](LINUX_SERVICE.md).
 
 ## Quick Start with Docker
 
+No image is published: build one from a checkout first. The examples below
+use the name and tag `make docker-build` gives it by default.
+
+```bash
+make docker-build VERSION=1.0.0
+```
+
 ### 1. Create Configuration File
 
 Create a `config.yaml` file:
@@ -57,7 +64,9 @@ Create a `config.yaml` file:
 ```yaml
 server:
   nfs_port: 2049
+  metrics_enabled: true # off by default; the checks under Monitoring need both
   metrics_port: 8080
+  health_enabled: true
   health_port: 8081
 
 cos:
@@ -179,6 +188,10 @@ kubectl create secret generic bluestone-secret \
 
 ### 2. Deploy
 
+The manifests name the image `oborges/bluestone:1.0.0`. Build it, push it to
+a registry your cluster can pull from, and set `image:` in
+`deployments/kubernetes/deployment.yaml` to match.
+
 ```bash
 # Apply all manifests
 kubectl apply -f deployments/kubernetes/
@@ -203,6 +216,9 @@ sudo mount -t nfs4 -o vers=4.0,tcp,port=2049 <SERVICE_IP>:/ /mnt/cos
 ```
 
 ## Monitoring
+
+The metrics and health servers are off by default and listen on localhost.
+Turn them on with `server.metrics_enabled` and `server.health_enabled`.
 
 ### Health Checks
 
@@ -345,14 +361,14 @@ curl http://localhost:8080/metrics | grep cos_api_duration
 
 ## Next Steps
 
-- [Full Documentation](../README.md)
-- [Configuration Reference](CONFIGURATION.md)
-- [Performance Tuning](PERFORMANCE.md)
-- [Troubleshooting Guide](TROUBLESHOOTING.md)
-- [API Documentation](API.md)
+- [Full documentation and configuration reference](../README.md)
+- [Linux service installation](LINUX_SERVICE.md)
+- [High availability](HA.md)
+- [IBM Power: Linux and AIX](POWER.md)
+- [Architecture](../ARCHITECTURE.md)
 
 ## Support
 
 For issues and questions:
 - GitHub Issues: https://github.com/oborges/bluestone/issues
-- Documentation: https://github.com/oborges/bluestone/docs
+- Documentation: https://github.com/oborges/bluestone/tree/main/docs

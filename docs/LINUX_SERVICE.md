@@ -62,6 +62,19 @@ BLUESTONE_COS_API_KEY=your-ibm-cloud-api-key
 The installer sets config and environment file permissions to `0640` with group
 `bluestone`.
 
+SMB accounts can be kept in a separate file named by `smb.users_file`, so the
+main configuration holds no account hashes. The service must be able to read
+it and nobody else should:
+
+```bash
+sudo install -m 0600 -o bluestone -g bluestone smb-users.yaml /etc/bluestone/smb-users.yaml
+```
+
+The installer and unit are written for systemd on Linux. They have been used
+on x86-64; on ppc64le the gateway itself is tested but the installer is not,
+and AIX has no installer. See [IBM Power: Linux and AIX](POWER.md), which
+also covers `server.nfs_register_portmap` for AIX NFSv3 clients.
+
 ## Start And Inspect
 
 ```bash
