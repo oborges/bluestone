@@ -574,3 +574,131 @@ func TestNFSv3RemoveAndRenameEndNFSv4Opens(t *testing.T) {
 		t.Errorf("%d NFSv4 open states left after NFSv3 REMOVE and RENAME, want none", len(sm.states))
 	}
 }
+
+// VERIFY and NVERIFY gate the rest of a compound on the current file's
+// attributes. The AIX client lists a directory as PUTFH, READDIR, NVERIFY,
+// GETATTR and retried without end while NVERIFY was refused as illegal.
+func TestNFSv4VerifyAndNVerify(t *testing.T) {
+	srv, handler, fs := newNFS4TestServer(t)
+	f, err := fs.Create("f")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = f.Write([]byte("12345"))
+	_ = f.Close()
+
+	sizeIs := func(n uint64) nfs4FAttr {
+		var vals bytes.Buffer
+		if err := xdr.Write(&vals, n); err != nil {
+			t.Fatal(err)
+		}
+		return nfs4FAttr{Mask: nfs4BitmapOf(nfs4AttrSize), Vals: vals.Bytes()}
+	}
+	run := func(op nfs4Op, attrs nfs4FAttr) nfs4Status {
+		status, _ := nfs4RunCompound(t, srv, handler,
+			nfs4TestOp{nfs4OpPutRootFH, nil},
+			nfs4TestOp{nfs4OpLookup, nfs4LookupArgs{Name: "f"}},
+			nfs4TestOp{op, nfs4VerifyArgs{Attrs: attrs}},
+			nfs4TestOp{nfs4OpGetFH, nil},
+		)
+		return status
+	}
+	for _, tc := range []struct {
+		name  string
+		op    nfs4Op
+		attrs nfs4FAttr
+		want  nfs4Status
+	}{
+		{"VERIFY of the file's size", nfs4OpVerify, sizeIs(5), nfs4OK},
+		{"VERIFY of another size", nfs4OpVerify, sizeIs(6), nfs4ErrNotSame},
+		{"NVERIFY of the file's size", nfs4OpNVerify, sizeIs(5), nfs4ErrSame},
+		{"NVERIFY of another size", nfs4OpNVerify, sizeIs(6), nfs4OK},
+		{"VERIFY of an attribute the server lacks", nfs4OpVerify, nfs4FAttr{Mask: nfs4BitmapOf(12), Vals: []byte{0, 0, 0, 0}}, nfs4ErrAttrNotSupp},
+	} {
+		if got := run(tc.op, tc.attrs); got != tc.want {
+			t.Errorf("%s: status = %d, want %d", tc.name, got, tc.want)
+		}
+	}
+	// A known operation this server lacks is unsupported, not illegal.
+	if status, _ := nfs4RunCompound(t, srv, handler, nfs4TestOp{nfs4OpPutRootFH, nil}, nfs4TestOp{nfs4OpOpenAttr, nil}); status != nfs4ErrNotSupp {
+		t.Errorf("OPENATTR: status = %d, want NOTSUPP", status)
+	}
+}
+
+// A client that removes entries as it lists (rm -r) must still be shown
+// every entry: the listing resumes after the last name it saw, however many
+// were removed. Cookies that were positions made the AIX client skip as
+// many entries as it had removed.
+func TestReaddirResumesAfterRemovals(t *testing.T) {
+	srv, handler, fs := newNFS4TestServer(t)
+	const total = 60
+	for i := 0; i < total; i++ {
+		f, err := fs.Create(fmt.Sprintf("f%02d", i))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = f.Close()
+	}
+
+	seen := map[string]bool{}
+	cookie := uint64(0)
+	for page := 0; page < 2*total; page++ {
+		status, resp := nfs4RunCompound(t, srv, handler,
+			nfs4TestOp{nfs4OpPutRootFH, nil},
+			nfs4TestOp{nfs4OpReadDir, nfs4ReadDirArgs{Cookie: cookie, MaxCount: 400, AttrRequest: nfs4BitmapOf(nfs4AttrType)}},
+		)
+		if status != nfs4OK {
+			t.Fatalf("READDIR from cookie %d: status = %d", cookie, status)
+		}
+		nfs4ExpectOp(t, resp, nfs4OpPutRootFH, nfs4OK, nil)
+		nfs4ExpectOp(t, resp, nfs4OpReadDir, nfs4OK, nil)
+		var verifier uint64
+		if err := xdr.Read(resp, &verifier); err != nil {
+			t.Fatal(err)
+		}
+		var names []string
+		for {
+			var entry nfs4DirEntry
+			if err := xdr.Read(resp, &entry.Follows); err != nil {
+				t.Fatal(err)
+			}
+			if !entry.Follows {
+				break
+			}
+			if err := xdr.Read(resp, &entry.Cookie); err != nil {
+				t.Fatal(err)
+			}
+			if err := xdr.Read(resp, &entry.Name); err != nil {
+				t.Fatal(err)
+			}
+			if err := xdr.Read(resp, &entry.Attrs); err != nil {
+				t.Fatal(err)
+			}
+			if entry.Cookie <= cookie {
+				t.Fatalf("cookie %d for %s does not follow %d", entry.Cookie, entry.Name, cookie)
+			}
+			cookie = entry.Cookie
+			names = append(names, entry.Name)
+		}
+		var eof bool
+		if err := xdr.Read(resp, &eof); err != nil {
+			t.Fatal(err)
+		}
+		// Remove what this page listed before asking for the next.
+		for _, name := range names {
+			if seen[name] {
+				t.Fatalf("%s listed twice", name)
+			}
+			seen[name] = true
+			if err := fs.Remove(name); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if eof {
+			break
+		}
+	}
+	if len(seen) != total {
+		t.Fatalf("listing while removing showed %d of %d entries", len(seen), total)
+	}
+}

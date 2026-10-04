@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"hash/fnv"
 	"io"
 	"io/fs"
 	"os"
@@ -84,10 +85,9 @@ func onReadDir(ctx context.Context, w *response, userHandle Handler) error {
 
 	eof := true
 	maxEntities := userHandle.HandleLimit() / 2
-	for i, c := range contents {
-		// cookie equates to index within contents + 2 (for '.' and '..')
-		cookie := uint64(i + 2)
-		if started {
+	for _, c := range contents {
+		cookie := dirCookie(c.Name())
+		if started || cookie > obj.Cookie {
 			maxBytes += 512 // TODO: better estimation.
 			if maxBytes > obj.Count || len(entities) > maxEntities {
 				eof = false
@@ -101,8 +101,6 @@ func onReadDir(ctx context.Context, w *response, userHandle Handler) error {
 				Cookie: cookie,
 				Next:   true,
 			})
-		} else if cookie == obj.Cookie {
-			started = true
 		}
 	}
 
@@ -163,9 +161,7 @@ func getDirListingWithVerifier(userHandle Handler, fsHandle []byte, verifier uin
 		return nil, 0, readDirError(err)
 	}
 
-	sort.Slice(contents, func(i, j int) bool {
-		return contents[i].Name() < contents[j].Name()
-	})
+	sortByDirCookie(contents)
 
 	if vh, ok := userHandle.(CachingHandler); ok {
 		// let the user handler make a verifier if it can.
@@ -175,6 +171,35 @@ func getDirListingWithVerifier(userHandle Handler, fsHandle []byte, verifier uin
 
 	id := hashPathAndContents(path, contents)
 	return contents, id, nil
+}
+
+// dirCookie is the READDIR cookie of the entry called name. It depends on the
+// name alone, so an entry keeps its cookie, and its place in the listing,
+// when others are created or removed: a client that removes files as it
+// reads (rm -r) resumes after the last name it saw. Cookies used to be
+// positions in the listing, which removals shift, and the AIX client then
+// skipped as many entries as it had removed. 0, 1 and 2 are kept for the
+// start of a listing, "." and "..".
+func dirCookie(name string) uint64 {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(name))
+	// Clients hand cookies to applications as signed offsets.
+	c := h.Sum64() >> 1
+	if c < 3 {
+		c += 3
+	}
+	return c
+}
+
+// sortByDirCookie puts a listing in the order READDIR pages through it.
+func sortByDirCookie(contents []fs.FileInfo) {
+	sort.Slice(contents, func(i, j int) bool {
+		ci, cj := dirCookie(contents[i].Name()), dirCookie(contents[j].Name())
+		if ci != cj {
+			return ci < cj
+		}
+		return contents[i].Name() < contents[j].Name()
+	})
 }
 
 func hashPathAndContents(path string, contents []fs.FileInfo) uint64 {
