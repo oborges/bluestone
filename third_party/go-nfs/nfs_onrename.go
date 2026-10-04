@@ -106,6 +106,8 @@ func onRename(ctx context.Context, w *response, userHandle Handler) error {
 	if err := userHandle.InvalidateHandle(fs, oldHandle); err != nil {
 		return &NFSStatusError{NFSStatusServerFault, err}
 	}
+	// An NFSv4 client may have the file open.
+	w.Server.nfs4State().forgetOpens(fromLoc)
 
 	writer := bytes.NewBuffer([]byte{})
 	if err := xdr.Write(writer, uint32(NFSStatusOk)); err != nil {
