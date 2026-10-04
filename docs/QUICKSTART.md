@@ -57,6 +57,10 @@ use the name and tag `make docker-build` gives it by default.
 make docker-build VERSION=1.0.0
 ```
 
+Podman works as well: `make docker-build VERSION=1.0.0 DOCKER=podman`, and
+`podman` in place of `docker` below. With Podman, add `--format docker` to
+the build if you want the image's health check kept.
+
 ### 1. Create Configuration File
 
 Create a `config.yaml` file:
@@ -217,8 +221,12 @@ sudo mount -t nfs4 -o vers=4.0,tcp,port=2049 <SERVICE_IP>:/ /mnt/cos
 
 ## Monitoring
 
-The metrics and health servers are off by default and listen on localhost.
-Turn them on with `server.metrics_enabled` and `server.health_enabled`.
+The metrics and health servers are off by default and listen on 127.0.0.1
+only. Turn them on with `server.metrics_enabled` and `server.health_enabled`.
+In a container that means they are not reachable through a published port:
+run the commands below inside it, for example
+`docker exec cos-bluestone wget -qO- http://127.0.0.1:8081/health`. Use
+`127.0.0.1` rather than `localhost` there, which resolves to `::1` first.
 
 ### Health Checks
 

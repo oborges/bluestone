@@ -3,6 +3,8 @@
 # Variables
 BINARY_NAME=bluestone
 DOCKER_IMAGE=oborges/bluestone
+# The container tool: "make docker-build DOCKER=podman" works too.
+DOCKER?=docker
 VERSION?=1.0.0
 GO=go
 GOFLAGS=-v
@@ -112,17 +114,17 @@ vet:
 # Build Docker image
 docker-build:
 	@echo "Building Docker image..."
-	docker build -t ${DOCKER_IMAGE}:${VERSION} -f deployments/docker/Dockerfile .
+	${DOCKER} build --build-arg VERSION=${VERSION} -t ${DOCKER_IMAGE}:${VERSION} -f deployments/docker/Dockerfile .
 
 # Push Docker image
 docker-push:
 	@echo "Pushing Docker image..."
-	docker push ${DOCKER_IMAGE}:${VERSION}
+	${DOCKER} push ${DOCKER_IMAGE}:${VERSION}
 
 # Run Docker container
 docker-run:
 	@echo "Running Docker container..."
-	docker run -p 2049:2049 -p 8080:8080 -p 8081:8081 \
+	${DOCKER} run -p 2049:2049 -p 8080:8080 -p 8081:8081 \
 		-v $(PWD)/configs:/etc/bluestone \
 		-v $(PWD)/cache:/var/cache/bluestone \
 		${DOCKER_IMAGE}:${VERSION}
