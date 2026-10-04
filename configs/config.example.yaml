@@ -29,6 +29,11 @@ server:
   # With nfs_permissions: posix, act as the anonymous user (below) for root
   # on clients, instead of letting root do anything.
   nfs_root_squash: false
+  # Register the NFSv3 programs with this host's portmapper (rpcbind), which
+  # must be running. Needed by clients that look the port up instead of
+  # taking it as a mount option, such as AIX. Leave off if the host also
+  # runs its own NFS server. Only used when NFSv3 is served.
+  nfs_register_portmap: false
   # Who squashed root, and calls without AUTH_SYS credentials, act as.
   nfs_anon_uid: 65534
   nfs_anon_gid: 65534
