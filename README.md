@@ -21,7 +21,10 @@ Test carefully with your own workload before relying on it.
 
 - Serves an NFSv4 export backed by one IBM Cloud COS bucket, with optional
   NFSv3 or dual-protocol serving.
-- Accepts POSIX-style file operations from Linux NFS clients.
+- Accepts POSIX-style file operations from Linux NFS clients, and from AIX
+  ones.
+- Runs on Linux (x86-64, arm64, ppc64le) and on AIX on IBM Power. See
+  [IBM Power: Linux and AIX](docs/POWER.md).
 - Optionally serves the same bucket over SMB 3 (experimental) to Windows,
   macOS, and Linux clients, with NTLM users and Windows naming. See
   [SMB](#smb).
@@ -118,7 +121,8 @@ Before running the gateway, the operator must create and provide:
 - An IBM Cloud Object Storage service.
 - A COS bucket.
 - An API key or HMAC credentials with the required permissions for that bucket.
-- A Linux host with NFS client utilities.
+- A Linux host with NFS client utilities. AIX hosts and clients need a
+  little more: see [IBM Power: Linux and AIX](docs/POWER.md).
 - Local disk capacity for staging and read cache.
 - Go 1.25 or newer if building from source.
 
@@ -210,6 +214,7 @@ server:
   nfs_root_squash: false     # with posix: root on clients acts as nfs_anon_uid
   nfs_anon_uid: 65534
   nfs_anon_gid: 65534
+  nfs_register_portmap: false # register NFSv3 with the host's portmapper
 ```
 
 Metrics, health, and debug HTTP servers bind to localhost. Enable only the
@@ -222,6 +227,19 @@ user authentication, so combine the allowlist with OS/VPC firewalling and
 trusted networks. `nfs_concurrent_handlers` is an operational escape hatch for
 the per-connection request parallelism: set it to `1` to restore fully serial
 handling if a client misbehaves with concurrent replies.
+
+`nfs_register_portmap` registers the NFSv3 NFS and MOUNT programs, on
+`nfs_port`, with the host's portmapper (rpcbind) when the gateway starts and
+withdraws them when it stops. Clients that look the port up instead of taking
+it as a mount option need it: AIX's NFSv3 mount has no `mountport`. It only
+applies when NFSv3 is served, needs a portmapper running on the host, and
+should stay off where the host runs its own NFS server, whose registration it
+would replace. If the portmapper cannot be reached the gateway logs an error
+and starts anyway.
+
+Directory listings are not returned in name order. An entry's place in a
+listing comes from its name, so that a client reading a directory while it
+removes files from it (`rm -r`) is still shown every entry.
 
 By default any user on an allowed client can read, change and delete any
 file. `nfs_permissions: posix` makes the gateway check each call's user, the
@@ -913,12 +931,16 @@ make test
 make benchmark-suite
 ```
 
+`make build-all` cross-compiles for Linux (amd64, arm64, ppc64le), macOS
+(amd64, arm64) and AIX (ppc64).
+
 Useful local documentation:
 
 - `docs/BENCHMARK_SUITE.md`
 - `docs/BENCHMARKING.md`
 - `ARCHITECTURE.md`
 - `docs/AWS_S3_FILES_COMPARISON.md`
+- `docs/POWER.md`
 - `docs/STAGING_ARCHITECTURE.md`
 
 ## License
