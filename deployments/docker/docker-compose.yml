@@ -18,6 +18,12 @@ services:
       - BLUESTONE_COS_REGION=${COS_REGION:-us-south}
       - BLUESTONE_COS_API_KEY=${IBM_CLOUD_API_KEY}
       
+      # The health check below needs the health server, which is off by
+      # default. It and the metrics server listen on 127.0.0.1 inside the
+      # container, so they are reached with "exec", not through a published
+      # port.
+      - BLUESTONE_SERVER_HEALTH_ENABLED=true
+
       # Logging
       - BLUESTONE_LOGGING_LEVEL=${LOG_LEVEL:-info}
       - BLUESTONE_LOGGING_FORMAT=json
@@ -36,7 +42,7 @@ services:
       - ./logs:/var/log/bluestone
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8081/health/live"]
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:8081/health/live"]
       interval: 30s
       timeout: 10s
       retries: 3

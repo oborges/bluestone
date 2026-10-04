@@ -1,66 +1,63 @@
 # Multi-stage build for Bluestone
 
-ARG ALPINE_VERSION=3.20
+ARG GO_VERSION=1.25
+ARG ALPINE_VERSION=3.22
 
-# Build stage
-FROM golang:1.21-alpine3.20 AS builder
+# Build stage. It runs on the build host's own architecture and cross-compiles
+# for the image's, so building for another platform needs no emulation.
+FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-alpine AS builder
 
-# Install build dependencies
-RUN apk add --no-cache git make
+ARG VERSION=dev
+ARG TARGETOS
+ARG TARGETARCH
 
-# Set working directory
 WORKDIR /build
 
-# Copy go mod files
+# Dependencies first, so they are cached across source changes. go.mod
+# replaces two modules with the copies under third_party, which therefore
+# have to be present before anything is resolved.
 COPY go.mod go.sum ./
-
-# Download dependencies
+COPY third_party ./third_party
 RUN go mod download
 
-# Copy source code
 COPY . .
 
-# Build the binary
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
-    -ldflags="-w -s -X main.Version=${VERSION:-dev}" \
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build \
+    -ldflags="-w -s -X main.Version=${VERSION}" \
     -o bluestone \
     ./cmd/bluestone
 
 # Runtime stage
 FROM alpine:${ALPINE_VERSION}
 
-# Install runtime dependencies
 RUN apk add --no-cache \
     ca-certificates \
     tzdata \
-    && addgroup -g 1000 nfs \
-    && adduser -D -u 1000 -G nfs nfs
+    && addgroup -g 1000 bluestone \
+    && adduser -D -u 1000 -G bluestone bluestone
 
-# Set working directory
 WORKDIR /app
 
-# Copy binary from builder
 COPY --from=builder /build/bluestone .
 
-# Copy non-secret example configuration as the runtime default.
+# Non-secret example configuration as the runtime default.
 COPY --from=builder /build/configs/config.example.yaml /etc/bluestone/config.yaml
 
-# Create cache directory
-RUN mkdir -p /var/cache/bluestone && \
-    chown -R nfs:nfs /var/cache/bluestone /app
+# The gateway writes its read cache and its staging area; staging holds
+# accepted writes until they reach COS, so mount a volume there.
+RUN mkdir -p /var/cache/bluestone /var/staging/bluestone && \
+    chown -R bluestone:bluestone /var/cache/bluestone /var/staging/bluestone /app
 
-# Switch to non-root user
-USER nfs
+USER bluestone
 
-# Expose ports
-EXPOSE 2049 8080 8081
+# NFS, SMB (when smb.enabled), metrics and health.
+EXPOSE 2049 445 8080 8081
 
-# Health check
+# Needs server.health_enabled: true. The health server listens on 127.0.0.1
+# only, and "localhost" resolves to ::1 first here, so name the address.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD wget --no-verbose --tries=1 --spider http://localhost:8081/health/live || exit 1
+    CMD wget --no-verbose --tries=1 --spider http://127.0.0.1:8081/health/live || exit 1
 
-# Set entrypoint
 ENTRYPOINT ["./bluestone"]
 
-# Default command
 CMD ["--config", "/etc/bluestone/config.yaml"]
