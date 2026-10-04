@@ -3,9 +3,10 @@ package metrics
 import (
 	"context"
 	"errors"
-	"fmt"
+	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/oborges/bluestone/internal/logging"
@@ -454,9 +455,9 @@ func Initialize() {
 	logging.Info("Metrics initialized")
 }
 
-// StartMetricsServer starts the Prometheus metrics HTTP server
-func StartMetricsServer(port int) error {
-	addr := fmt.Sprintf("127.0.0.1:%d", port)
+// StartMetricsServer starts the Prometheus metrics HTTP server on host:port.
+func StartMetricsServer(host string, port int) error {
+	addr := net.JoinHostPort(host, strconv.Itoa(port))
 
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())

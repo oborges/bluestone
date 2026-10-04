@@ -6,6 +6,11 @@ server:
   nfs_version: "4"        # "4" (default), "3", or "dual"
   metrics_port: 8080
   health_port: 8081
+  # Where the metrics and health servers listen. They carry no
+  # authentication, so the default keeps them to this host. A container
+  # platform whose probes and scraper come from outside the container needs
+  # "0.0.0.0"; restrict who can reach the ports with its network policy.
+  monitoring_address: "127.0.0.1"
   max_connections: 1000
   read_timeout: "30s"
   write_timeout: "30s"

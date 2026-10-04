@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
@@ -85,9 +87,9 @@ func (c *Checker) Check(ctx context.Context) CheckResult {
 	return result
 }
 
-// StartHealthServer starts an HTTP server for health checks
-func StartHealthServer(port int, checker *Checker) error {
-	addr := fmt.Sprintf("127.0.0.1:%d", port)
+// StartHealthServer starts an HTTP server for health checks on host:port.
+func StartHealthServer(host string, port int, checker *Checker) error {
+	addr := net.JoinHostPort(host, strconv.Itoa(port))
 
 	mux := http.NewServeMux()
 

@@ -196,6 +196,10 @@ The manifests name the image `oborges/bluestone:1.0.0`. Build it, push it to
 a registry your cluster can pull from, and set `image:` in
 `deployments/kubernetes/deployment.yaml` to match.
 
+They run one gateway, as a bucket must have only one, with its staging area
+on a PersistentVolumeClaim (`pvc.yaml`) so accepted writes survive a pod
+restart. Only NFS is on the load balancer.
+
 ```bash
 # Apply all manifests
 kubectl apply -f deployments/kubernetes/
@@ -227,6 +231,9 @@ In a container that means they are not reachable through a published port:
 run the commands below inside it, for example
 `docker exec cos-bluestone wget -qO- http://127.0.0.1:8081/health`. Use
 `127.0.0.1` rather than `localhost` there, which resolves to `::1` first.
+To reach them from outside, set `server.monitoring_address: "0.0.0.0"`;
+neither server authenticates, so limit who can reach those ports. The
+Kubernetes manifests do this, for the probes and the Prometheus scrape.
 
 ### Health Checks
 

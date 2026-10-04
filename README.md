@@ -206,6 +206,7 @@ server:
   metrics_port: 8080
   health_enabled: true
   health_port: 8081
+  monitoring_address: "127.0.0.1" # where metrics and health listen
   debug_enabled: true
   debug_port: 8082
   allowed_clients: [] # CIDRs/IPs allowed to connect; empty allows all
@@ -218,7 +219,11 @@ server:
 ```
 
 Metrics, health, and debug HTTP servers bind to localhost. Enable only the
-endpoints you need.
+endpoints you need. `monitoring_address` moves the metrics and health servers
+to another address: `0.0.0.0` is what Kubernetes probes and a Prometheus
+scraper need, since they come from outside the container. Neither server
+authenticates, so limit who can reach those ports. The debug server always
+stays on localhost.
 
 `allowed_clients` restricts NFS connections to the listed CIDRs or IPs, the
 same model as cloud security groups: rejected connections are dropped at TCP
