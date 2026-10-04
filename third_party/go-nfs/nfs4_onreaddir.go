@@ -57,19 +57,14 @@ func nfs4OnReadDir(c *nfs4Compound, args io.Reader, res io.Writer) nfs4Status {
 	if req.Cookie > 0 && req.CookieVerf > 0 && req.CookieVerf != verifier {
 		return nfs4ErrBadCookie
 	}
-	sort.Slice(contents, func(i, j int) bool {
-		return contents[i].Name() < contents[j].Name()
-	})
+	sortByDirCookie(contents)
 
-	// Cookies 1 and 2 stand for "." and "..", which NFSv4 does not list,
-	// so entry i has cookie i+2.
-	start := 0
-	if req.Cookie > 1 {
-		if req.Cookie > uint64(len(contents))+1 {
-			return nfs4ErrBadCookie
-		}
-		start = int(req.Cookie - 1)
-	}
+	// An entry's cookie comes from its name (dirCookie), so the listing
+	// resumes after the last entry the client saw whatever has been
+	// created or removed since.
+	start := sort.Search(len(contents), func(i int) bool {
+		return dirCookie(contents[i].Name()) > req.Cookie
+	})
 
 	var entries bytes.Buffer
 	eof := true
@@ -83,7 +78,7 @@ func nfs4OnReadDir(c *nfs4Compound, args io.Reader, res io.Writer) nfs4Status {
 		}
 
 		var one bytes.Buffer
-		if err := xdr.Write(&one, nfs4DirEntry{Follows: true, Cookie: uint64(i + 2), Name: info.Name(), Attrs: attrs}); err != nil {
+		if err := xdr.Write(&one, nfs4DirEntry{Follows: true, Cookie: dirCookie(info.Name()), Name: info.Name(), Attrs: attrs}); err != nil {
 			return nfs4ErrServerFault
 		}
 		// 16 bytes for the verifier and the list's end.
