@@ -5,7 +5,14 @@ metadata:
   labels:
     app: bluestone
 spec:
-  type: LoadBalancer
+  # Reachable from inside the cluster only. The export has no user
+  # authentication, so a public load balancer would hand the bucket to anyone
+  # who can reach it. For clients outside the cluster, change this to
+  # LoadBalancer and restrict it: a private load balancer (on IBM Cloud, the
+  # annotation service.kubernetes.io/ibm-load-balancer-cloud-provider-ip-type:
+  # "private"), loadBalancerSourceRanges, or server.allowed_clients in the
+  # ConfigMap.
+  type: ClusterIP
   selector:
     app: bluestone
   ports:
