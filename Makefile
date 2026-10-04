@@ -23,6 +23,8 @@ build-all:
 	@mkdir -p bin
 	GOOS=linux GOARCH=amd64 ${GO} build ${GOFLAGS} ${LDFLAGS} -o bin/${BINARY_NAME}-linux-amd64 ./cmd/bluestone
 	GOOS=linux GOARCH=arm64 ${GO} build ${GOFLAGS} ${LDFLAGS} -o bin/${BINARY_NAME}-linux-arm64 ./cmd/bluestone
+	GOOS=linux GOARCH=ppc64le ${GO} build ${GOFLAGS} ${LDFLAGS} -o bin/${BINARY_NAME}-linux-ppc64le ./cmd/bluestone
+	GOOS=aix GOARCH=ppc64 ${GO} build ${GOFLAGS} ${LDFLAGS} -o bin/${BINARY_NAME}-aix-ppc64 ./cmd/bluestone
 	GOOS=darwin GOARCH=amd64 ${GO} build ${GOFLAGS} ${LDFLAGS} -o bin/${BINARY_NAME}-darwin-amd64 ./cmd/bluestone
 	GOOS=darwin GOARCH=arm64 ${GO} build ${GOFLAGS} ${LDFLAGS} -o bin/${BINARY_NAME}-darwin-arm64 ./cmd/bluestone
 
