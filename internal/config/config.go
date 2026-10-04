@@ -357,6 +357,9 @@ type ServerConfig struct {
 	// NFSRootSquash makes root on NFS clients act as the anonymous user.
 	// It needs nfs_permissions: posix.
 	NFSRootSquash bool `mapstructure:"nfs_root_squash"`
+	// NFSRegisterPortmap registers the NFSv3 programs with the host's
+	// portmapper (rpcbind), for clients that look the port up there.
+	NFSRegisterPortmap bool `mapstructure:"nfs_register_portmap"`
 	// NFSAnonUID and NFSAnonGID are who squashed root, and calls without
 	// AUTH_SYS credentials, act as.
 	NFSAnonUID int `mapstructure:"nfs_anon_uid"`
@@ -548,6 +551,7 @@ func bindEnvOverrides(v *viper.Viper) error {
 		"server.nfs_concurrent_handlers",
 		"server.nfs_permissions",
 		"server.nfs_root_squash",
+		"server.nfs_register_portmap",
 		"server.nfs_anon_uid",
 		"server.nfs_anon_gid",
 		"cos.endpoint",
@@ -708,6 +712,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("server.nfs_concurrent_handlers", 0)
 	v.SetDefault("server.nfs_permissions", NFSPermissionsNone)
 	v.SetDefault("server.nfs_root_squash", false)
+	v.SetDefault("server.nfs_register_portmap", false)
 	v.SetDefault("server.nfs_anon_uid", 65534)
 	v.SetDefault("server.nfs_anon_gid", 65534)
 	v.SetDefault("server.read_timeout", "30s")

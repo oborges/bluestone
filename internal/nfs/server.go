@@ -19,6 +19,8 @@ type Server struct {
 	concurrentHandlers int
 	locker             nfs.ByteRangeLocker
 	permissions        *nfs.Permissions
+	registerPortmap    bool
+	portmapRegistered  bool
 	wg                 sync.WaitGroup
 	ctx                context.Context
 	cancel             context.CancelFunc
@@ -39,6 +41,9 @@ type ServerOptions struct {
 	// Permissions, when set, enforces POSIX file permissions for each
 	// call's AUTH_SYS user; nil lets every client user do anything.
 	Permissions *nfs.Permissions
+	// RegisterPortmap registers the NFSv3 programs with the host's
+	// portmapper, for clients that look the port up (AIX).
+	RegisterPortmap bool
 }
 
 // NewServer creates a new NFS server
@@ -68,6 +73,7 @@ func NewServer(handler nfs.Handler, address string, logger *logging.KVLogger, nf
 		concurrentHandlers: opts.ConcurrentHandlers,
 		locker:             opts.Locker,
 		permissions:        opts.Permissions,
+		registerPortmap:    opts.RegisterPortmap,
 		ctx:                ctx,
 		cancel:             cancel,
 	}, nil
@@ -92,6 +98,19 @@ func (s *Server) Start() error {
 		"concurrent_handlers", concurrency,
 		"permissions", permissions)
 
+	if s.registerPortmap {
+		// A client that needs the portmapper cannot mount without this,
+		// but the others can, so a failure is reported and not fatal.
+		port := s.listener.Addr().(*net.TCPAddr).Port
+		if err := registerPortmap(port); err != nil {
+			s.logger.Error("Could not register NFSv3 with the portmapper; clients that look the port up (AIX) will not mount",
+				"error", err)
+		} else {
+			s.portmapRegistered = true
+			s.logger.Info("Registered NFSv3 with the portmapper", "port", port)
+		}
+	}
+
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
@@ -114,6 +133,10 @@ func (s *Server) Start() error {
 // Stop gracefully stops the NFS server
 func (s *Server) Stop() error {
 	s.logger.Info("Stopping NFS server")
+
+	if s.portmapRegistered {
+		unregisterPortmap()
+	}
 
 	// Cancel context to signal shutdown
 	s.cancel()

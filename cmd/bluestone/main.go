@@ -12,6 +12,7 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -391,6 +392,7 @@ func main() {
 		ConcurrentHandlers: cfg.Server.NFSConcurrentHandlers,
 		Locker:             nfs.NewLocker(locks),
 		Permissions:        nfsPermissions,
+		RegisterPortmap:    cfg.Server.NFSRegisterPortmap && slices.Contains(nfsVersions, 3),
 	})
 	if err != nil {
 		logging.Fatal("Failed to create NFS server", zap.Error(err))
