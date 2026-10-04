@@ -1,99 +1,127 @@
-# Bluestone: Comprehensive Manual Test Plan
+# Manual Test Plan
 
-This document serves as the foundational validation runbook for the Gateway Daemon. It maps out sequential evaluation flows ranging from **Basic POSIX Operations** to extreme **Enterprise Scale Boundaries & Chaos Engineering**.
+Ten checks to run by hand against a gateway, from basic file operations to
+killing the process mid-write. They need a running gateway and a mount of
+it:
 
-Before starting, ensure your gateway is running and correctly mounted organically:
 ```bash
 sudo mount -t nfs4 -o vers=4.0,tcp,soft,timeo=30,retrans=2,port=2049 localhost:/ /mnt/cos-nfs
 ```
 
+The `soft` mount matters for test 9: it makes the client give up with an
+error instead of waiting for ever when the gateway stops answering.
+
+Several tests read the gateway's log. The commands below assume the systemd
+service; if the gateway logs to a file, tail the file named by
+`logging.output` instead.
+
 ---
 
-## Part 1: Basic Functionality & POSIX Evaluations
+## Part 1: Basic file operations
 
-### 1. Simple Write and Read
-**Description**: Prove that strings can be written and natively resolved quickly mapped cleanly.
-**Steps**:
+### 1. Write and read
+
 1. `echo "Hello IBM COS NFS" > /mnt/cos-nfs/test_basic.txt`
 2. `cat /mnt/cos-nfs/test_basic.txt`
-**Expected Result**: Output perfectly matching `Hello IBM COS NFS` directly to standard output.
 
-### 2. Directory Navigation & Permissions
-**Description**: Evaluate fundamental path traversal capabilities natively.
-**Steps**:
+**Expected:** `cat` prints `Hello IBM COS NFS`.
+
+### 2. Directories and permissions
+
 1. `mkdir -p /mnt/cos-nfs/deep/nested/folder`
 2. `touch /mnt/cos-nfs/deep/nested/folder/empty.bin`
 3. `chmod 777 /mnt/cos-nfs/deep/nested/folder/empty.bin`
 4. `ls -lah /mnt/cos-nfs/deep/nested/folder`
-**Expected Result**: The `ls` maps all elements appropriately accurately resolving POSIX standard flags and attributes organically without I/O freezes dynamically.
 
-### 3. File Appending & Truncation
-**Description**: Validate internal bounds mapping offset variables organically natively bypassing COS limits.
-**Steps**:
+**Expected:** `ls` returns promptly and shows `empty.bin` with mode
+`-rwxrwxrwx`.
+
+### 3. Append and truncate
+
+Object storage cannot change part of an object, so these exercise the staging
+layer.
+
 1. `echo "Line 1" > /mnt/cos-nfs/modify.txt`
 2. `echo "Line 2" >> /mnt/cos-nfs/modify.txt`
 3. `truncate -s 5 /mnt/cos-nfs/modify.txt`
-**Expected Result**: `cat` correctly resolves `Line ` natively bounding precisely without 400 Bad Request limitations from basic COS layers safely!
+4. `cat /mnt/cos-nfs/modify.txt`
+
+**Expected:** `cat` prints `Line ` (five bytes), with no error.
 
 ---
 
-## Part 2: Enterprise Scaling & Deep Performance
+## Part 2: Size and concurrency
 
-### 4. Extreme Sustained Sequential Writing 
-**Description**: Evaluating how effectively the staging layer handles monolithic payload allocations continuously streaming data bounds effectively mapping cleanly.
-**Steps**: Explicitly funnel chunks continuously creating a monolithic `1GB` mapping!
+### 4. A large sequential write
+
 `dd if=/dev/urandom of=/mnt/cos-nfs/scale_1gb.blob bs=1M count=1000`
-**Expected Result**: Throughput explicitly matches disk cache capabilities (frequently generating `1+ GB/s` metrics). Data should organically funnel behind the scenes natively transparent to `dd` safely!
 
-### 5. High Concurrency Mixed Threads (FIO)
-**Description**: Executing parallel threads evaluating `Read / Write` overlap securely validating memory Mutex limits!
-**Steps**: Navigate into native paths running concurrent bindings manually:
+**Expected:** `dd` completes at about the speed of the staging disk, since
+writes are accepted into local staging. The upload to COS happens afterwards
+in the background and does not hold `dd` up.
+
+### 5. Concurrent mixed reads and writes
+
 `fio --name=randrw --directory=/mnt/cos-nfs --rw=randrw --bs=4k --size=100M --numjobs=10 --time_based --runtime=30`
-**Expected Result**: Evaluation dynamically concludes successfully. Logs must explicitly show `0` native kernel deadlock errors without producing `Input/output error` maps during parallel streaming organically.
+
+**Expected:** `fio` finishes with no errors. Neither `fio` nor the gateway
+log reports an `Input/output error`, and the gateway does not hang.
 
 ---
 
-## Part 3: Read-After-Write Staging Architecture
+## Part 3: Staging and write-back
 
-### 6. Local Disk Cache Consistency
-**Description**: Prove that native datasets seamlessly invoke the local staging layers avoiding IBM latency explicitly safely.
-**Steps**:
-1. Run stream generating caching chunk evaluations sequentially natively:
-   `dd if=/dev/urandom of=/mnt/cos-nfs/test_cache.bin bs=1M count=250`
-2. **Immediately** evaluate chunk responses directly without stdout evaluations organically:
-   `time cat /mnt/cos-nfs/test_cache.bin > /dev/null`
-**Expected Result**: `cat` finishes natively within fractional milliseconds organically proving mapping bypassed the IBM mapping latency naturally bounds cleanly.
+### 6. Reading back what was just written
 
-### 7. Progressive Array Background Upload Tracking
-**Description**: Ensure massive blob arrays map securely dynamically dispatching upload vectors correctly organically.
-**Steps**:
-1. Open terminal 1 executing: `sudo journalctl -u bluestone -f | grep -i "multipart"` (or tail the file named by `logging.output`)
-2. Execute massive blob inside terminal 2 gracefully: `dd if=/dev/urandom of=/mnt/cos-nfs/massive.blob bs=100M count=50`
-**Expected Result**: Terminal 1 organically tracks native output emitting continuous bounds displaying iterations natively organically natively uploading dynamically concurrently while terminal 2 generates data bound paths cleanly.
+1. `dd if=/dev/urandom of=/mnt/cos-nfs/test_cache.bin bs=1M count=250`
+2. Straight away: `time cat /mnt/cos-nfs/test_cache.bin > /dev/null`
 
-### 8. Hard Drive Limit / Quota Constraint Tests
-**Description**: Evaluate limits triggering active OS restrictions dynamically seamlessly organically!
-**Steps**:
-1. Lower constraints organically editing `config.yaml` setting `staging.max_staging_size_gb: 1` and restarting the gateway.
-2. Push evaluations organically over mapping sequentially smoothly safely executing organically: `dd if=/dev/zero of=/mnt/cos-nfs/quota.bin bs=1M count=3000`
-**Expected Result**: Command organically fails exactly after `1024` buffers bounds yielding `dd: error writing ... No space left on device` cleanly proving quota mechanisms actively natively preserved root disk architectures seamlessly gracefully.
+**Expected:** the read is served from local staging, so it takes well under
+the time a 250 MB download from COS would.
+
+### 7. Multipart upload of a large file
+
+1. In one terminal: `sudo journalctl -u bluestone -f | grep -i "multipart"`
+2. In another: `dd if=/dev/urandom of=/mnt/cos-nfs/massive.blob bs=100M count=50`
+
+**Expected:** once the file starts syncing, the log shows
+`Multipart upload lifecycle event` entries for it. `dd` is not slowed by the
+upload. Progress is also visible at
+`http://127.0.0.1:8082/debug/staging/sync` when `server.debug_enabled` is on.
+
+### 8. Staging quota
+
+1. Set `staging.max_staging_size_gb: 1` in the configuration and restart the
+   gateway.
+2. `dd if=/dev/zero of=/mnt/cos-nfs/quota.bin bs=1M count=3000`
+
+**Expected:** `dd` slows as staging fills and then fails with
+`No space left on device`, before the staging filesystem itself is full.
+With `staging.backpressure_mode: "block"`, the default, it may wait up to
+`backpressure_wait_timeout` for sync to free space before failing.
 
 ---
 
-## Part 4: Extreme Chaos & Edge Resilience
+## Part 4: Failures
 
-### 9. Gateway Disconnections & Kernel Traps
-**Description**: Evaluate systemic Operating System lockups preventing SSH hangouts executing gracefully cleanly.
-**Steps**:
-1. Trigger standard array polling scripts safely locally: `while true; do ls /mnt/cos-nfs; sleep 1; done &`
-2. Send kill signal dynamically mapping bounds correctly simulating crashes organically: `sudo pkill -STOP -f bluestone`
-**Expected Result**: After polling OS standard bounds maps efficiently mapped out delays correctly effectively, native strings return `EIO` explicitly bypassing systemic freezes gracefully handling kernel dropouts safely.
+### 9. A gateway that stops answering
 
-### 10. Data Orphan Integrity Reboots
-**Description**: Prove `.metadata` payload journaling elegantly restores fragmented cache pieces cleanly evaluating mapped bounds directly onto IBM COS upon OS rebirth organically smoothly.
-**Steps**:
-1. Execute `dd if=/dev/urandom of=/mnt/cos-nfs/disaster.bin bs=1M count=100 &`
-2. Hard Kill Daemon natively mimicking Out-of-Memory faults mapping forcefully: `sudo pkill -9 -f bluestone`
-3. Reboot binaries mapping paths natively evaluating `config.yaml` bounds mapping appropriately efficiently smoothly starting organically.
-4. Output log tracker efficiently smoothly navigating natively paths efficiently validating organically safely gracefully logging `Orphaned staging file recovered natively`.
-**Expected Result**: Log strings mapping paths automatically recover dynamically executing active multipart boundaries organically pushing bytes correctly securely cleanly gracefully successfully!
+1. `while true; do ls /mnt/cos-nfs; sleep 1; done &`
+2. Freeze the gateway: `sudo pkill -STOP -f bluestone`
+
+**Expected:** after the mount's timeout and retries, `ls` fails with
+`Input/output error` instead of hanging, and the shell stays usable.
+Resume the gateway with `sudo pkill -CONT -f bluestone`; `ls` works again.
+
+### 10. A crash with unsynced data
+
+1. `dd if=/dev/urandom of=/mnt/cos-nfs/disaster.bin bs=1M count=100 &`
+2. Kill the gateway without warning: `sudo pkill -9 -f bluestone`
+3. Start it again with the same configuration.
+4. Read its log from startup: `sudo journalctl -u bluestone -b | grep -i recover`
+
+**Expected:** the log shows
+`Recovered staging files automatically after daemon crash`. What `dd` had
+written before the kill is still in staging, and the gateway resumes
+uploading it to COS. Bytes `dd` had not yet written are, of course, not
+there.
