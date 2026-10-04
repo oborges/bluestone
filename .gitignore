@@ -29,11 +29,22 @@ go.work
 *~
 .DS_Store
 
-# Configuration files with secrets
-configs/config.yaml
+# Configuration files with secrets. Only the example is versioned: a real
+# configuration, or a copy of one under any name, holds COS keys and SMB
+# account hashes.
+configs/*
 !configs/config.example.yaml
-configs/local-config.yaml
-/local-config.yaml
+/*.yaml
+/*.yml
+*.yaml.*
+*.yml.*
+*config*.yaml
+!configs/config.example.yaml
+!deployments/kubernetes/configmap.yaml
+smb-users*.yaml
+*.pem
+*.key
+*.keytab
 # Cache directories
 /var/cache/
 *.cache
