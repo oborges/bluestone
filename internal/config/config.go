@@ -84,6 +84,12 @@ type SMBConfig struct {
 	Limits SMBLimits `mapstructure:"limits"`
 	// Users are local accounts, authenticated with NTLM.
 	Users []SMBUser `mapstructure:"users"`
+	// UsersFile names a YAML file holding more local accounts, under a
+	// "users" key as here. Their hashes are secrets, so keeping them in a
+	// file of their own lets the main configuration be copied and shared
+	// without them. A relative path is taken from the configuration file's
+	// directory.
+	UsersFile string `mapstructure:"users_file"`
 	// Kerberos lets Active Directory users sign in with their own
 	// credentials, with no local account.
 	Kerberos SMBKerberos `mapstructure:"kerberos"`
@@ -519,6 +525,15 @@ func Load(configPath string) (*Config, error) {
 		return nil, fmt.Errorf("failed to unmarshal config: %w", err)
 	}
 	config.Notices = legacyEnvNotices()
+	if config.SMB.UsersFile != "" {
+		notice, err := loadSMBUsersFile(&config.SMB, v.ConfigFileUsed())
+		if err != nil {
+			return nil, err
+		}
+		if notice != "" {
+			config.Notices = append(config.Notices, notice)
+		}
+	}
 	if dir, ok := legacyStagingRootFallback(v); ok {
 		config.Staging.RootDir = dir
 		config.Notices = append(config.Notices, fmt.Sprintf(
@@ -626,6 +641,7 @@ func bindEnvOverrides(v *viper.Viper) error {
 		"smb.leases",
 		"smb.durable_handles",
 		"smb.max_dialect",
+		"smb.users_file",
 		"smb.kerberos.keytab",
 		"smb.kerberos.max_clock_skew",
 		"smb.id_map.domain_sid",

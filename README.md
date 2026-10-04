@@ -358,6 +358,30 @@ reused elsewhere. It is the same hash Windows and Samba store, so an existing
 one can be pasted in. `password` still works and logs a warning at startup;
 set one or the other, not both.
 
+Accounts can live in a file of their own instead, so the main configuration
+holds no SMB secrets and can be copied or shared without them:
+
+```yaml
+smb:
+  users_file: "smb-users.yaml" # relative to the configuration file
+```
+
+```yaml
+# smb-users.yaml
+users:
+  - username: "alice"
+    ntlm_hash: "<32 hex characters>"
+    uid: 2001
+    gid: 2001
+```
+
+It takes the same fields as `users`, and both may be used together; an
+account named in both is refused. The gateway will not start if the file is
+missing, lists no accounts or has a field it does not know, and logs a notice
+at startup if anyone but the file's owner can read it. COS keys can be kept
+out of the configuration the same way, with the `BLUESTONE_COS_ACCESS_KEY`,
+`BLUESTONE_COS_SECRET_KEY` and `BLUESTONE_COS_API_KEY` environment variables.
+
 Keep the configuration file readable only by the gateway's service account.
 `server.allowed_clients` also applies to the SMB port. Binding port 445 on
 Linux needs root or `CAP_NET_BIND_SERVICE`. `smb.enabled`, `smb.port`,
