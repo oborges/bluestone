@@ -60,6 +60,7 @@ func nfs4OnRename(c *nfs4Compound, args io.Reader, res io.Writer) nfs4Status {
 	if err := c.handler.InvalidateHandle(source.fs, oldHandle); err != nil {
 		return nfs4ErrServerFault
 	}
+	c.w.Server.nfs4State().forgetOpens(oldPath)
 	return nfs4Encode(res, nfs4RenameRes{
 		Source: nfs4ChangeInfo{Before: sourceBefore, After: source.changeID()},
 		Target: nfs4ChangeInfo{Before: targetBefore, After: target.changeID()},

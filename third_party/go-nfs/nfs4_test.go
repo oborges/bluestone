@@ -464,3 +464,113 @@ func TestNFSv4RenameInvalidatesOldHandle(t *testing.T) {
 		t.Fatalf("GETATTR of the new name: status = %d", status)
 	}
 }
+
+// A file renamed or removed while a client has it open leaves that client
+// unable to CLOSE it: the handle it would send is stale. The server must not
+// keep the open's state waiting for a CLOSE that cannot come.
+func TestNFSv4RemoveAndRenameEndOpens(t *testing.T) {
+	srv, handler, _ := newNFS4TestServer(t)
+	unchecked := &nfs4CreateHow{Mode: nfs4CreateUnchecked}
+
+	type opened struct {
+		id nfs4StateID
+		fh []byte
+	}
+	open := func(name string) opened {
+		t.Helper()
+		status, resp := nfs4RunCompound(t, srv, handler,
+			nfs4TestOp{nfs4OpPutRootFH, nil},
+			nfs4OpenFile(name, "alice", unchecked),
+			nfs4TestOp{nfs4OpGetFH, nil},
+		)
+		if status != nfs4OK {
+			t.Fatalf("OPEN %s: status = %d", name, status)
+		}
+		nfs4ExpectOp(t, resp, nfs4OpPutRootFH, nfs4OK, nil)
+		var res nfs4OpenRes
+		nfs4ExpectOp(t, resp, nfs4OpOpen, nfs4OK, &res)
+		var fh []byte
+		nfs4ExpectOp(t, resp, nfs4OpGetFH, nfs4OK, &fh)
+		return opened{res.StateID, fh}
+	}
+	closeStatus := func(o opened) nfs4Status {
+		status, _ := nfs4RunCompound(t, srv, handler,
+			nfs4TestOp{nfs4OpPutFH, nfs4PutFHArgs{Handle: o.fh}},
+			nfs4TestOp{nfs4OpClose, nfs4CloseArgs{Seqid: 2, StateID: o.id}},
+		)
+		return status
+	}
+
+	renamed, removed, kept := open("renamed"), open("removed"), open("kept")
+
+	if status, _ := nfs4RunCompound(t, srv, handler,
+		nfs4TestOp{nfs4OpPutRootFH, nil},
+		nfs4TestOp{nfs4OpSaveFH, nil},
+		nfs4TestOp{nfs4OpRename, nfs4RenameArgs{OldName: "renamed", NewName: "moved"}},
+	); status != nfs4OK {
+		t.Fatalf("RENAME: status = %d", status)
+	}
+	if status, _ := nfs4RunCompound(t, srv, handler,
+		nfs4TestOp{nfs4OpPutRootFH, nil},
+		nfs4TestOp{nfs4OpRemove, nfs4RemoveArgs{Name: "removed"}},
+	); status != nfs4OK {
+		t.Fatalf("REMOVE: status = %d", status)
+	}
+
+	sm := srv.nfs4State()
+	if len(sm.states) != 1 {
+		t.Fatalf("%d open states after RENAME and REMOVE, want only the untouched file's", len(sm.states))
+	}
+	for name, o := range map[string]opened{"renamed": renamed, "removed": removed} {
+		if status := closeStatus(o); status != nfs4ErrStale {
+			t.Errorf("CLOSE of the %s file through its old handle: status = %d, want STALE", name, status)
+		}
+	}
+	if status := closeStatus(kept); status != nfs4OK {
+		t.Errorf("CLOSE of the untouched file: status = %d", status)
+	}
+	if len(sm.states) != 0 {
+		t.Errorf("%d open states left, want none", len(sm.states))
+	}
+
+	// A failed REMOVE retires nothing.
+	still := open("still")
+	if status, _ := nfs4RunCompound(t, srv, handler,
+		nfs4TestOp{nfs4OpPutRootFH, nil},
+		nfs4TestOp{nfs4OpRemove, nfs4RemoveArgs{Name: "missing"}},
+	); status != nfs4ErrNoEnt {
+		t.Fatalf("REMOVE of a missing file: status = %d, want NOENT", status)
+	}
+	if status := closeStatus(still); status != nfs4OK {
+		t.Errorf("CLOSE after an unrelated failed REMOVE: status = %d", status)
+	}
+}
+
+// The same holds when the file is removed or renamed over NFSv3 while an
+// NFSv4 client has it open.
+func TestNFSv3RemoveAndRenameEndNFSv4Opens(t *testing.T) {
+	fs := newOwnedFS(t)
+	g, err := fs.Create("/g")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = g.Close()
+	srv, root := serveV3As(t, fs, 0, 0)
+
+	sm := srv.nfs4State()
+	owner := nfs4Owner{ClientID: 7, Owner: "alice"}
+	sm.open(owner, nfs4Join(fs, []string{"f"}))
+	sm.open(owner, nfs4Join(fs, []string{"g"}))
+
+	if err := root.Remove("/f"); err != nil {
+		t.Fatalf("REMOVE: %v", err)
+	}
+	if err := root.Rename("/g", "/h"); err != nil {
+		t.Fatalf("RENAME: %v", err)
+	}
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	if len(sm.states) != 0 {
+		t.Errorf("%d NFSv4 open states left after NFSv3 REMOVE and RENAME, want none", len(sm.states))
+	}
+}

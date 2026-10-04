@@ -368,3 +368,59 @@ func TestDeniedOwnerMapping(t *testing.T) {
 		t.Fatalf("malformed NFSv4 client = %+v, want descriptive owner", got)
 	}
 }
+
+// A REMOVE or RENAME invalidates the file's handle, so the client can no
+// longer send the CLOSE that ends its opens: they go with the file.
+func TestForgetOpensDropsTheFilesOpenStates(t *testing.T) {
+	sm := newNFS4StateManager(&fakeLocker{})
+	alice := nfs4Owner{ClientID: 1, Owner: "alice"}
+	bob := nfs4Owner{ClientID: 2, Owner: "bob"}
+
+	aliceF := sm.open(alice, "/f")
+	bobF := sm.open(bob, "/f")
+	aliceG := sm.open(alice, "/g")
+	lockF, _, status := sm.lock(alice, "/f", mustRange(t, 0, 1, nfs4WriteLT))
+	if status != nfs4OK {
+		t.Fatalf("lock: status = %d", status)
+	}
+
+	sm.forgetOpens("/f")
+
+	for name, id := range map[string]nfs4StateID{"alice": aliceF, "bob": bobF} {
+		if _, status := sm.close(id); status != nfs4ErrBadStateID {
+			t.Errorf("close of %s's open of the retired file: status = %d, want BAD_STATEID", name, status)
+		}
+	}
+	if _, status := sm.close(aliceG); status != nfs4OK {
+		t.Errorf("close of an open of another file: status = %d", status)
+	}
+	// Lock state is the lock owner's to release (RELEASE_LOCKOWNER).
+	if _, status := sm.unlock(lockF, "/f", mustRange(t, 0, 1, nfs4WriteLT)); status != nfs4OK {
+		t.Errorf("unlock on the retired file: status = %d", status)
+	}
+	if len(sm.opensByPath) != 0 {
+		t.Errorf("opensByPath = %v, want empty", sm.opensByPath)
+	}
+	// The same owner opening the path again starts a new state.
+	if again := sm.open(alice, "/f"); again.Other == aliceF.Other || again.Seqid != 1 {
+		t.Errorf("open after forgetOpens = %+v, want a new state at seqid 1", again)
+	}
+}
+
+// Closed opens leave nothing behind in the per-file index.
+func TestCloseAndExpiryClearOpensByPath(t *testing.T) {
+	sm := newNFS4StateManager(&fakeLocker{})
+	now := time.Unix(1000, 0)
+	sm.now = func() time.Time { return now }
+
+	id := sm.open(nfs4Owner{ClientID: 1, Owner: "o"}, "/f")
+	if _, status := sm.close(id); status != nfs4OK {
+		t.Fatalf("close: status = %d", status)
+	}
+	sm.open(nfs4Owner{ClientID: 2, Owner: "o"}, "/g")
+	now = now.Add((nfs4LeaseGracePeriods*nfs4LeaseTimeSecs + 1) * time.Second)
+	sm.open(nfs4Owner{ClientID: 3, Owner: "o"}, "/h") // sweeps client 2
+	if len(sm.opensByPath) != 1 || len(sm.opensByPath["/h"]) != 1 {
+		t.Fatalf("opensByPath = %v, want only /h", sm.opensByPath)
+	}
+}
