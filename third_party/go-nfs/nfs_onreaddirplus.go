@@ -91,11 +91,10 @@ func onReadDirPlus(ctx context.Context, w *response, userHandle Handler) error {
 	maxEntities := userHandle.HandleLimit() / 2
 	fb := 0
 	fss := 0
-	for i, c := range contents {
-		// cookie equates to index within contents + 2 (for '.' and '..')
-		cookie := uint64(i + 2)
+	for _, c := range contents {
+		cookie := dirCookie(c.Name())
 		fb++
-		if started {
+		if started || cookie > obj.Cookie {
 			fss++
 			dirBytes += uint32(len(c.Name()) + 20)
 			maxBytes += 512 // TODO: better estimation.
@@ -115,8 +114,6 @@ func onReadDirPlus(ctx context.Context, w *response, userHandle Handler) error {
 				Handle:     &handle,
 				Next:       true,
 			})
-		} else if cookie == obj.Cookie {
-			started = true
 		}
 	}
 

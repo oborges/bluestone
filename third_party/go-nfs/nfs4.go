@@ -58,11 +58,13 @@ const (
 	nfs4ErrServerFault       nfs4Status = 10006
 	nfs4ErrBadType           nfs4Status = 10007
 	nfs4ErrDelay             nfs4Status = 10008
+	nfs4ErrSame              nfs4Status = 10009
 	nfs4ErrDenied            nfs4Status = 10010
 	nfs4ErrResource          nfs4Status = 10018
 	nfs4ErrNoFileHandle      nfs4Status = 10020
 	nfs4ErrMinorVersMismatch nfs4Status = 10021
 	nfs4ErrBadStateID        nfs4Status = 10025
+	nfs4ErrNotSame           nfs4Status = 10027
 	nfs4ErrAttrNotSupp       nfs4Status = 10032
 	nfs4ErrNoGrace           nfs4Status = 10033
 	nfs4ErrBadXDR            nfs4Status = 10036
@@ -79,6 +81,8 @@ const (
 	nfs4OpClose              nfs4Op = 4
 	nfs4OpCommit             nfs4Op = 5
 	nfs4OpCreate             nfs4Op = 6
+	nfs4OpDelegPurge         nfs4Op = 7
+	nfs4OpDelegReturn        nfs4Op = 8
 	nfs4OpGetAttr            nfs4Op = 9
 	nfs4OpGetFH              nfs4Op = 10
 	nfs4OpLink               nfs4Op = 11
@@ -87,7 +91,9 @@ const (
 	nfs4OpLockU              nfs4Op = 14
 	nfs4OpLookup             nfs4Op = 15
 	nfs4OpLookupP            nfs4Op = 16
+	nfs4OpNVerify            nfs4Op = 17
 	nfs4OpOpen               nfs4Op = 18
+	nfs4OpOpenAttr           nfs4Op = 19
 	nfs4OpOpenConfirm        nfs4Op = 20
 	nfs4OpOpenDowngrade      nfs4Op = 21
 	nfs4OpPutFH              nfs4Op = 22
@@ -105,6 +111,7 @@ const (
 	nfs4OpSetAttr            nfs4Op = 34
 	nfs4OpSetClientID        nfs4Op = 35
 	nfs4OpSetClientIDConfirm nfs4Op = 36
+	nfs4OpVerify             nfs4Op = 37
 	nfs4OpWrite              nfs4Op = 38
 	nfs4OpReleaseLockOwner   nfs4Op = 39
 	nfs4OpIllegal            nfs4Op = 10044
@@ -121,6 +128,8 @@ var nfs4OpHandlers = map[nfs4Op]nfs4OpHandler{
 	nfs4OpClose:              nfs4OnClose,
 	nfs4OpCommit:             nfs4OnCommit,
 	nfs4OpCreate:             nfs4OnCreate,
+	nfs4OpDelegPurge:         nfs4OnNotSupp,
+	nfs4OpDelegReturn:        nfs4OnNotSupp,
 	nfs4OpGetAttr:            nfs4OnGetAttr,
 	nfs4OpGetFH:              nfs4OnGetFH,
 	nfs4OpLink:               nfs4OnNotSupp,
@@ -129,7 +138,9 @@ var nfs4OpHandlers = map[nfs4Op]nfs4OpHandler{
 	nfs4OpLockU:              nfs4OnLockU,
 	nfs4OpLookup:             nfs4OnLookup,
 	nfs4OpLookupP:            nfs4OnLookupP,
+	nfs4OpNVerify:            nfs4OnNVerify,
 	nfs4OpOpen:               nfs4OnOpen,
+	nfs4OpOpenAttr:           nfs4OnNotSupp,
 	nfs4OpOpenConfirm:        nfs4OnOpenConfirm,
 	nfs4OpOpenDowngrade:      nfs4OnOpenDowngrade,
 	nfs4OpPutFH:              nfs4OnPutFH,
@@ -147,6 +158,7 @@ var nfs4OpHandlers = map[nfs4Op]nfs4OpHandler{
 	nfs4OpSetAttr:            nfs4OnSetAttr,
 	nfs4OpSetClientID:        nfs4OnSetClientID,
 	nfs4OpSetClientIDConfirm: nfs4OnSetClientIDConfirm,
+	nfs4OpVerify:             nfs4OnVerify,
 	nfs4OpWrite:              nfs4OnWrite,
 	nfs4OpReleaseLockOwner:   nfs4OnReleaseLockOwner,
 }
