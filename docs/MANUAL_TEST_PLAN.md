@@ -67,14 +67,14 @@ sudo mount -t nfs4 -o vers=4.0,tcp,soft,timeo=30,retrans=2,port=2049 localhost:/
 ### 7. Progressive Array Background Upload Tracking
 **Description**: Ensure massive blob arrays map securely dynamically dispatching upload vectors correctly organically.
 **Steps**:
-1. Open terminal 1 executing: `tail -f /tmp/nfs.log | grep -i "multipart"`
+1. Open terminal 1 executing: `sudo journalctl -u bluestone -f | grep -i "multipart"` (or tail the file named by `logging.output`)
 2. Execute massive blob inside terminal 2 gracefully: `dd if=/dev/urandom of=/mnt/cos-nfs/massive.blob bs=100M count=50`
 **Expected Result**: Terminal 1 organically tracks native output emitting continuous bounds displaying iterations natively organically natively uploading dynamically concurrently while terminal 2 generates data bound paths cleanly.
 
 ### 8. Hard Drive Limit / Quota Constraint Tests
 **Description**: Evaluate limits triggering active OS restrictions dynamically seamlessly organically!
 **Steps**:
-1. Lower constraints organically editing `config.yaml` using exact map `MaxStagingSizeGB: 1`.
+1. Lower constraints organically editing `config.yaml` setting `staging.max_staging_size_gb: 1` and restarting the gateway.
 2. Push evaluations organically over mapping sequentially smoothly safely executing organically: `dd if=/dev/zero of=/mnt/cos-nfs/quota.bin bs=1M count=3000`
 **Expected Result**: Command organically fails exactly after `1024` buffers bounds yielding `dd: error writing ... No space left on device` cleanly proving quota mechanisms actively natively preserved root disk architectures seamlessly gracefully.
 

@@ -965,7 +965,6 @@ Useful local documentation:
 - `ARCHITECTURE.md`
 - `docs/AWS_S3_FILES_COMPARISON.md`
 - `docs/POWER.md`
-- `docs/STAGING_ARCHITECTURE.md`
 
 ## License
 

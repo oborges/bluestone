@@ -131,6 +131,10 @@ standby# ha-promote.sh          # succeeds once stale (crash) or immediately
 client#  umount -l /mnt/cos-nfs && mount -t nfs4 -o vers=4.0 STANDBY_IP:/ /mnt/cos-nfs
 ```
 
+An AIX client keeps its old mount in place after a failover and every call on
+it fails with "Missing file or filesystem": use `umount -f` there, then mount
+again. See [IBM Power: Linux and AIX](POWER.md).
+
 In production, front the gateway with a DNS name (low TTL) and update it in
 the promotion step so clients remount to a stable name.
 

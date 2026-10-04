@@ -3,8 +3,8 @@
 ## Overview
 
 Bluestone exposes a single IBM Cloud Object Storage bucket as an
-NFSv4 filesystem by default, with optional NFSv3 compatibility. Linux clients
-speak NFS to the gateway; the gateway translates filesystem operations into COS
+NFSv4 filesystem by default, with optional NFSv3 compatibility. Linux and AIX
+clients speak NFS to the gateway; the gateway translates filesystem operations into COS
 object operations and uses local disk for staging, write-back sync, and read
 caching.
 
@@ -83,6 +83,24 @@ file and 8,192 per client, and expires when a client stops renewing its lease
 (90s lease, 3 lease periods of grace). Lock state does not survive a gateway
 restart; reclaim attempts after restart return NFS4ERR_NO_GRACE and
 applications must re-acquire.
+
+Opens have state too: each open owner's opens of a file share one stateid,
+whose generation moves on with every OPEN, OPEN_DOWNGRADE and CLOSE. Opens
+take no share reservations and nothing is enforced against READ or WRITE, so
+the state exists to give clients the stateids the protocol expects. It lives
+under the same client lease as lock state, which READ, WRITE and SETATTR
+renew, and is dropped when REMOVE or RENAME retires the file, since the
+file's handle is invalidated with it and no CLOSE can follow. An exclusive
+create (O_EXCL) of a name that exists is refused; the verifier is not kept,
+so a client that resends one after losing the reply is refused as well.
+
+VERIFY and NVERIFY are served, which the AIX client depends on to list
+directories. READDIR cookies, over NFSv3 and NFSv4, are derived from each
+entry's name rather than its position, so a listing resumes correctly while
+entries are being removed; listings are therefore not in name order. For
+NFSv3 clients that find the MOUNT program through the portmapper instead of
+a mount option, `server.nfs_register_portmap` registers the gateway with the
+host's rpcbind.
 
 The request path is:
 

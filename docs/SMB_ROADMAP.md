@@ -51,7 +51,8 @@ so it carries the least risk of regressing interop.
   with SMB alone.
 
 Done. Accounts keep an NT hash rather than a password (`bluestone -smb-hash`),
-and a plaintext one warns at startup. `smb.limits` bounds connections,
+and a plaintext one warns at startup. They can be kept out of the main
+configuration, in a file of their own (`smb.users_file`). `smb.limits` bounds connections,
 sessions, share connections and open files, and repeated failed logins from
 one address are slowed down and then blocked; both are covered by tests. The
 SMB server has a health check and `smb_*` metrics for sessions, opens, locks,
@@ -192,9 +193,8 @@ and no local user exists in the config.
   clients produced.
 - A client matrix: Windows 10 and 11, Server 2019 through 2025, several macOS
   releases and `cifs` versions, Office, and robocopy.
-- Upstream: `third_party/go-smb-server/VENDOR.md` lists every local change.
-  Six pull requests are open against the upstream project; keeping them moving
-  keeps the vendored diff from drifting.
+- The vendored SMB library: `third_party/go-smb-server/VENDOR.md` lists
+  every local change. It is maintained here, as the gateway's own code.
 
 ## Known limitations that stay
 
