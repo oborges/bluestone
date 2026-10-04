@@ -203,7 +203,7 @@ func main() {
 	// Initialize metrics
 	metrics.Initialize()
 	if cfg.Server.MetricsEnabled {
-		if err := metrics.StartMetricsServer(cfg.Server.MetricsPort); err != nil {
+		if err := metrics.StartMetricsServer(cfg.Server.MonitoringHost(), cfg.Server.MetricsPort); err != nil {
 			logging.Error("Failed to start metrics server", zap.Error(err))
 		}
 	} else {
@@ -222,7 +222,7 @@ func main() {
 	))
 
 	if cfg.Server.HealthEnabled {
-		if err := health.StartHealthServer(cfg.Server.HealthPort, healthChecker); err != nil {
+		if err := health.StartHealthServer(cfg.Server.MonitoringHost(), cfg.Server.HealthPort, healthChecker); err != nil {
 			logging.Error("Failed to start health server", zap.Error(err))
 		}
 	} else {

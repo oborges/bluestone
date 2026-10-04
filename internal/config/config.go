@@ -341,11 +341,15 @@ type ServerConfig struct {
 	MetricsPort    int    `mapstructure:"metrics_port"`
 	HealthEnabled  bool   `mapstructure:"health_enabled"`
 	HealthPort     int    `mapstructure:"health_port"`
-	DebugEnabled   bool   `mapstructure:"debug_enabled"`
-	DebugPort      int    `mapstructure:"debug_port"`
-	MaxConnections int    `mapstructure:"max_connections"`
-	ReadTimeout    string `mapstructure:"read_timeout"`
-	WriteTimeout   string `mapstructure:"write_timeout"`
+	// MonitoringAddress is the address the metrics and health servers
+	// listen on. The default, 127.0.0.1, keeps them to the host itself;
+	// 0.0.0.0 lets a container platform's probes and scraper reach them.
+	MonitoringAddress string `mapstructure:"monitoring_address"`
+	DebugEnabled      bool   `mapstructure:"debug_enabled"`
+	DebugPort         int    `mapstructure:"debug_port"`
+	MaxConnections    int    `mapstructure:"max_connections"`
+	ReadTimeout       string `mapstructure:"read_timeout"`
+	WriteTimeout      string `mapstructure:"write_timeout"`
 	// AllowedClients restricts which client addresses may connect to the NFS
 	// port. Entries are CIDRs ("10.0.1.0/24") or single IPs ("10.0.1.5").
 	// Empty means all clients are allowed (rely on external firewalling).
@@ -557,6 +561,7 @@ func bindEnvOverrides(v *viper.Viper) error {
 		"server.metrics_port",
 		"server.health_enabled",
 		"server.health_port",
+		"server.monitoring_address",
 		"server.debug_enabled",
 		"server.debug_port",
 		"server.max_connections",
@@ -721,6 +726,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("server.metrics_port", 8080)
 	v.SetDefault("server.health_enabled", false)
 	v.SetDefault("server.health_port", 8081)
+	v.SetDefault("server.monitoring_address", "127.0.0.1")
 	v.SetDefault("server.debug_enabled", false)
 	v.SetDefault("server.debug_port", 8082)
 	v.SetDefault("server.max_connections", 1000)
@@ -838,6 +844,16 @@ func (c *ServerConfig) GetReadTimeout() (time.Duration, error) {
 // GetWriteTimeout returns the parsed write timeout duration
 func (c *ServerConfig) GetWriteTimeout() (time.Duration, error) {
 	return time.ParseDuration(c.WriteTimeout)
+}
+
+// MonitoringHost is the address the metrics and health servers listen on:
+// MonitoringAddress, or loopback when that is unset. An empty host would
+// mean every interface.
+func (c *ServerConfig) MonitoringHost() string {
+	if c.MonitoringAddress == "" {
+		return "127.0.0.1"
+	}
+	return c.MonitoringAddress
 }
 
 // GetNFSVersions returns the enabled NFS protocol versions.

@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"math"
+	"net"
 	"os"
 	"path"
 	"strconv"
@@ -350,6 +351,9 @@ func validateServer(config *ServerConfig) error {
 
 	if config.HealthPort < 1 || config.HealthPort > 65535 {
 		return fmt.Errorf("invalid health_port: %d (must be 1-65535)", config.HealthPort)
+	}
+	if config.MonitoringAddress != "" && net.ParseIP(config.MonitoringAddress) == nil {
+		return fmt.Errorf("invalid monitoring_address: %q (must be an IP address, such as 127.0.0.1 or 0.0.0.0)", config.MonitoringAddress)
 	}
 
 	if config.MaxConnections < 1 {

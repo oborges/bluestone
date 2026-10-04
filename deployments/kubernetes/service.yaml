@@ -9,17 +9,12 @@ spec:
   selector:
     app: bluestone
   ports:
+  # NFS only. Metrics and health have no authentication and stay inside the
+  # cluster: the kubelet probes the pod directly, and bluestone-metrics below
+  # is a ClusterIP service for the scraper.
   - name: nfs
     port: 2049
     targetPort: 2049
-    protocol: TCP
-  - name: metrics
-    port: 8080
-    targetPort: 8080
-    protocol: TCP
-  - name: health
-    port: 8081
-    targetPort: 8081
     protocol: TCP
   sessionAffinity: ClientIP
   sessionAffinityConfig:

@@ -13,8 +13,15 @@ data:
     server:
       nfs_port: 2049
       nfs_version: "4"
+      # The probes in deployment.yaml and the Prometheus scrape come from
+      # outside the container, so both servers are on, and listen on every
+      # address rather than the default 127.0.0.1. Neither authenticates:
+      # service.yaml keeps them off the load balancer.
+      metrics_enabled: true
       metrics_port: 8080
+      health_enabled: true
       health_port: 8081
+      monitoring_address: "0.0.0.0"
       max_connections: 1000
       read_timeout: "30s"
       write_timeout: "30s"
@@ -50,6 +57,11 @@ data:
       max_full_object_read_mb: 512
       max_buffered_write_mb: 512
       max_directory_entries: 100000
+
+    staging:
+      enabled: true
+      root_dir: "/var/staging/bluestone"
+      max_staging_size_gb: 10
 
     logging:
       level: "info"

@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: bluestone-staging
+  labels:
+    app: bluestone
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      # At least staging.max_staging_size_gb in the ConfigMap.
+      storage: 12Gi

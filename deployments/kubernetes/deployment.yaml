@@ -6,7 +6,12 @@ metadata:
     app: bluestone
     version: v1
 spec:
-  replicas: 2
+  # One gateway serves a bucket at a time: two writing the same bucket
+  # corrupt each other's write-back state. Recreate stops the old pod before
+  # the new one starts, so an upgrade never runs two.
+  replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: bluestone
@@ -21,6 +26,9 @@ spec:
         prometheus.io/path: "/metrics"
     spec:
       serviceAccountName: bluestone
+      # The image runs as uid and gid 1000; this lets it write its volumes.
+      securityContext:
+        fsGroup: 1000
       containers:
       - name: bluestone
         image: oborges/bluestone:1.0.0
@@ -69,6 +77,8 @@ spec:
           readOnly: true
         - name: cache
           mountPath: /var/cache/bluestone
+        - name: staging
+          mountPath: /var/staging/bluestone
         livenessProbe:
           httpGet:
             path: /health/live
@@ -100,17 +110,10 @@ spec:
       - name: cache
         emptyDir:
           sizeLimit: 10Gi
-      affinity:
-        podAntiAffinity:
-          preferredDuringSchedulingIgnoredDuringExecution:
-          - weight: 100
-            podAffinityTerm:
-              labelSelector:
-                matchExpressions:
-                - key: app
-                  operator: In
-                  values:
-                  - bluestone
-              topologyKey: kubernetes.io/hostname
+      # Staging holds writes the gateway has accepted but not yet uploaded.
+      # It must outlive the pod, or a restart loses them.
+      - name: staging
+        persistentVolumeClaim:
+          claimName: bluestone-staging
 
 # Made with Bob
