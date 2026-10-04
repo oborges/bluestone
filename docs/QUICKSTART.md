@@ -209,19 +209,33 @@ kubectl get pods -l app=bluestone
 kubectl get svc bluestone
 ```
 
+If the image is in a private registry, uncomment `imagePullSecrets` in
+`deployment.yaml` and name the registry's pull secret; without it the pod
+stays in `ImagePullBackOff`.
+
 ### 3. Get Service IP
 
+The service is a `ClusterIP`: the export has no user authentication, so it is
+not put on a load balancer by default. Clients inside the cluster mount it by
+that address (the kernel's NFS client does not resolve service names):
+
 ```bash
-# Get the LoadBalancer IP
-kubectl get svc bluestone -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
+kubectl get svc bluestone -o jsonpath='{.spec.clusterIP}'
 ```
+
+For clients outside the cluster, change the service's type to `LoadBalancer`
+in `service.yaml` and restrict who can reach it, as the comment there
+describes.
 
 ### 4. Mount from Client
 
 ```bash
-# Replace <SERVICE_IP> with the actual IP
+# Replace <SERVICE_IP> with the address from the previous step
 sudo mount -t nfs4 -o vers=4.0,tcp,port=2049 <SERVICE_IP>:/ /mnt/cos
 ```
+
+A pod that mounts the export needs to be privileged, or to use an NFS volume
+in its spec instead of running `mount` itself.
 
 ## Monitoring
 

@@ -26,6 +26,12 @@ spec:
         prometheus.io/path: "/metrics"
     spec:
       serviceAccountName: bluestone
+      # An image in a private registry needs the registry's pull secret here:
+      # the pod runs as its own service account, which does not have the one
+      # a cluster gives its default account. On IBM Cloud Kubernetes Service
+      # with IBM Container Registry that secret is "all-icr-io".
+      # imagePullSecrets:
+      # - name: all-icr-io
       # The image runs as uid and gid 1000; this lets it write its volumes.
       securityContext:
         fsGroup: 1000
@@ -64,10 +70,13 @@ spec:
             secretKeyRef:
               name: bluestone-secret
               key: ibm-cloud-api-key
+        # Requests are what the pod needs to be scheduled, and are kept small
+        # enough for a 2 vCPU, 4 GB worker, where the cluster's own pods leave
+        # little. Raise them, and the limits, for a busy gateway.
         resources:
           requests:
-            memory: "512Mi"
-            cpu: "500m"
+            memory: "256Mi"
+            cpu: "100m"
           limits:
             memory: "2Gi"
             cpu: "2000m"
