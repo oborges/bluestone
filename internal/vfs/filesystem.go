@@ -803,6 +803,16 @@ func (fs *Filesystem) renameDirectoryWithStagedFiles(oldFull, newFull string, ch
 
 	sort.Strings(children)
 	moved := make([]string, 0, len(children))
+	// A moved file must not start syncing under its new name until the
+	// bucket rename has succeeded: once uploaded and cleaned from staging
+	// it could no longer be put back. Holding its sync claim keeps the
+	// sync workers off it.
+	claimed := make([]string, 0, len(children))
+	release := func() {
+		for _, path := range claimed {
+			sm.UnlockSync(path)
+		}
+	}
 	// undo puts the staged files back under their old names, so a rename
 	// that fails leaves the directory where the client still believes it is.
 	undo := func() {
@@ -810,18 +820,21 @@ func (fs *Filesystem) renameDirectoryWithStagedFiles(oldFull, newFull string, ch
 			child := moved[i]
 			if err := sm.RenameStagedPath(target(child), child); err != nil {
 				fs.logger.Error("Failed to move a staged file back after a failed directory rename; it stays under the new name",
-					zap.String("path", child),
-					zap.String("new_path", target(child)),
-					zap.Error(err))
+					"path", child, "new_path", target(child), "error", err)
 				continue
 			}
 			fs.ops.InvalidateFileMutation(child)
 			fs.ops.InvalidateFileMutation(target(child))
 		}
+		release()
 	}
 
 	for _, child := range children {
+		holdsClaim := sm.TryLockSync(target(child))
 		if err := sm.RenameStagedPath(child, target(child)); err != nil {
+			if holdsClaim {
+				sm.UnlockSync(target(child))
+			}
 			if os.IsNotExist(err) {
 				// No staged bytes after all: whatever the bucket holds for
 				// it moves with the directory's other objects.
@@ -829,6 +842,9 @@ func (fs *Filesystem) renameDirectoryWithStagedFiles(oldFull, newFull string, ch
 			}
 			undo()
 			return err
+		}
+		if holdsClaim {
+			claimed = append(claimed, target(child))
 		}
 		moved = append(moved, child)
 		fs.ops.InvalidateFileMutation(child)
@@ -843,20 +859,19 @@ func (fs *Filesystem) renameDirectoryWithStagedFiles(oldFull, newFull string, ch
 		// Give the new name one, so the files below it can be reached.
 		if mkErr := fs.ops.CreateDirectory(ctx, newFull, nil); mkErr != nil && !os.IsExist(mkErr) {
 			fs.logger.Error("Failed to create the marker of a renamed directory that had only staged files",
-				zap.String("path", newFull), zap.Error(mkErr))
+				"path", newFull, "error", mkErr)
 		}
 	default:
 		undo()
 		return err
 	}
+	release()
 
 	// The pending deletes on the old names are left to the sync worker. It
 	// removes each object only once no upload of it is in flight, which an
 	// inline delete here could not wait for.
 	fs.logger.Info("Renamed a directory with staged files",
-		zap.String("old_path", oldFull),
-		zap.String("new_path", newFull),
-		zap.Int("staged_files", len(moved)))
+		"old_path", oldFull, "new_path", newFull, "staged_files", len(moved))
 	return nil
 }
 

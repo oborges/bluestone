@@ -1409,6 +1409,11 @@ func (h *OperationsHandler) renameDirectory(ctx context.Context, oldPath, newPat
 		}
 		destKey := newPrefix + strings.TrimPrefix(obj.Key, oldPrefix)
 		if err := h.cosClient.CopyObject(ctx, obj.Key, destKey); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				// Deleted since the listing, as a pending delete is when the
+				// sync worker gets to it: there is nothing to carry over.
+				continue
+			}
 			log.Error("Failed to copy directory object",
 				zap.String("source_key", obj.Key),
 				zap.String("dest_key", destKey),

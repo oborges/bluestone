@@ -421,6 +421,12 @@ func TestFilesystemRenameDirectoryMovesItsStagedFiles(t *testing.T) {
 		if !manager.HasPendingDelete(old) {
 			t.Errorf("%s has no pending delete to retire its old object", old)
 		}
+		// The rename held the file's sync claim; it must be free again, or
+		// the file would never upload.
+		if !manager.TryLockSync(renamed) {
+			t.Errorf("%s is still claimed after the rename", renamed)
+		}
+		manager.UnlockSync(renamed)
 	}
 	if got := readStaged(t, fs, "moved/new.txt"); got != "never synced" {
 		t.Errorf("moved/new.txt = %q", got)
@@ -527,6 +533,12 @@ func TestFilesystemRenameDirectoryFailureKeepsStagedFilesInPlace(t *testing.T) {
 	check("failed copy", "/dir/a.txt", "/dir/b.txt")
 	if manager.IsDirty("/moved/a.txt") || manager.IsDirty("/moved/b.txt") {
 		t.Error("staged files were left under the new name after a failed rename")
+	}
+	for _, p := range []string{"/dir/a.txt", "/moved/a.txt"} {
+		if !manager.TryLockSync(p) {
+			t.Errorf("%s is still claimed after the failed rename", p)
+		}
+		manager.UnlockSync(p)
 	}
 	if got := readStaged(t, fs, "dir/a.txt"); got != "a" {
 		t.Errorf("dir/a.txt after a failed rename = %q", got)
