@@ -273,6 +273,8 @@ type fakeObjectStore struct {
 	omitListMetadata bool
 	rangeCalls       int
 	headCalls        int
+	// headCallsByKey counts HeadObject calls for each key.
+	headCallsByKey map[string]int
 	// afterList runs once a listing has been taken, before it is returned,
 	// to simulate an object changing while the listing is in flight.
 	afterList func()
@@ -412,6 +414,10 @@ func (s *fakeObjectStore) headCallCount() int {
 func (s *fakeObjectStore) HeadObject(_ context.Context, key string) (*types.ObjectMetadata, error) {
 	s.mu.Lock()
 	s.headCalls++
+	if s.headCallsByKey == nil {
+		s.headCallsByKey = make(map[string]int)
+	}
+	s.headCallsByKey[key]++
 	s.mu.Unlock()
 
 	s.mu.RLock()
