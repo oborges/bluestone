@@ -349,31 +349,256 @@ func TestFilesystemRenameCleanSourceOverSyncingDestinationStaysBusy(t *testing.T
 	}
 }
 
-func TestFilesystemRenameDirectoryWithDirtyChildIsBlocked(t *testing.T) {
-	cfg := testStagingConfig(t)
-	manager, err := staging.NewStagingManager(cfg)
+// stageFile leaves path dirty in staging with the given bytes, as a client
+// write that has not synced yet does.
+func stageFile(t *testing.T, manager *staging.StagingManager, path string, data []byte) {
+	t.Helper()
+	session, err := manager.GetOrCreateSession(path)
+	if err != nil {
+		t.Fatalf("GetOrCreateSession(%s) error = %v", path, err)
+	}
+	if _, err := session.Write(data, 0); err != nil {
+		t.Fatalf("session.Write(%s) error = %v", path, err)
+	}
+	if err := session.Sync(); err != nil {
+		t.Fatalf("session.Sync(%s) error = %v", path, err)
+	}
+	manager.MarkDirty(path, session.Size)
+	manager.ReleaseSession(path)
+}
+
+func readStaged(t *testing.T, fs *Filesystem, name string) string {
+	t.Helper()
+	f, err := fs.Open(name)
+	if err != nil {
+		t.Fatalf("Open(%s) error = %v", name, err)
+	}
+	defer f.Close()
+	data, err := io.ReadAll(f)
+	if err != nil {
+		t.Fatalf("read of %s error = %v", name, err)
+	}
+	return string(data)
+}
+
+// A directory whose files have not synced yet is renamed with them: a client
+// that writes a folder and renames it straight away must not be refused.
+func TestFilesystemRenameDirectoryMovesItsStagedFiles(t *testing.T) {
+	manager, err := staging.NewStagingManager(testStagingConfig(t))
 	if err != nil {
 		t.Fatalf("NewStagingManager() error = %v", err)
 	}
 	defer manager.Shutdown()
 
-	path := "/dir/dirty.txt"
-	session, err := manager.GetOrCreateSession(path)
-	if err != nil {
-		t.Fatalf("GetOrCreateSession() error = %v", err)
-	}
-	if _, err := session.Write([]byte("dirty data"), 0); err != nil {
-		t.Fatalf("session.Write() error = %v", err)
-	}
-	manager.MarkDirty(path, session.Size)
+	stageFile(t, manager, "/dir/new.txt", []byte("never synced"))
+	stageFile(t, manager, "/dir/sub/deep.txt", []byte("nested"))
+	stageFile(t, manager, "/dir/changed.txt", []byte("changed since sync"))
 
-	fs := newDirtyStagingTestFilesystem(t, manager)
-	err = fs.Rename("dir", "renamed-dir")
-	if !errors.Is(err, syscall.EBUSY) {
-		t.Fatalf("Rename(directory) error = %v, want EBUSY", err)
+	store := newFakeObjectStore()
+	store.put("dir/", nil)
+	store.put("dir/sub/", nil)
+	store.put("dir/clean.txt", []byte("already in the bucket"))
+	// changed.txt was synced once and written again: its object is stale.
+	store.put("dir/changed.txt", []byte("stale"))
+	store.put("other/keep.txt", []byte("untouched"))
+	fs := newDirtyStagingTestFilesystemWithStore(t, manager, store)
+
+	if err := fs.Rename("dir", "moved"); err != nil {
+		t.Fatalf("Rename(directory with staged files) error = %v", err)
 	}
-	if !manager.IsDirty(path) {
-		t.Fatal("dirty child path should remain dirty after blocked directory rename")
+
+	for old, renamed := range map[string]string{
+		"/dir/new.txt":      "/moved/new.txt",
+		"/dir/sub/deep.txt": "/moved/sub/deep.txt",
+		"/dir/changed.txt":  "/moved/changed.txt",
+	} {
+		if manager.IsDirty(old) {
+			t.Errorf("%s is still dirty under the old name", old)
+		}
+		if !manager.IsDirty(renamed) {
+			t.Errorf("%s is not dirty under the new name", renamed)
+		}
+		if !manager.HasPendingDelete(old) {
+			t.Errorf("%s has no pending delete to retire its old object", old)
+		}
+	}
+	if got := readStaged(t, fs, "moved/new.txt"); got != "never synced" {
+		t.Errorf("moved/new.txt = %q", got)
+	}
+	if got := readStaged(t, fs, "moved/sub/deep.txt"); got != "nested" {
+		t.Errorf("moved/sub/deep.txt = %q", got)
+	}
+	// The staged bytes win over the stale object, which is not carried over.
+	if got := readStaged(t, fs, "moved/changed.txt"); got != "changed since sync" {
+		t.Errorf("moved/changed.txt = %q", got)
+	}
+	if stale := store.get("moved/changed.txt"); stale != nil {
+		t.Errorf("the stale object was copied to the new name: %q", stale)
+	}
+	if got := string(store.get("moved/clean.txt")); got != "already in the bucket" {
+		t.Errorf("clean object under the new name = %q", got)
+	}
+	for _, gone := range []string{"dir/", "dir/sub/", "dir/clean.txt", "dir/changed.txt"} {
+		if store.get(gone) != nil || !store.wasDeleted(gone) {
+			t.Errorf("%s is still in the bucket", gone)
+		}
+	}
+	if got := string(store.get("other/keep.txt")); got != "untouched" {
+		t.Errorf("an object outside the directory changed: %q", got)
+	}
+	if _, err := fs.Stat("dir/new.txt"); !os.IsNotExist(err) {
+		t.Errorf("Stat(old name) = %v, want not-exist", err)
+	}
+	if _, err := fs.Stat("dir"); !os.IsNotExist(err) {
+		t.Errorf("Stat(old directory) = %v, want not-exist", err)
+	}
+	if info, err := fs.Stat("moved"); err != nil || !info.IsDir() {
+		t.Errorf("Stat(new directory) = %v, %v", info, err)
+	}
+}
+
+// A file being uploaded when its directory is renamed keeps its upload: the
+// pending delete on the old name waits for it, and the bytes sync again
+// under the new name.
+func TestFilesystemRenameDirectoryWithFileMidUpload(t *testing.T) {
+	manager, err := staging.NewStagingManager(testStagingConfig(t))
+	if err != nil {
+		t.Fatalf("NewStagingManager() error = %v", err)
+	}
+	defer manager.Shutdown()
+
+	stageFile(t, manager, "/dir/uploading.txt", []byte("on its way"))
+	if !manager.TryLockSync("/dir/uploading.txt") {
+		t.Fatal("failed to claim the sync lock for the test")
+	}
+	defer manager.UnlockSync("/dir/uploading.txt")
+
+	store := newFakeObjectStore()
+	store.put("dir/", nil)
+	fs := newDirtyStagingTestFilesystemWithStore(t, manager, store)
+
+	if err := fs.Rename("dir", "moved"); err != nil {
+		t.Fatalf("Rename() error = %v", err)
+	}
+	if !manager.IsDirty("/moved/uploading.txt") {
+		t.Error("the file is not waiting to sync under the new name")
+	}
+	if !manager.HasPendingDelete("/dir/uploading.txt") {
+		t.Error("nothing will remove the object the upload leaves under the old name")
+	}
+	if got := readStaged(t, fs, "moved/uploading.txt"); got != "on its way" {
+		t.Errorf("moved/uploading.txt = %q", got)
+	}
+}
+
+// A rename the bucket refuses leaves the staged files where they were.
+func TestFilesystemRenameDirectoryFailureKeepsStagedFilesInPlace(t *testing.T) {
+	manager, err := staging.NewStagingManager(testStagingConfig(t))
+	if err != nil {
+		t.Fatalf("NewStagingManager() error = %v", err)
+	}
+	defer manager.Shutdown()
+
+	stageFile(t, manager, "/dir/a.txt", []byte("a"))
+	stageFile(t, manager, "/dir/b.txt", []byte("b"))
+	stageFile(t, manager, "/dir2/c.txt", []byte("c"))
+
+	store := newFakeObjectStore()
+	store.put("dir/", nil)
+	store.put("dir/clean.txt", []byte("clean"))
+	store.put("dir2/", nil)
+	store.put("taken/", nil)
+	fs := newDirtyStagingTestFilesystemWithStore(t, manager, store)
+
+	check := func(what string, paths ...string) {
+		t.Helper()
+		for _, p := range paths {
+			if !manager.IsDirty(p) || manager.HasPendingDelete(p) {
+				t.Errorf("%s: %s is not staged under its old name any more", what, p)
+			}
+		}
+	}
+
+	// The bucket fails part-way through its copies.
+	store.failCopies(errors.New("copy refused"))
+	if err := fs.Rename("dir", "moved"); err == nil {
+		t.Fatal("Rename() with a failing bucket succeeded")
+	}
+	check("failed copy", "/dir/a.txt", "/dir/b.txt")
+	if manager.IsDirty("/moved/a.txt") || manager.IsDirty("/moved/b.txt") {
+		t.Error("staged files were left under the new name after a failed rename")
+	}
+	if got := readStaged(t, fs, "dir/a.txt"); got != "a" {
+		t.Errorf("dir/a.txt after a failed rename = %q", got)
+	}
+	store.failCopies(nil)
+
+	// The destination exists.
+	if err := fs.Rename("dir2", "taken"); err == nil {
+		t.Fatal("Rename() onto an existing directory succeeded")
+	}
+	check("existing destination", "/dir2/c.txt")
+
+	// And the same rename works once the bucket does.
+	if err := fs.Rename("dir", "moved"); err != nil {
+		t.Fatalf("Rename() after the bucket recovered error = %v", err)
+	}
+	if got := readStaged(t, fs, "moved/b.txt"); got != "b" {
+		t.Errorf("moved/b.txt = %q", got)
+	}
+}
+
+// A conflicted file below the directory stops the rename before anything
+// moves: a conflict stays until an operator resolves it.
+func TestFilesystemRenameDirectoryWithConflictedChildFails(t *testing.T) {
+	manager, err := staging.NewStagingManager(testStagingConfig(t))
+	if err != nil {
+		t.Fatalf("NewStagingManager() error = %v", err)
+	}
+	defer manager.Shutdown()
+
+	stageFile(t, manager, "/dir/ok.txt", []byte("ok"))
+	stageFile(t, manager, "/dir/bad.txt", []byte("bad"))
+	if _, err := manager.RecordConflict("/dir/bad.txt", staging.ExternalChangeSnapshot{
+		ObjectKey:    "dir/bad.txt",
+		Size:         13,
+		LastModified: time.Unix(200, 0),
+	}); err != nil {
+		t.Fatalf("RecordConflict() error = %v", err)
+	}
+
+	store := newFakeObjectStore()
+	store.put("dir/", nil)
+	fs := newDirtyStagingTestFilesystemWithStore(t, manager, store)
+
+	err = fs.Rename("dir", "moved")
+	if !errors.Is(err, staging.ErrPathConflicted) || errors.Is(err, syscall.EBUSY) {
+		t.Fatalf("Rename() error = %v, want a conflict that clients do not retry", err)
+	}
+	if !manager.IsDirty("/dir/ok.txt") || manager.IsDirty("/moved/ok.txt") {
+		t.Error("a staged file moved although the rename was refused")
+	}
+}
+
+// A destination with staged files below it is still refused.
+func TestFilesystemRenameDirectoryOntoStagedFilesIsRefused(t *testing.T) {
+	manager, err := staging.NewStagingManager(testStagingConfig(t))
+	if err != nil {
+		t.Fatalf("NewStagingManager() error = %v", err)
+	}
+	defer manager.Shutdown()
+
+	stageFile(t, manager, "/dst/staged.txt", []byte("in the way"))
+	store := newFakeObjectStore()
+	store.put("src/", nil)
+	store.put("src/f.txt", []byte("f"))
+	fs := newDirtyStagingTestFilesystemWithStore(t, manager, store)
+
+	if err := fs.Rename("src", "dst"); !errors.Is(err, syscall.EBUSY) {
+		t.Fatalf("Rename() onto a directory with staged files error = %v, want EBUSY", err)
+	}
+	if !manager.IsDirty("/dst/staged.txt") {
+		t.Error("the destination's staged file was disturbed")
 	}
 }
 
@@ -676,6 +901,8 @@ type fakeObjectStore struct {
 	deleteErr error
 	// headCalls counts HeadObject calls by key.
 	headCalls map[string]int
+	// copyErr fails CopyObject.
+	copyErr error
 	// metadata holds each object's user metadata.
 	metadata map[string]map[string]string
 	// putCalls counts object writes, telling data rewrites from
@@ -877,9 +1104,18 @@ func (s *fakeObjectStore) ListObjects(ctx context.Context, prefix string, maxKey
 	return result, nil
 }
 
+func (s *fakeObjectStore) failCopies(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.copyErr = err
+}
+
 func (s *fakeObjectStore) CopyObject(ctx context.Context, sourceKey, destKey string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.copyErr != nil {
+		return s.copyErr
+	}
 	data, ok := s.objects[sourceKey]
 	if !ok {
 		return os.ErrNotExist

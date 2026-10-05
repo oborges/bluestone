@@ -103,9 +103,14 @@ operations explicit:
   the moved bytes sync to the destination key. This supports the
   write-tmp-then-rename atomic-save pattern used by editors and sync tools.
   Renaming a clean file over a destination whose staged bytes are mid-upload
-  returns busy (retryable); directory rename is rejected when any dirty staged
-  child exists under the source or destination tree. This avoids losing
-  accepted writes that are still only in local staging.
+  returns busy (retryable).
+- A directory with files still waiting to sync is renamed with them: each
+  staged file moves to its new name as a rename of that file alone would, and
+  then the directory's objects are renamed in the bucket. It is no more atomic
+  than any directory rename; if the bucket rename fails, the staged files are
+  put back under their old names. Renaming onto a directory that has staged
+  files below it returns busy, and a directory with a conflicted file below it
+  cannot be renamed until the conflict is resolved.
 - `mkdir` creates a trailing-slash directory marker object. `rmdir` removes the
   marker only when the gateway's current listing sees the directory as empty.
   Implicit directories still come from object key prefixes and may converge
