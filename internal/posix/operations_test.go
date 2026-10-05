@@ -155,6 +155,35 @@ func TestRenameDirectoryCopyFailureLeavesSourceAndCopiedDestinations(t *testing.
 	}
 }
 
+// An object deleted between the listing and its copy has nothing to carry
+// over: the sync worker retires pending deletes while a rename runs.
+func TestRenameDirectorySkipsObjectsDeletedSinceTheListing(t *testing.T) {
+	ctx := context.Background()
+	store := newFakeObjectStore()
+	store.put("old/a.txt", []byte("a"), time.Unix(100, 0))
+	store.put("old/gone.txt", []byte("gone"), time.Unix(101, 0))
+	store.put("old/z.txt", []byte("z"), time.Unix(102, 0))
+	store.failCopy("old/gone.txt", "new/gone.txt", fmt.Errorf("failed to copy object old/gone.txt: %w", os.ErrNotExist))
+
+	ops, _ := newRefreshTestOps(t, store)
+	if err := ops.RenameFile(ctx, "/old", "/new"); err != nil {
+		t.Fatalf("RenameFile(directory) error = %v, want the vanished object skipped", err)
+	}
+	for _, key := range []string{"new/a.txt", "new/z.txt"} {
+		if _, err := store.HeadObject(ctx, key); err != nil {
+			t.Errorf("%s was not carried over: %v", key, err)
+		}
+	}
+	if _, err := store.HeadObject(ctx, "new/gone.txt"); !os.IsNotExist(err) {
+		t.Errorf("new/gone.txt HeadObject error = %v, want not exist", err)
+	}
+	for _, key := range []string{"old/a.txt", "old/gone.txt", "old/z.txt"} {
+		if _, err := store.HeadObject(ctx, key); !os.IsNotExist(err) {
+			t.Errorf("%s is still under the old name: %v", key, err)
+		}
+	}
+}
+
 func TestDeleteDirectoryNotEmptyReportsENOTEMPTY(t *testing.T) {
 	ctx := context.Background()
 	store := newFakeObjectStore()

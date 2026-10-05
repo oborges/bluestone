@@ -682,6 +682,11 @@ func (c *Client) copyObject(ctx context.Context, sourceKey, destKey string, meta
 
 	_, err := c.s3Client.CopyObjectWithContext(ctx, input)
 	if err = c.noteWrite(err); err != nil {
+		if isNotFoundError(err) {
+			// Callers tell a source that is gone from a copy that failed.
+			log.Debug("copy source does not exist", zap.Error(err))
+			return fmt.Errorf("failed to copy object %s: %w", sourceKey, os.ErrNotExist)
+		}
 		log.Error("failed to copy object", zap.Error(err))
 		return fmt.Errorf("failed to copy object: %w", err)
 	}
