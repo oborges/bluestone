@@ -79,17 +79,19 @@ func TestStatStillCachesUndisturbedLookups(t *testing.T) {
 	store.put("here", []byte("x"), time.Unix(100, 0))
 	ops, _ := newRefreshTestOps(t, store)
 
-	for _, path := range []string{"/here", "/missing"} {
-		_, _ = ops.Stat(ctx, path)
+	// Counted for the file's own key: Stat also asks for the directory
+	// marker, on a goroutine that can still be running when a file is found.
+	asked := func(key string) int {
 		store.mu.Lock()
-		before := store.headCalls
-		store.mu.Unlock()
-		_, _ = ops.Stat(ctx, path)
-		store.mu.Lock()
-		after := store.headCalls
-		store.mu.Unlock()
-		if after != before {
-			t.Errorf("second Stat(%s) asked the bucket again (%d more HEADs), want it answered from the cache", path, after-before)
+		defer store.mu.Unlock()
+		return store.headCallsByKey[key]
+	}
+	for _, key := range []string{"here", "missing"} {
+		_, _ = ops.Stat(ctx, "/"+key)
+		before := asked(key)
+		_, _ = ops.Stat(ctx, "/"+key)
+		if after := asked(key); after != before {
+			t.Errorf("second Stat(/%s) asked the bucket again (%d more HEADs), want it answered from the cache", key, after-before)
 		}
 	}
 }
