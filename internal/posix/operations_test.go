@@ -184,6 +184,78 @@ func TestRenameDirectorySkipsObjectsDeletedSinceTheListing(t *testing.T) {
 	}
 }
 
+// A directory's objects are copied and deleted several at a time. One at a
+// time, a directory of 1,500 took over a minute against COS, longer than an
+// NFS client waits before sending the rename again; the gateway then ran it
+// twice and the client was told a rename that had worked had failed.
+func TestRenameDirectoryCopiesAndDeletesConcurrently(t *testing.T) {
+	ctx := context.Background()
+	store := newFakeObjectStore()
+	const files = 60
+	store.put("old/", nil, time.Unix(100, 0))
+	for i := 0; i < files; i++ {
+		store.put(fmt.Sprintf("old/sub/f%03d", i), []byte{byte(i)}, time.Unix(100, 0))
+	}
+	store.writeDelay = 5 * time.Millisecond
+
+	ops, _ := newRefreshTestOps(t, store)
+	const limit = 12
+	ops.perfConfig.MaxConcurrentWrites = limit
+	if err := ops.RenameFile(ctx, "/old", "/new"); err != nil {
+		t.Fatalf("RenameFile(directory) error = %v", err)
+	}
+
+	store.mu.RLock()
+	most := store.maxWritesInFlight
+	store.mu.RUnlock()
+	if most < 2 || most > limit {
+		t.Errorf("at most %d bucket writes ran at once, want several and no more than max_concurrent_writes (%d)", most, limit)
+	}
+	for i := 0; i < files; i++ {
+		data, err := store.GetObject(ctx, fmt.Sprintf("new/sub/f%03d", i))
+		if err != nil || len(data) != 1 || data[0] != byte(i) {
+			t.Fatalf("new/sub/f%03d = %v, %v; want its own byte", i, data, err)
+		}
+		if _, err := store.HeadObject(ctx, fmt.Sprintf("old/sub/f%03d", i)); !os.IsNotExist(err) {
+			t.Fatalf("old/sub/f%03d is still there: %v", i, err)
+		}
+	}
+	if _, err := store.HeadObject(ctx, "new/"); err != nil {
+		t.Errorf("the directory marker was not carried over: %v", err)
+	}
+}
+
+// After a copy fails no further copies are started, and nothing is deleted.
+func TestRenameDirectoryStopsStartingCopiesAfterAFailure(t *testing.T) {
+	ctx := context.Background()
+	store := newFakeObjectStore()
+	const files = 80
+	for i := 0; i < files; i++ {
+		store.put(fmt.Sprintf("old/f%03d", i), []byte("x"), time.Unix(100, 0))
+	}
+	store.failCopy("old/f000", "new/f000", fmt.Errorf("injected copy failure"))
+	store.writeDelay = 5 * time.Millisecond
+
+	ops, _ := newRefreshTestOps(t, store)
+	const limit = 4
+	ops.perfConfig.MaxConcurrentWrites = limit
+	if err := ops.RenameFile(ctx, "/old", "/new"); err == nil {
+		t.Fatal("RenameFile(directory) error = nil, want the copy failure")
+	}
+
+	store.mu.RLock()
+	attempts := store.copyCalls
+	store.mu.RUnlock()
+	if attempts > 3*limit {
+		t.Errorf("%d copies were attempted after the first failed, want it to stop within a few (limit %d)", attempts, limit)
+	}
+	for i := 0; i < files; i++ {
+		if _, err := store.HeadObject(ctx, fmt.Sprintf("old/f%03d", i)); err != nil {
+			t.Fatalf("source old/f%03d was deleted after a failed copy: %v", i, err)
+		}
+	}
+}
+
 func TestDeleteDirectoryNotEmptyReportsENOTEMPTY(t *testing.T) {
 	ctx := context.Background()
 	store := newFakeObjectStore()

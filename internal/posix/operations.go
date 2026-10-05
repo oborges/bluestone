@@ -18,6 +18,7 @@ import (
 	"github.com/oborges/bluestone/internal/metrics"
 	"github.com/oborges/bluestone/pkg/types"
 	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -111,6 +112,15 @@ func (h *OperationsHandler) maxDirectoryEntries() int {
 		return h.perfConfig.MaxDirectoryEntries
 	}
 	return config.DefaultMaxDirectoryEntries
+}
+
+// maxConcurrentWrites bounds how many objects a bulk operation, such as a
+// directory rename, changes in the bucket at once.
+func (h *OperationsHandler) maxConcurrentWrites() int {
+	if h.perfConfig != nil && h.perfConfig.MaxConcurrentWrites > 0 {
+		return h.perfConfig.MaxConcurrentWrites
+	}
+	return 8
 }
 
 func (h *OperationsHandler) maxConcurrentReadFetches() int {
@@ -1397,52 +1407,93 @@ func (h *OperationsHandler) renameDirectory(ctx context.Context, oldPath, newPat
 		return os.ErrNotExist
 	}
 
-	copied := 0
+	// Copies, and then deletes, run several at a time. One at a time, a
+	// directory of a thousand objects took over a minute, longer than an
+	// NFS client waits before it sends the rename again.
+	sources := make([]string, 0, len(objects))
 	for _, obj := range objects {
-		if obj == nil || !strings.HasPrefix(obj.Key, oldPrefix) {
-			continue
+		if obj != nil && strings.HasPrefix(obj.Key, oldPrefix) {
+			sources = append(sources, obj.Key)
 		}
-		// A file whose delete is pending must not reappear under the new
-		// name; its source object is still removed below.
-		if h.isPendingDelete(obj.Key) {
-			continue
-		}
-		destKey := newPrefix + strings.TrimPrefix(obj.Key, oldPrefix)
-		if err := h.cosClient.CopyObject(ctx, obj.Key, destKey); err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				// Deleted since the listing, as a pending delete is when the
-				// sync worker gets to it: there is nothing to carry over.
-				continue
-			}
-			log.Error("Failed to copy directory object",
-				zap.String("source_key", obj.Key),
-				zap.String("dest_key", destKey),
-				zap.Error(err))
-			return fmt.Errorf("directory rename copied %d of %d objects before copy failed at %s -> %s; source objects were not deleted and copied destination objects were left in place: %w",
-				copied, len(objects), obj.Key, destKey, err)
-		}
-		copied++
 	}
 
-	deleted := 0
-	for _, obj := range objects {
-		if obj == nil || !strings.HasPrefix(obj.Key, oldPrefix) {
-			continue
+	copied, failedKey, err := h.forEachKey(sources, func(key string) (bool, error) {
+		// A file whose delete is pending must not reappear under the new
+		// name; its source object is still removed below.
+		if h.isPendingDelete(key) {
+			return false, nil
 		}
-		if err := h.cosClient.DeleteObject(ctx, obj.Key); err != nil {
-			log.Error("Failed to delete source directory object after copy",
-				zap.String("source_key", obj.Key),
-				zap.Error(err))
-			return fmt.Errorf("directory rename copied %d objects but deleted only %d source objects before delete failed at %s; source and destination may both contain objects: %w",
-				copied, deleted, obj.Key, err)
+		err := h.cosClient.CopyObject(ctx, key, newPrefix+strings.TrimPrefix(key, oldPrefix))
+		if errors.Is(err, os.ErrNotExist) {
+			// Deleted since the listing, as a pending delete is when the
+			// sync worker gets to it: there is nothing to carry over.
+			return false, nil
 		}
-		deleted++
+		return err == nil, err
+	})
+	if err != nil {
+		destKey := newPrefix + strings.TrimPrefix(failedKey, oldPrefix)
+		log.Error("Failed to copy directory object",
+			zap.String("source_key", failedKey),
+			zap.String("dest_key", destKey),
+			zap.Error(err))
+		return fmt.Errorf("directory rename copied %d of %d objects before copy failed at %s -> %s; source objects were not deleted and copied destination objects were left in place: %w",
+			copied, len(objects), failedKey, destKey, err)
+	}
+
+	deleted, failedKey, err := h.forEachKey(sources, func(key string) (bool, error) {
+		err := h.cosClient.DeleteObject(ctx, key)
+		return err == nil, err
+	})
+	if err != nil {
+		log.Error("Failed to delete source directory object after copy",
+			zap.String("source_key", failedKey),
+			zap.Error(err))
+		return fmt.Errorf("directory rename copied %d objects but deleted only %d source objects before delete failed at %s; source and destination may both contain objects: %w",
+			copied, deleted, failedKey, err)
 	}
 
 	log.Debug("Directory renamed successfully",
 		zap.Int("objects_copied", copied),
 		zap.Int("objects_deleted", deleted))
 	return nil
+}
+
+// forEachKey calls fn for each key, up to max_concurrent_writes of them at a
+// time. fn reports whether it did anything, and forEachKey returns how many
+// did. After a failure no further calls are started; those under way finish.
+// It returns the first failure and the key it was for.
+func (h *OperationsHandler) forEachKey(keys []string, fn func(key string) (bool, error)) (int, string, error) {
+	var (
+		group     errgroup.Group
+		mu        sync.Mutex
+		done      int
+		failedKey string
+		firstErr  error
+	)
+	group.SetLimit(h.maxConcurrentWrites())
+	for _, key := range keys {
+		mu.Lock()
+		failed := firstErr != nil
+		mu.Unlock()
+		if failed {
+			break
+		}
+		group.Go(func() error {
+			did, err := fn(key)
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case err != nil && firstErr == nil:
+				failedKey, firstErr = key, err
+			case err == nil && did:
+				done++
+			}
+			return nil
+		})
+	}
+	_ = group.Wait()
+	return done, failedKey, firstErr
 }
 
 // UpdateAttributes applies a metadata-only attribute change without rewriting
