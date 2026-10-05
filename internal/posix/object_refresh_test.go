@@ -278,6 +278,32 @@ type fakeObjectStore struct {
 	afterList func()
 	// afterHead does the same for a HeadObject of the key it is given.
 	afterHead func(key string)
+	// writeDelay makes every copy and delete take this long, and
+	// maxWritesInFlight records how many ran at once.
+	writeDelay        time.Duration
+	writesInFlight    int
+	maxWritesInFlight int
+	copyCalls         int
+}
+
+// beginWrite and endWrite bracket a copy or delete, to observe concurrency.
+func (s *fakeObjectStore) beginWrite() {
+	s.mu.Lock()
+	s.writesInFlight++
+	if s.writesInFlight > s.maxWritesInFlight {
+		s.maxWritesInFlight = s.writesInFlight
+	}
+	delay := s.writeDelay
+	s.mu.Unlock()
+	if delay > 0 {
+		time.Sleep(delay)
+	}
+}
+
+func (s *fakeObjectStore) endWrite() {
+	s.mu.Lock()
+	s.writesInFlight--
+	s.mu.Unlock()
 }
 
 type fakeObject struct {
@@ -366,6 +392,8 @@ func (s *fakeObjectStore) PutObject(_ context.Context, key string, data []byte, 
 }
 
 func (s *fakeObjectStore) DeleteObject(_ context.Context, key string) error {
+	s.beginWrite()
+	defer s.endWrite()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.deleteErrors[key]; err != nil {
@@ -457,6 +485,11 @@ func (s *fakeObjectStore) listObjects(prefix string, maxKeys int) ([]*types.Obje
 }
 
 func (s *fakeObjectStore) CopyObject(_ context.Context, sourceKey, destKey string) error {
+	s.beginWrite()
+	defer s.endWrite()
+	s.mu.Lock()
+	s.copyCalls++
+	s.mu.Unlock()
 	s.mu.RLock()
 	err := s.copyErrors[copyErrorKey(sourceKey, destKey)]
 	s.mu.RUnlock()
