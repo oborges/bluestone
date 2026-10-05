@@ -122,7 +122,10 @@ func (feed *changeFeed) active() bool {
 // isDirPath reports whether the key path is a directory, for describing a
 // change. It is asked only when something is subscribed.
 func (fs *Filesystem) isDirPath(fullPath string) bool {
-	info, err := fs.ops.Stat(fs.requestContext(), fullPath)
+	// Through staging, as every other stat: a file that is only staged is
+	// not in the bucket, and asking there cost a round trip on every remove
+	// and left a "does not exist" in the cache for a file that does.
+	info, err := fs.statPath(fullPath, fullPath)
 	return err == nil && info.IsDir()
 }
 

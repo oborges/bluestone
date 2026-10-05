@@ -276,6 +276,8 @@ type fakeObjectStore struct {
 	// afterList runs once a listing has been taken, before it is returned,
 	// to simulate an object changing while the listing is in flight.
 	afterList func()
+	// afterHead does the same for a HeadObject of the key it is given.
+	afterHead func(key string)
 }
 
 type fakeObject struct {
@@ -385,9 +387,14 @@ func (s *fakeObjectStore) HeadObject(_ context.Context, key string) (*types.Obje
 	s.mu.Unlock()
 
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	obj, ok := s.objects[key]
+	hook := s.afterHead
+	s.mu.RUnlock()
+	// The answer is settled; whatever the hook changes comes after it.
+	if hook != nil {
+		hook(key)
+	}
+
 	if !ok {
 		return nil, os.ErrNotExist
 	}

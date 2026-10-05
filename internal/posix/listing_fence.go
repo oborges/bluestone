@@ -1,6 +1,9 @@
 package posix
 
-import "sync"
+import (
+	"strings"
+	"sync"
+)
 
 // listingFence keeps a directory listing taken from COS out of the cache when
 // the directory was invalidated while that listing was in flight. Without it
@@ -57,5 +60,16 @@ func (f *listingFence) invalidate(dir string) {
 	defer f.mu.Unlock()
 	if entry := f.inflight[dir]; entry != nil {
 		entry.generation++
+	}
+}
+
+// invalidatePrefix marks everything in flight at or below prefix as stale.
+func (f *listingFence) invalidatePrefix(prefix string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for path, entry := range f.inflight {
+		if strings.HasPrefix(path, prefix) {
+			entry.generation++
+		}
 	}
 }

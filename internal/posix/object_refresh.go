@@ -272,6 +272,7 @@ func (h *OperationsHandler) invalidateObjectPath(path string) int {
 		return 0
 	}
 	h.metadataCache.Delete(path)
+	h.lookups.invalidate(NormalizePath(path))
 	return 1 + h.invalidateAncestorListings(GetParentPath(path))
 }
 
