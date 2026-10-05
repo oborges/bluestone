@@ -592,6 +592,52 @@ func TestFilesystemRecreateCancelsPendingDelete(t *testing.T) {
 	}
 }
 
+// Removing a file that is only staged must not ask the bucket about it, even
+// to describe the change to subscribers (the SMB server subscribes whenever
+// it is enabled). The bucket does not have the file yet; asking cost a round
+// trip per remove and cached a "does not exist" for a file that exists.
+func TestFilesystemRemoveOfStagedFileDoesNotAskTheBucket(t *testing.T) {
+	manager, err := staging.NewStagingManager(testStagingConfig(t))
+	if err != nil {
+		t.Fatalf("NewStagingManager() error = %v", err)
+	}
+	defer manager.Shutdown()
+
+	path := "/dir/staged.txt"
+	session, err := manager.GetOrCreateSession(path)
+	if err != nil {
+		t.Fatalf("GetOrCreateSession() error = %v", err)
+	}
+	if _, err := session.Write([]byte("staged"), 0); err != nil {
+		t.Fatalf("session.Write() error = %v", err)
+	}
+	manager.MarkDirty(path, session.Size)
+	manager.ReleaseSession(path)
+
+	store := newFakeObjectStore()
+	store.put("dir/", nil)
+	fs := newDirtyStagingTestFilesystemWithStore(t, manager, store)
+	var seen []Change
+	cancel := fs.SubscribeChanges(func(c Change) { seen = append(seen, c) })
+	defer cancel()
+
+	if err := fs.Remove("dir/staged.txt"); err != nil {
+		t.Fatalf("Remove() error = %v", err)
+	}
+	store.mu.Lock()
+	heads := store.headCalls["dir/staged.txt"]
+	store.mu.Unlock()
+	if heads != 0 {
+		t.Errorf("Remove() of a staged file asked the bucket about it %d times, want none", heads)
+	}
+	if len(seen) != 1 || seen[0].IsDir {
+		t.Errorf("changes published = %+v, want one, for a file", seen)
+	}
+	if _, err := fs.Stat("dir/staged.txt"); !os.IsNotExist(err) {
+		t.Errorf("Stat() after Remove() = %v, want not exist", err)
+	}
+}
+
 func TestFilesystemRemoveDirectoryWithDirtyChildIsBlocked(t *testing.T) {
 	cfg := testStagingConfig(t)
 	manager, err := staging.NewStagingManager(cfg)
@@ -628,6 +674,8 @@ type fakeObjectStore struct {
 	objects   map[string][]byte
 	deleted   map[string]bool
 	deleteErr error
+	// headCalls counts HeadObject calls by key.
+	headCalls map[string]int
 	// metadata holds each object's user metadata.
 	metadata map[string]map[string]string
 	// putCalls counts object writes, telling data rewrites from
@@ -791,6 +839,10 @@ func (s *fakeObjectStore) DeleteObject(ctx context.Context, key string) error {
 func (s *fakeObjectStore) HeadObject(ctx context.Context, key string) (*types.ObjectMetadata, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.headCalls == nil {
+		s.headCalls = make(map[string]int)
+	}
+	s.headCalls[key]++
 	if s.lookupErr != nil {
 		return nil, s.lookupErr
 	}

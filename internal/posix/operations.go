@@ -30,6 +30,13 @@ type OperationsHandler struct {
 	perfConfig    *config.PerformanceConfig
 	readGroup     singleflight.Group
 	listings      listingFence
+	// lookups does for Stat what listings does for a listing: a probe of a
+	// path that was invalidated while the probe was in flight is not cached.
+	// Without it a lookup that just missed an upload (asked before the
+	// object landed, answered after the sync cleared the cache) left a
+	// "does not exist" behind it, and a delete arriving in the next few
+	// seconds took the file for gone and removed nothing.
+	lookups listingFence
 	// pendingDelete reports paths whose delete was accepted but whose object
 	// may still be in COS (a staged file removed while its upload was in
 	// flight). Such objects are left out of listings and directory checks.
@@ -150,7 +157,9 @@ func (h *OperationsHandler) InvalidateObjectAfterSync(path string) {
 		normalized := NormalizePath(path)
 		parent := GetParentPath(normalized)
 		h.metadataCache.Delete(normalized)
-		// A listing of the parent in flight may predate the upload.
+		// A lookup of the file, or a listing of the parent, in flight may
+		// predate the upload.
+		h.lookups.invalidate(normalized)
 		h.listings.invalidate(parent)
 		if !h.cachedListingHas(parent, GetBaseName(normalized)) {
 			h.metadataCache.Delete(parent)
@@ -187,6 +196,8 @@ func (h *OperationsHandler) invalidateDirectoryMutation(path string) {
 
 		h.metadataCache.Delete(normalized)
 		h.metadataCache.InvalidatePrefix(prefix)
+		h.lookups.invalidate(normalized)
+		h.lookups.invalidatePrefix(prefix)
 		h.invalidateAncestorListings(GetParentPath(normalized))
 	}
 
@@ -299,6 +310,21 @@ func (h *OperationsHandler) Stat(ctx context.Context, path string) (_ *FileInfo,
 	// Translate path to object key
 	objectKey := h.translator.ToObjectKey(path)
 
+	// What the probes below find is cached only if nothing invalidated the
+	// path while they were in flight: the answer may predate the change.
+	fenced := NormalizePath(path)
+	fenceGeneration := h.lookups.begin(fenced)
+	fenceOpen := true
+	defer func() {
+		if fenceOpen {
+			h.lookups.end(fenced, fenceGeneration)
+		}
+	}()
+	stillCurrent := func() bool {
+		fenceOpen = false
+		return h.lookups.end(fenced, fenceGeneration)
+	}
+
 	// A backend failure that is not a definite "not found" must not be
 	// reported as nonexistence: false ENOENT during an object-store outage
 	// corrupts application behavior. Track it and surface an I/O error.
@@ -341,7 +367,9 @@ func (h *OperationsHandler) Stat(ctx context.Context, path string) (_ *FileInfo,
 		}
 
 		// Cache the result
-		h.metadataCache.SetFileInfo(path, info, attrs)
+		if stillCurrent() {
+			h.metadataCache.SetFileInfo(path, info, attrs)
+		}
 
 		// Removed debug logging from hot path
 		return info, nil
@@ -365,7 +393,9 @@ func (h *OperationsHandler) Stat(ctx context.Context, path string) (_ *FileInfo,
 		}
 
 		// Cache the result
-		h.metadataCache.SetFileInfo(path, info, attrs)
+		if stillCurrent() {
+			h.metadataCache.SetFileInfo(path, info, attrs)
+		}
 
 		// Removed debug logging from hot path
 		return info, nil
@@ -412,7 +442,9 @@ func (h *OperationsHandler) Stat(ctx context.Context, path string) (_ *FileInfo,
 
 		// Cache the result as a normal directory (NOT implicit)
 		// Once validated, we don't need to re-validate on every Stat() call
-		h.metadataCache.SetFileInfo(path, info, attrs)
+		if stillCurrent() {
+			h.metadataCache.SetFileInfo(path, info, attrs)
+		}
 
 		log.Debug("Implicit directory stat successful")
 		return info, nil
@@ -463,7 +495,9 @@ func (h *OperationsHandler) Stat(ctx context.Context, path string) (_ *FileInfo,
 	// Cache the miss briefly so lookup/create storms do not pay repeated
 	// object-store probes for the same missing path. Local creates overwrite
 	// the entry through the staging layer and normal invalidation.
-	h.metadataCache.SetNegative(path)
+	if stillCurrent() {
+		h.metadataCache.SetNegative(path)
+	}
 
 	log.Debug("Path not found")
 	return nil, os.ErrNotExist
