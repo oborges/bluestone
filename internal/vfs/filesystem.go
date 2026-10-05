@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -728,13 +729,25 @@ func (fs *Filesystem) rename(oldpath, newpath string) error {
 			}
 		}
 
-		// Directory renames with dirty staged children stay blocked: moving a
-		// tree would have to re-key every child atomically.
-		if err := fs.ensureNoDirtyStagedChildren("rename", oldFull); err != nil {
-			return err
+		// Nor does a directory move out from under a conflict below it: the
+		// conflict names the file by its path.
+		if conflicted := fs.conflictedPathUnder(oldFull); conflicted != "" {
+			return &os.PathError{
+				Op:   "rename",
+				Path: conflicted,
+				Err:  fmt.Errorf("%w: %w", staging.ErrPathConflicted, syscall.EIO),
+			}
 		}
+
+		// A destination with staged files below it is a directory that is
+		// not empty, whatever the bucket holds.
 		if err := fs.ensureNoDirtyStagedChildren("rename", newFull); err != nil {
 			return err
+		}
+
+		// A directory with staged files below it: they move with it.
+		if children := fs.dirtyStagedChildren(oldFull); len(children) > 0 {
+			return fs.renameDirectoryWithStagedFiles(oldFull, newFull, children)
 		}
 
 		// A source with an accepted delete no longer exists.
@@ -757,6 +770,94 @@ func (fs *Filesystem) rename(oldpath, newpath string) error {
 	}
 
 	return fs.ops.RenameFile(fs.requestContext(), oldFull, newFull)
+}
+
+// renameDirectoryWithStagedFiles renames a directory that has files waiting
+// to sync below it. Each staged file is re-keyed to its new name, as a rename
+// of that file alone would be, and then the directory's objects are renamed
+// in the bucket. Like the bucket rename it is not atomic: a crash part-way
+// leaves some files under each name, and none lost.
+//
+// The staged files go first. Each leaves a pending delete on its old name,
+// so the bucket rename does not copy the stale object a file may have there,
+// and still removes it. A file that finishes syncing while this runs is
+// either re-keyed, when its upload to the old name is undone by that pending
+// delete, or already in the bucket, when the bucket rename moves it. The
+// other order would leave such a file behind under the old name.
+func (fs *Filesystem) renameDirectoryWithStagedFiles(oldFull, newFull string, children []string) error {
+	sm := fs.stagingManager
+	ctx := fs.requestContext()
+
+	target := func(child string) string { return newFull + strings.TrimPrefix(child, oldFull) }
+
+	// The bucket rename refuses a destination that exists. Find that out
+	// before anything has moved, and let it say so.
+	if sm.IsDirty(newFull) {
+		return &os.PathError{Op: "rename", Path: newFull, Err: syscall.ENOTDIR}
+	}
+	if _, err := fs.ops.Stat(ctx, newFull); err == nil {
+		return fs.ops.RenameFile(ctx, oldFull, newFull)
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+
+	sort.Strings(children)
+	moved := make([]string, 0, len(children))
+	// undo puts the staged files back under their old names, so a rename
+	// that fails leaves the directory where the client still believes it is.
+	undo := func() {
+		for i := len(moved) - 1; i >= 0; i-- {
+			child := moved[i]
+			if err := sm.RenameStagedPath(target(child), child); err != nil {
+				fs.logger.Error("Failed to move a staged file back after a failed directory rename; it stays under the new name",
+					zap.String("path", child),
+					zap.String("new_path", target(child)),
+					zap.Error(err))
+				continue
+			}
+			fs.ops.InvalidateFileMutation(child)
+			fs.ops.InvalidateFileMutation(target(child))
+		}
+	}
+
+	for _, child := range children {
+		if err := sm.RenameStagedPath(child, target(child)); err != nil {
+			if os.IsNotExist(err) {
+				// No staged bytes after all: whatever the bucket holds for
+				// it moves with the directory's other objects.
+				continue
+			}
+			undo()
+			return err
+		}
+		moved = append(moved, child)
+		fs.ops.InvalidateFileMutation(child)
+		fs.ops.InvalidateFileMutation(target(child))
+	}
+
+	err := fs.ops.RenameFile(ctx, oldFull, newFull)
+	switch {
+	case err == nil:
+	case os.IsNotExist(err) && len(moved) > 0:
+		// The directory had nothing in the bucket, not even its marker.
+		// Give the new name one, so the files below it can be reached.
+		if mkErr := fs.ops.CreateDirectory(ctx, newFull, nil); mkErr != nil && !os.IsExist(mkErr) {
+			fs.logger.Error("Failed to create the marker of a renamed directory that had only staged files",
+				zap.String("path", newFull), zap.Error(mkErr))
+		}
+	default:
+		undo()
+		return err
+	}
+
+	// The pending deletes on the old names are left to the sync worker. It
+	// removes each object only once no upload of it is in flight, which an
+	// inline delete here could not wait for.
+	fs.logger.Info("Renamed a directory with staged files",
+		zap.String("old_path", oldFull),
+		zap.String("new_path", newFull),
+		zap.Int("staged_files", len(moved)))
+	return nil
 }
 
 // renameDirtyStagedFile renames a dirty staged source by re-keying the staged
@@ -930,9 +1031,19 @@ func (fs *Filesystem) removeDirtyStagedFile(fullPath string) error {
 	return nil
 }
 
-// ensureNoDirtyStagedChildren blocks operations on a directory tree that has
-// dirty staged files strictly below path (path itself is allowed).
-func (fs *Filesystem) ensureNoDirtyStagedChildren(op, path string) error {
+// conflictedPathUnder returns a conflicted path strictly below path, or "".
+func (fs *Filesystem) conflictedPathUnder(path string) string {
+	prefix := strings.TrimSuffix(path, "/") + "/"
+	for _, conflict := range fs.stagingManager.GetConflicts() {
+		if conflict != nil && strings.HasPrefix(conflict.Path, prefix) {
+			return conflict.Path
+		}
+	}
+	return ""
+}
+
+// dirtyStagedChildren lists the dirty staged files strictly below path.
+func (fs *Filesystem) dirtyStagedChildren(path string) []string {
 	if fs.featureFlags == nil || !fs.featureFlags.IsStagingEnabled() || fs.stagingManager == nil {
 		return nil
 	}
@@ -944,6 +1055,13 @@ func (fs *Filesystem) ensureNoDirtyStagedChildren(op, path string) error {
 			children = append(children, dirtyPath)
 		}
 	}
+	return children
+}
+
+// ensureNoDirtyStagedChildren blocks operations on a directory tree that has
+// dirty staged files strictly below path (path itself is allowed).
+func (fs *Filesystem) ensureNoDirtyStagedChildren(op, path string) error {
+	children := fs.dirtyStagedChildren(path)
 	if len(children) == 0 {
 		return nil
 	}
