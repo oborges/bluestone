@@ -5,6 +5,7 @@ go 1.25.0
 require (
 	github.com/IBM/ibm-cos-sdk-go v1.14.0
 	github.com/go-git/go-billy/v5 v5.6.0
+	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/hirochachacha/go-smb2 v1.1.0
 	github.com/prometheus/client_golang v1.23.2
 	github.com/prometheus/client_model v0.6.2
@@ -37,7 +38,6 @@ require (
 	github.com/hashicorp/go-cleanhttp v0.5.2 // indirect
 	github.com/hashicorp/go-retryablehttp v0.7.8 // indirect
 	github.com/hashicorp/go-uuid v1.0.3 // indirect
-	github.com/hashicorp/golang-lru/v2 v2.0.7 // indirect
 	github.com/jcmturner/aescts/v2 v2.0.0 // indirect
 	github.com/jcmturner/dnsutils/v2 v2.0.0 // indirect
 	github.com/jcmturner/gofork v1.7.6 // indirect

@@ -38,8 +38,6 @@ type PerformanceCounters struct {
 	// Conversion metrics
 	ConversionTime atomic.Int64 // nanoseconds
 
-	// Per-path tracking
-	pathCalls sync.Map // map[string]*int64
 	mu        sync.Mutex
 	startTime time.Time
 }
@@ -162,22 +160,6 @@ func GetTransferReport() map[string]interface{} {
 // RecordConversion records time spent in conversion
 func RecordConversion(duration time.Duration) {
 	globalCounters.ConversionTime.Add(duration.Nanoseconds())
-}
-
-// RecordPathCall records a call for a specific path
-func (pc *PerformanceCounters) RecordPathCall(path string) {
-	val, _ := pc.pathCalls.LoadOrStore(path, new(int64))
-	counter := val.(*int64)
-	atomic.AddInt64(counter, 1)
-}
-
-// GetPathCallCount returns the number of calls for a specific path
-func (pc *PerformanceCounters) GetPathCallCount(path string) int64 {
-	val, ok := pc.pathCalls.Load(path)
-	if !ok {
-		return 0
-	}
-	return atomic.LoadInt64(val.(*int64))
 }
 
 // GetReport generates a performance report

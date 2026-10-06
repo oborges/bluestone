@@ -1241,9 +1241,6 @@ func (fs *Filesystem) ReadDir(path string) ([]os.FileInfo, error) {
 
 	fullPath := fs.keyPath(path)
 
-	// Track per-path calls
-	metrics.GetGlobalCounters().RecordPathCall(fullPath)
-
 	// Take the staged sessions before listing COS. A file whose sync
 	// completes in between is then either still in this snapshot or already
 	// in the object store the listing reads (the sync drops any cached

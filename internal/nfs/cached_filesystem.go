@@ -28,6 +28,9 @@ type CachedFilesystem struct {
 	// generation counts invalidations, so a listing read while a change was
 	// made is not cached.
 	generation atomic.Uint64
+	// lastSweep is when expired listings were last dropped, in Unix
+	// nanoseconds.
+	lastSweep atomic.Int64
 }
 
 type cachedDir struct {
@@ -88,12 +91,35 @@ func (cfs *CachedFilesystem) ReadDir(path string) ([]os.FileInfo, error) {
 		timestamp: time.Now(),
 	}
 	cfs.cache.Store(key, dir)
+	cfs.dropExpired(dir.timestamp)
 
 	cfs.logger.Info("CACHE STORE: Cached directory listing",
 		"path", path,
 		"entries", len(entries))
 
 	return entries, nil
+}
+
+// dropExpired removes the listings past their TTL, at most once per TTL.
+// Nothing else removes the listing of a directory that is neither listed
+// again nor changed through this filesystem, so without it every directory
+// ever listed would keep its last listing in memory.
+func (cfs *CachedFilesystem) dropExpired(now time.Time) {
+	last := cfs.lastSweep.Load()
+	if now.UnixNano()-last < int64(cfs.cacheTTL) || !cfs.lastSweep.CompareAndSwap(last, now.UnixNano()) {
+		return
+	}
+	cfs.cache.Range(func(key, value any) bool {
+		dir := value.(*cachedDir)
+		dir.mu.RLock()
+		expired := now.Sub(dir.timestamp) >= cfs.cacheTTL
+		dir.mu.RUnlock()
+		if expired {
+			// Only this listing: one stored since is still fresh.
+			cfs.cache.CompareAndDelete(key, value)
+		}
+		return true
+	})
 }
 
 // InvalidateCache clears the cache for a specific path

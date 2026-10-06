@@ -124,3 +124,48 @@ func TestCachedFilesystemDoesNotCacheListingTakenDuringChange(t *testing.T) {
 		t.Fatalf("ReadDir after racing create = %q, want %q", got, "late")
 	}
 }
+
+func (cfs *CachedFilesystem) cachedListings() []string {
+	var keys []string
+	cfs.cache.Range(func(key, _ any) bool {
+		keys = append(keys, key.(string))
+		return true
+	})
+	sort.Strings(keys)
+	return keys
+}
+
+// A directory listed once and never changed through this filesystem has
+// nothing to drop its listing. Listings past their TTL are dropped when a
+// later one is stored, or every directory ever listed would stay in memory.
+func TestCachedFilesystemDropsExpiredListings(t *testing.T) {
+	base := memfs.New()
+	for _, dir := range []string{"old1", "old2", "new"} {
+		if err := base.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("MkdirAll(%s) error = %v", dir, err)
+		}
+		touch(t, base, dir+"/f")
+	}
+	const ttl = 50 * time.Millisecond
+	fs := NewCachedFilesystem(base, logging.NewKVLogger(zap.NewNop()), ttl)
+
+	listNames(t, fs, "old1")
+	listNames(t, fs, "old2")
+	if got := strings.Join(fs.cachedListings(), ","); got != "old1,old2" {
+		t.Fatalf("cached listings = %q, want old1,old2", got)
+	}
+
+	time.Sleep(2 * ttl)
+	if got := listNames(t, fs, "new"); got != "f" {
+		t.Fatalf("listing of new = %q, want f", got)
+	}
+	if got := strings.Join(fs.cachedListings(), ","); got != "new" {
+		t.Fatalf("cached listings after the old ones expired = %q, want new", got)
+	}
+
+	// The fresh one is served from the cache still.
+	touch(t, base, "new/behind-the-cache")
+	if got := listNames(t, fs, "new"); got != "f" {
+		t.Fatalf("listing of new within its TTL = %q, want the cached f", got)
+	}
+}
