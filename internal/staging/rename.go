@@ -9,6 +9,11 @@ import (
 	"go.uber.org/zap"
 )
 
+// moveStagedFile moves staged bytes to their new name on disk. It is a
+// variable so a test can take the bytes away just before the move, as a sync
+// worker finishing at that moment does.
+var moveStagedFile = os.Rename
+
 // RenameStagedPath applies POSIX write-back rename semantics to a dirty staged
 // source file: the staged bytes and dirty bookkeeping move to the destination
 // path, and a durable tombstone removes the source COS object once any
@@ -40,16 +45,9 @@ func (sm *StagingManager) RenameStagedPath(oldPath, newPath string) error {
 
 	if _, err := os.Stat(oldStaging); err != nil {
 		if os.IsNotExist(err) {
-			// Stale dirty entry without staged bytes: drop it (without
-			// touching sync claims) and let the caller fall back to the
-			// object-store rename.
-			sm.dirtyIndex.DropEntry(oldPath)
-			if removeErr := sm.removePathMetadata(oldPath); removeErr != nil {
-				logging.Warn("Failed to remove stale sidecar for dirty entry without staged bytes",
-					zap.String("path", oldPath),
-					zap.Error(removeErr))
-			}
-			sm.updateSyncQueueMetrics()
+			// Stale dirty entry without staged bytes: drop it and let the
+			// caller fall back to the object-store rename.
+			sm.dropEntryWithoutStagedBytes(oldPath)
 		}
 		return err
 	}
@@ -60,6 +58,9 @@ func (sm *StagingManager) RenameStagedPath(oldPath, newPath string) error {
 	sm.CancelPendingDelete(newPath)
 
 	// Durable intent first: destination sidecar describing the moved bytes.
+	// What it replaces is kept, to put back if the move does not happen.
+	newSidecar := sm.pathMetadataPath(newStaging)
+	replacedSidecar, _ := readPathMetadataState(newSidecar)
 	now := time.Now()
 	state := &PathMetadataState{
 		Version:              pathMetadataVersion,
@@ -79,7 +80,7 @@ func (sm *StagingManager) RenameStagedPath(oldPath, newPath string) error {
 		state.LocalDirtyGeneration = meta.LocalDirtyGeneration + 1
 	}
 	state.Attributes = sm.renamedAttributes(oldPath, oldStaging)
-	if err := writePathMetadataState(sm.pathMetadataPath(newStaging), state); err != nil {
+	if err := writePathMetadataState(newSidecar, state); err != nil {
 		return fmt.Errorf("failed to persist renamed staging metadata: %w", err)
 	}
 
@@ -91,13 +92,25 @@ func (sm *StagingManager) RenameStagedPath(oldPath, newPath string) error {
 	sm.mu.RLock()
 	source := sm.sessions[oldPath]
 	sm.mu.RUnlock()
-	moveStagedData := func() error { return os.Rename(oldStaging, newStaging) }
+	moveStagedData := func() error { return moveStagedFile(oldStaging, newStaging) }
 	if source != nil {
 		moveStagedData = func() error {
-			return source.moveStagingFile(newStaging, func() error { return os.Rename(oldStaging, newStaging) })
+			return source.moveStagingFile(newStaging, func() error { return moveStagedFile(oldStaging, newStaging) })
 		}
 	}
 	if err := moveStagedData(); err != nil {
+		// Nothing moved: take back the intent written above.
+		sm.restorePathMetadata(newSidecar, replacedSidecar)
+		if os.IsNotExist(err) {
+			// The staged bytes went between the check above and the move:
+			// a sync worker uploaded the file and cleaned up after itself.
+			// That is a source without staged bytes like any other, and the
+			// error goes back unwrapped so the caller can tell: wrapped, it
+			// read as a failure, and a directory rename gave up over a file
+			// that was safely in the bucket.
+			sm.dropEntryWithoutStagedBytes(oldPath)
+			return err
+		}
 		return fmt.Errorf("failed to move staged data: %w", err)
 	}
 
@@ -158,6 +171,34 @@ func (sm *StagingManager) RenameStagedPath(oldPath, newPath string) error {
 		zap.String("staging_path", newStaging))
 
 	return nil
+}
+
+// dropEntryWithoutStagedBytes forgets the dirty entry and sidecar of a path
+// whose staged bytes are gone, without touching sync claims.
+func (sm *StagingManager) dropEntryWithoutStagedBytes(path string) {
+	sm.dirtyIndex.DropEntry(path)
+	if err := sm.removePathMetadata(path); err != nil {
+		logging.Warn("Failed to remove stale sidecar for dirty entry without staged bytes",
+			zap.String("path", path),
+			zap.Error(err))
+	}
+	sm.updateSyncQueueMetrics()
+}
+
+// restorePathMetadata puts a sidecar back to what it was before a rename
+// wrote its intent there: the state it replaced, or nothing.
+func (sm *StagingManager) restorePathMetadata(metadataPath string, replaced *PathMetadataState) {
+	var err error
+	if replaced != nil {
+		err = writePathMetadataState(metadataPath, replaced)
+	} else if err = os.Remove(metadataPath); os.IsNotExist(err) {
+		err = nil
+	}
+	if err != nil {
+		logging.Warn("Failed to take back the staging metadata of a rename that did not happen",
+			zap.String("metadata_path", metadataPath),
+			zap.Error(err))
+	}
 }
 
 // Made with Bob

@@ -1,6 +1,7 @@
 package staging
 
 import (
+	"bytes"
 	"os"
 	"testing"
 )
@@ -226,6 +227,100 @@ func TestRenameStagedPathWithoutStagedBytesFallsBack(t *testing.T) {
 	}
 	if manager.HasPendingDelete(oldPath) {
 		t.Fatal("no tombstone should be registered for a failed rename")
+	}
+}
+
+// syncAwayBeforeMove makes the next staged-file move find its source gone:
+// what happens when a sync worker finishes uploading the file, and removes
+// its staged bytes, after the rename has checked for them.
+func syncAwayBeforeMove(t *testing.T) {
+	t.Helper()
+	t.Cleanup(func() { moveStagedFile = os.Rename })
+	moveStagedFile = func(oldStaging, newStaging string) error {
+		if err := os.Remove(oldStaging); err != nil {
+			t.Errorf("remove staged bytes: %v", err)
+		}
+		return os.Rename(oldStaging, newStaging)
+	}
+}
+
+// A sync worker that finishes uploading a file removes its staged bytes. When
+// that lands between the rename's check for them and its move, the rename
+// must report a source without staged bytes, as it does when the check itself
+// finds none: the caller then renames the object in the bucket. It used to
+// report a failure, and a directory rename gave up over it.
+func TestRenameStagedPathReportsBytesSyncedAwayMidRename(t *testing.T) {
+	cfg := createTestConfig(t)
+	manager, err := NewStagingManager(cfg)
+	if err != nil {
+		t.Fatalf("NewStagingManager() error = %v", err)
+	}
+	defer manager.Shutdown()
+
+	oldPath := "/rename-synced-src.txt"
+	newPath := "/rename-synced-dst.txt"
+	writeDirtyTestFile(t, manager, oldPath, "payload")
+	newSidecar := manager.pathMetadataPath(manager.stagingFilePath(newPath))
+
+	syncAwayBeforeMove(t)
+	err = manager.RenameStagedPath(oldPath, newPath)
+	if !os.IsNotExist(err) {
+		t.Fatalf("RenameStagedPath() error = %v, want not-exist for a source whose staged bytes were synced away", err)
+	}
+
+	if _, err := os.Stat(newSidecar); !os.IsNotExist(err) {
+		t.Fatalf("destination sidecar should be taken back, stat err = %v", err)
+	}
+	if manager.IsDirty(newPath) {
+		t.Fatal("destination must not be dirty: nothing moved there")
+	}
+	if manager.IsDirty(oldPath) {
+		t.Fatal("source dirty entry should be dropped: its bytes are gone")
+	}
+	if manager.HasPendingDelete(oldPath) {
+		t.Fatal("no tombstone should be registered for a rename that did not happen")
+	}
+}
+
+// The destination of such a rename may have staged bytes of its own. Its
+// sidecar, overwritten by the rename's intent, must come back as it was.
+func TestRenameStagedPathRestoresDestinationSidecarWhenBytesGoMidRename(t *testing.T) {
+	cfg := createTestConfig(t)
+	manager, err := NewStagingManager(cfg)
+	if err != nil {
+		t.Fatalf("NewStagingManager() error = %v", err)
+	}
+	defer manager.Shutdown()
+
+	oldPath := "/rename-synced-over-src.txt"
+	newPath := "/rename-synced-over-dst.txt"
+	destinationPayload := "destination"
+	writeDirtyTestFile(t, manager, oldPath, "a longer source payload")
+	writeDirtyTestFile(t, manager, newPath, destinationPayload)
+	newSidecar := manager.pathMetadataPath(manager.stagingFilePath(newPath))
+	before, err := os.ReadFile(newSidecar)
+	if err != nil {
+		t.Fatalf("read destination sidecar: %v", err)
+	}
+
+	syncAwayBeforeMove(t)
+	err = manager.RenameStagedPath(oldPath, newPath)
+	if !os.IsNotExist(err) {
+		t.Fatalf("RenameStagedPath() error = %v, want not-exist for a source whose staged bytes were synced away", err)
+	}
+
+	after, err := os.ReadFile(newSidecar)
+	if err != nil {
+		t.Fatalf("read destination sidecar after the rename: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("destination sidecar changed:\nbefore %s\nafter  %s", before, after)
+	}
+	if !manager.IsDirty(newPath) {
+		t.Fatal("destination must stay dirty: its own bytes are still staged")
+	}
+	if got := readStagedBytes(t, manager, newPath, len(destinationPayload)); got != destinationPayload {
+		t.Fatalf("destination staged bytes = %q, want %q", got, destinationPayload)
 	}
 }
 

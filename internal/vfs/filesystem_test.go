@@ -463,6 +463,80 @@ func TestFilesystemRenameDirectoryMovesItsStagedFiles(t *testing.T) {
 	}
 }
 
+// A file's sync can finish, and remove its staged bytes, after the rename has
+// listed the directory's staged files. Such a file is in the bucket and moves
+// with the directory's other objects: the rename must not fail over it. (The
+// staging tests cover the sync that finishes later still, while the file is
+// being moved.)
+func TestFilesystemRenameDirectoryCarriesAFileSyncedSinceItWasListed(t *testing.T) {
+	manager, err := staging.NewStagingManager(testStagingConfig(t))
+	if err != nil {
+		t.Fatalf("NewStagingManager() error = %v", err)
+	}
+	defer manager.Shutdown()
+
+	stageFile(t, manager, "/dir/new.txt", []byte("never synced"))
+	// Listed as staged, but its bytes are gone and its object is there.
+	manager.MarkDirty("/dir/synced.txt", int64(len("synced meanwhile")))
+
+	store := newFakeObjectStore()
+	store.put("dir/", nil)
+	store.put("dir/synced.txt", []byte("synced meanwhile"))
+	fs := newDirtyStagingTestFilesystemWithStore(t, manager, store)
+
+	if err := fs.Rename("dir", "moved"); err != nil {
+		t.Fatalf("Rename(directory with a file synced meanwhile) error = %v", err)
+	}
+
+	if got := string(store.get("moved/synced.txt")); got != "synced meanwhile" {
+		t.Errorf("the synced file under the new name = %q", got)
+	}
+	if store.get("dir/synced.txt") != nil {
+		t.Error("the synced file is still under the old name")
+	}
+	if manager.IsDirty("/dir/synced.txt") || manager.IsDirty("/moved/synced.txt") {
+		t.Error("the synced file is still marked dirty")
+	}
+	if !manager.IsDirty("/moved/new.txt") {
+		t.Error("the staged file did not move with the directory")
+	}
+	if got := readStaged(t, fs, "moved/new.txt"); got != "never synced" {
+		t.Errorf("moved/new.txt = %q", got)
+	}
+}
+
+// The same for a file renamed by itself onto a name with staged bytes: the
+// rename falls back to the bucket, and the destination's staged bytes must
+// go first, or they would sync over the renamed object afterwards.
+func TestFilesystemRenameOfFileSyncedAwayDiscardsStagedDestination(t *testing.T) {
+	manager, err := staging.NewStagingManager(testStagingConfig(t))
+	if err != nil {
+		t.Fatalf("NewStagingManager() error = %v", err)
+	}
+	defer manager.Shutdown()
+
+	manager.MarkDirty("/src.txt", int64(len("source")))
+	stageFile(t, manager, "/dst.txt", []byte("replaced by the rename"))
+
+	store := newFakeObjectStore()
+	store.put("src.txt", []byte("source"))
+	fs := newDirtyStagingTestFilesystemWithStore(t, manager, store)
+
+	if err := fs.Rename("src.txt", "dst.txt"); err != nil {
+		t.Fatalf("Rename(file synced away, onto staged bytes) error = %v", err)
+	}
+
+	if manager.IsDirty("/dst.txt") {
+		t.Error("the destination's staged bytes are still waiting to sync over the renamed object")
+	}
+	if got := string(store.get("dst.txt")); got != "source" {
+		t.Errorf("dst.txt in the bucket = %q, want the renamed source", got)
+	}
+	if store.get("src.txt") != nil {
+		t.Error("src.txt is still in the bucket")
+	}
+}
+
 // A file being uploaded when its directory is renamed keeps its upload: the
 // pending delete on the old name waits for it, and the bytes sync again
 // under the new name.
