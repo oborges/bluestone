@@ -51,7 +51,7 @@ type SyncWorker struct {
 	uploadMu           sync.Mutex
 	uploadByPath       map[string]uploadAccumulator
 	objectLocksMu      sync.Mutex
-	objectLocks        map[string]*sync.Mutex
+	objectLocks        map[string]*objectLock
 	totalSyncedFiles   int64
 	totalUploadedBytes int64
 	lastSync           syncObservation
@@ -83,7 +83,7 @@ func NewSyncWorker(manager *StagingManager, cosClient COSClient, cfg *config.Sta
 		ctx:          ctx,
 		cancel:       cancel,
 		uploadByPath: make(map[string]uploadAccumulator),
-		objectLocks:  make(map[string]*sync.Mutex),
+		objectLocks:  make(map[string]*objectLock),
 	}
 }
 
@@ -479,17 +479,37 @@ func (sw *SyncWorker) syncFileLocked(path string, workerID int) error {
 	return nil
 }
 
+// objectLock serializes the syncs of one path. users counts the holder and
+// everyone queued behind it, so the entry can go once nobody needs it.
+type objectLock struct {
+	mu    sync.Mutex
+	users int
+}
+
+// lockObject takes the lock for path and returns the function that releases
+// it. The table holds an entry only while a sync of that path is running or
+// waiting; keeping one for every path ever synced grows without bound.
 func (sw *SyncWorker) lockObject(path string) func() {
 	sw.objectLocksMu.Lock()
 	lock := sw.objectLocks[path]
 	if lock == nil {
-		lock = &sync.Mutex{}
+		lock = &objectLock{}
 		sw.objectLocks[path] = lock
 	}
+	lock.users++
 	sw.objectLocksMu.Unlock()
 
-	lock.Lock()
-	return lock.Unlock
+	lock.mu.Lock()
+	return func() {
+		lock.mu.Unlock()
+
+		sw.objectLocksMu.Lock()
+		lock.users--
+		if lock.users == 0 {
+			delete(sw.objectLocks, path)
+		}
+		sw.objectLocksMu.Unlock()
+	}
 }
 
 func (sw *SyncWorker) uploadMultipartWithRetry(path string, file *os.File, size, partSize int64, metadata map[string]string, workerID int, isSnapshotCurrent func() bool) error {

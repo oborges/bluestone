@@ -5,7 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -659,6 +662,106 @@ func TestSyncWorker_MultipleFiles(t *testing.T) {
 		if string(uploaded) != string(expectedData) {
 			t.Errorf("File %s: expected %s, got %s", path, expectedData, uploaded)
 		}
+	}
+}
+
+func (sw *SyncWorker) objectLockCount() int {
+	sw.objectLocksMu.Lock()
+	defer sw.objectLocksMu.Unlock()
+	return len(sw.objectLocks)
+}
+
+func TestSyncWorker_ObjectLocksAreDroppedAfterSync(t *testing.T) {
+	cfg := createTestConfig(t)
+	cfg.MaxDirtyFiles = 1000
+	cfg.MaxSyncRetries = 1
+	cfg.RetryBackoffInit = "1ms"
+	manager, _ := NewStagingManager(cfg)
+	defer manager.Shutdown()
+
+	cosClient := NewMockCOSClient()
+	worker := NewSyncWorker(manager, cosClient, cfg)
+
+	const files = 200
+	for i := 0; i < files; i++ {
+		path := fmt.Sprintf("/test/file-%d.txt", i)
+		session, _ := manager.GetOrCreateSession(path)
+		session.Write([]byte("data"), 0)
+		session.Sync()
+		manager.MarkDirty(path, 4)
+
+		// Both ways into a sync take the lock.
+		var err error
+		if i%2 == 0 {
+			err = worker.syncFile(path)
+		} else {
+			err = worker.TriggerSync(path)
+		}
+		if err != nil {
+			t.Fatalf("Sync failed for %s: %v", path, err)
+		}
+		if _, exists := cosClient.GetUpload(path); !exists {
+			t.Fatalf("File %s was not uploaded", path)
+		}
+	}
+
+	if got := worker.objectLockCount(); got != 0 {
+		t.Fatalf("lock table holds %d entries after %d files synced, want 0", got, files)
+	}
+
+	// A sync that fails releases its entry as well.
+	failing := "/test/upload-fails.txt"
+	session, _ := manager.GetOrCreateSession(failing)
+	session.Write([]byte("data"), 0)
+	session.Sync()
+	manager.MarkDirty(failing, 4)
+	cosClient.SetError(failing, errors.New("bucket refused the upload"))
+	if err := worker.syncFile(failing); err == nil {
+		t.Fatal("Expected the sync to fail when the upload is refused")
+	}
+	if got := worker.objectLockCount(); got != 0 {
+		t.Fatalf("lock table holds %d entries after a failed sync, want 0", got)
+	}
+}
+
+func TestSyncWorker_ObjectLockExcludesWhileEntriesComeAndGo(t *testing.T) {
+	cfg := createTestConfig(t)
+	manager, _ := NewStagingManager(cfg)
+	defer manager.Shutdown()
+
+	worker := NewSyncWorker(manager, NewMockCOSClient(), cfg)
+
+	// Few paths and many goroutines, so entries are dropped and made again
+	// while others wait on them. A waiter left on a dropped entry would let
+	// two holders in at once.
+	const paths, goroutines, rounds = 4, 16, 500
+	var inside [paths]atomic.Int32
+	var overlaps atomic.Int32
+
+	var wg sync.WaitGroup
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for r := 0; r < rounds; r++ {
+				p := (g + r) % paths
+				unlock := worker.lockObject(fmt.Sprintf("/test/contended-%d", p))
+				if inside[p].Add(1) != 1 {
+					overlaps.Add(1)
+				}
+				runtime.Gosched()
+				inside[p].Add(-1)
+				unlock()
+			}
+		}(g)
+	}
+	wg.Wait()
+
+	if got := overlaps.Load(); got != 0 {
+		t.Fatalf("%d times two holders had the same path's lock at once", got)
+	}
+	if got := worker.objectLockCount(); got != 0 {
+		t.Fatalf("lock table holds %d entries with nothing running, want 0", got)
 	}
 }
 
