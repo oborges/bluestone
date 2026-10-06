@@ -840,6 +840,8 @@ func (fs *Filesystem) renameDirectoryWithStagedFiles(oldFull, newFull string, ch
 				// it moves with the directory's other objects.
 				continue
 			}
+			fs.logger.Error("Directory rename failed moving a staged file; moving the others back",
+				"old_path", oldFull, "new_path", newFull, "path", child, "moved", len(moved), "error", err)
 			undo()
 			return err
 		}
@@ -862,6 +864,8 @@ func (fs *Filesystem) renameDirectoryWithStagedFiles(oldFull, newFull string, ch
 				"path", newFull, "error", mkErr)
 		}
 	default:
+		fs.logger.Error("Directory rename failed in the bucket; moving its staged files back",
+			"old_path", oldFull, "new_path", newFull, "moved", len(moved), "error", err)
 		undo()
 		return err
 	}
@@ -881,8 +885,14 @@ func (fs *Filesystem) renameDirectoryWithStagedFiles(oldFull, newFull string, ch
 func (fs *Filesystem) renameDirtyStagedFile(oldFull, newFull string) error {
 	if err := fs.stagingManager.RenameStagedPath(oldFull, newFull); err != nil {
 		if os.IsNotExist(err) {
-			// Staged bytes vanished (stale dirty entry); fall back to the
-			// object-store rename.
+			// Staged bytes vanished (a stale dirty entry, or a sync that
+			// finished as the rename began); fall back to the object-store
+			// rename. As for any clean source, staged state at the
+			// destination goes first, or it would sync over the renamed
+			// object later.
+			if err := fs.discardStagedDestination(newFull); err != nil {
+				return err
+			}
 			return fs.ops.RenameFile(fs.requestContext(), oldFull, newFull)
 		}
 		return err
