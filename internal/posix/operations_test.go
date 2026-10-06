@@ -256,6 +256,31 @@ func TestRenameDirectoryStopsStartingCopiesAfterAFailure(t *testing.T) {
 	}
 }
 
+// rm -r unlinks a directory's files and removes it straight after. A file
+// whose delete was deferred behind its upload can complete while the removal
+// lists the directory: the bucket's listing has the object, and by the time
+// the listing is read nothing marks it as going. The directory is empty all
+// the same, and its removal must not fail with "not empty".
+func TestDeleteDirectoryIgnoresFilesDeletedWhileItListed(t *testing.T) {
+	ctx := context.Background()
+	store := newFakeObjectStore()
+	store.put("dir/", nil, time.Unix(100, 0))
+	store.put("dir/going.txt", []byte("payload"), time.Unix(100, 0))
+	store.afterList = func() {
+		if err := store.DeleteObject(ctx, "dir/going.txt"); err != nil {
+			t.Errorf("DeleteObject() error = %v", err)
+		}
+	}
+
+	ops, _ := newRefreshTestOps(t, store)
+	if err := ops.DeleteDirectory(ctx, "/dir"); err != nil {
+		t.Fatalf("DeleteDirectory(emptied while listing) error = %v", err)
+	}
+	if _, err := store.HeadObject(ctx, "dir/"); !os.IsNotExist(err) {
+		t.Fatalf("directory marker HeadObject error = %v, want it removed", err)
+	}
+}
+
 func TestDeleteDirectoryNotEmptyReportsENOTEMPTY(t *testing.T) {
 	ctx := context.Background()
 	store := newFakeObjectStore()

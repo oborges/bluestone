@@ -1035,7 +1035,7 @@ func (h *OperationsHandler) DeleteDirectory(ctx context.Context, path string) (e
 	if err != nil {
 		return err
 	}
-	if len(entries) > 0 {
+	if len(entries) > 0 && !h.listedEntriesAreGone(ctx, path, entries) {
 		log.Warn("Directory not empty", zap.Int("entries", len(entries)))
 		return fmt.Errorf("directory not empty: %w", syscall.ENOTEMPTY)
 	}
@@ -1054,6 +1054,34 @@ func (h *OperationsHandler) DeleteDirectory(ctx context.Context, path string) (e
 
 	log.Debug("Directory deleted successfully")
 	return nil
+}
+
+// maxGoneEntryProbes bounds how many listed entries a directory removal asks
+// the bucket about before taking the listing's word that they exist.
+const maxGoneEntryProbes = 32
+
+// listedEntriesAreGone reports whether none of the files a listing of path
+// showed is in the bucket any more. A file whose delete was pending is left
+// out of a listing, but one whose delete completes while the listing is in
+// flight is in what the bucket returned and no longer marked as going, so it
+// shows up after it is gone. Removing the directory right after its files,
+// as rm -r does, then found it "not empty".
+func (h *OperationsHandler) listedEntriesAreGone(ctx context.Context, path string, entries []*FileInfo) bool {
+	if len(entries) > maxGoneEntryProbes {
+		return false
+	}
+	prefix := ListPrefix(path)
+	for _, entry := range entries {
+		if entry.IsDir() {
+			return false
+		}
+		metrics.RecordCOSHeadObject()
+		if _, err := h.cosClient.HeadObject(ctx, prefix+entry.Name()); !errors.Is(err, os.ErrNotExist) {
+			// It is there, or the bucket could not say.
+			return false
+		}
+	}
+	return true
 }
 
 // ListDirectory lists directory contents
