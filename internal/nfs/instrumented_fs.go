@@ -8,18 +8,24 @@ import (
 	"time"
 
 	"github.com/go-git/go-billy/v5"
+	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/oborges/bluestone/internal/logging"
-	"github.com/oborges/bluestone/internal/metrics"
 	gonfs "github.com/willscott/go-nfs"
 )
+
+// maxTrackedPaths bounds the per-directory call records. They are there to
+// spot a client listing one directory over and over, which takes only the
+// directories listed lately; one for every directory ever listed grows
+// without end.
+const maxTrackedPaths = 256
 
 // InstrumentedFilesystem wraps a billy.Filesystem to track NFS-level operations
 type InstrumentedFilesystem struct {
 	billy.Filesystem
 	logger *logging.KVLogger
 
-	// Per-path tracking for detecting loops
-	pathCalls sync.Map // map[string]*PathCallTracker
+	// Per-path tracking for detecting loops, least recently listed dropped first
+	pathCalls *lru.Cache[string, *PathCallTracker]
 }
 
 // PathCallTracker tracks calls to a specific path
@@ -36,10 +42,24 @@ type PathCallTracker struct {
 
 // NewInstrumentedFilesystem wraps a filesystem with instrumentation
 func NewInstrumentedFilesystem(fs billy.Filesystem, logger *logging.KVLogger) *InstrumentedFilesystem {
+	pathCalls, _ := lru.New[string, *PathCallTracker](maxTrackedPaths)
 	return &InstrumentedFilesystem{
 		Filesystem: fs,
 		logger:     logger,
+		pathCalls:  pathCalls,
 	}
+}
+
+// trackerFor returns the call record of path, starting one if it has none.
+func (ifs *InstrumentedFilesystem) trackerFor(path string, now time.Time) *PathCallTracker {
+	if tracker, ok := ifs.pathCalls.Get(path); ok {
+		return tracker
+	}
+	tracker := &PathCallTracker{firstCall: now}
+	if previous, ok, _ := ifs.pathCalls.PeekOrAdd(path, tracker); ok {
+		return previous
+	}
+	return tracker
 }
 
 // ReadDir wraps the ReadDir call with detailed instrumentation
@@ -47,13 +67,7 @@ func (ifs *InstrumentedFilesystem) ReadDir(path string) ([]os.FileInfo, error) {
 	start := time.Now()
 
 	// Get or create tracker for this path
-	trackerVal, _ := ifs.pathCalls.LoadOrStore(path, &PathCallTracker{
-		firstCall:   start,
-		callTimes:   make([]time.Time, 0, 100),
-		returnTimes: make([]time.Time, 0, 100),
-		gapTimes:    make([]time.Duration, 0, 100),
-	})
-	tracker := trackerVal.(*PathCallTracker)
+	tracker := ifs.trackerFor(path, start)
 
 	// Calculate gap since last return (this is the REAL gap)
 	tracker.mu.Lock()
@@ -139,22 +153,18 @@ func (ifs *InstrumentedFilesystem) ReadDir(path string) ([]os.FileInfo, error) {
 			"gap_ms", gapSinceLastReturn.Milliseconds())
 	}
 
-	// Record metrics
-	metrics.GetGlobalCounters().RecordPathCall(path)
-
 	return entries, err
 }
 
 // GetPathStats returns statistics for a specific path
 func (ifs *InstrumentedFilesystem) GetPathStats(path string) map[string]interface{} {
-	trackerVal, ok := ifs.pathCalls.Load(path)
+	tracker, ok := ifs.pathCalls.Peek(path)
 	if !ok {
 		return map[string]interface{}{
 			"calls": 0,
 		}
 	}
 
-	tracker := trackerVal.(*PathCallTracker)
 	tracker.mu.Lock()
 	defer tracker.mu.Unlock()
 
@@ -195,11 +205,9 @@ func (ifs *InstrumentedFilesystem) GetPathStats(path string) map[string]interfac
 func (ifs *InstrumentedFilesystem) GetAllPathStats() map[string]interface{} {
 	stats := make(map[string]interface{})
 
-	ifs.pathCalls.Range(func(key, value interface{}) bool {
-		path := key.(string)
+	for _, path := range ifs.pathCalls.Keys() {
 		stats[path] = ifs.GetPathStats(path)
-		return true
-	})
+	}
 
 	return stats
 }
