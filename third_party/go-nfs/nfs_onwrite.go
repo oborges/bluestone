@@ -22,6 +22,24 @@ const (
 	fileSync writeStability = 2
 )
 
+// commitWrite settles how durable a write just made to filename is, and
+// returns the level to report for it. A write asked for as UNSTABLE is left
+// for COMMIT; any other is committed before it is answered. The answer is
+// only ever stronger than what was asked.
+func commitWrite(fs billy.Filesystem, filename string, how writeStability) (writeStability, error) {
+	committer, ok := fs.(Committer)
+	if !ok {
+		return fileSync, nil
+	}
+	if how == unstable {
+		return unstable, nil
+	}
+	if err := committer.Commit(filename); err != nil {
+		return how, err
+	}
+	return fileSync, nil
+}
+
 type writeArgs struct {
 	Handle []byte
 	Offset uint64
@@ -103,6 +121,14 @@ func onWrite(ctx context.Context, w *response, userHandle Handler) error {
 		}
 		return &NFSStatusError{NFSStatusIO, err}
 	}
+	committed, err := commitWrite(fs, fullPath, writeStability(req.How))
+	if err != nil {
+		Log.Errorf("error committing: %v", err)
+		if errors.Is(err, syscall.ENOSPC) {
+			return &NFSStatusError{NFSStatusNoSPC, err}
+		}
+		return &NFSStatusError{NFSStatusIO, err}
+	}
 
 	writer := bytes.NewBuffer([]byte{})
 	if err := xdr.Write(writer, uint32(NFSStatusOk)); err != nil {
@@ -115,7 +141,7 @@ func onWrite(ctx context.Context, w *response, userHandle Handler) error {
 	if err := xdr.Write(writer, uint32(writtenCount)); err != nil {
 		return &NFSStatusError{NFSStatusServerFault, err}
 	}
-	if err := xdr.Write(writer, fileSync); err != nil {
+	if err := xdr.Write(writer, committed); err != nil {
 		return &NFSStatusError{NFSStatusServerFault, err}
 	}
 	if err := xdr.Write(writer, w.Server.ID); err != nil {

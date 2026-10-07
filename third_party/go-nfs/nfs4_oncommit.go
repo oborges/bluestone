@@ -12,9 +12,16 @@ func nfs4OnCommit(c *nfs4Compound, args io.Reader, res io.Writer) nfs4Status {
 	if status := nfs4Decode(args, &req); status != nfs4OK {
 		return status
 	}
-	if _, status := c.requireCurrent(); status != nfs4OK {
+	current, status := c.requireCurrent()
+	if status != nfs4OK {
 		return status
 	}
-	// Every WRITE is FILE_SYNC, so there is nothing to commit.
+	// Without a Committer every WRITE was FILE_SYNC, so there is nothing to
+	// commit. The whole file is committed, whatever range the client named.
+	if committer, ok := current.fs.(Committer); ok {
+		if err := committer.Commit(current.fullPath()); err != nil {
+			return nfs4StatusFromErr(err)
+		}
+	}
 	return nfs4Encode(res, c.w.Server.ID)
 }

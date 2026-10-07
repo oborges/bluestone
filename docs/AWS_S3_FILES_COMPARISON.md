@@ -66,6 +66,10 @@ This gateway's competitive bet is different from AWS's newer client-side model:
 For this gateway:
 
 - `WRITE` accepted means local staging accepted the bytes.
+- a stable `WRITE` (`FILE_SYNC`, `DATA_SYNC`) and `COMMIT` are answered only
+  after the staged bytes and their recovery metadata are flushed to the
+  staging disk; an `UNSTABLE` `WRITE` is reported as `UNSTABLE` and may be
+  lost to a power loss until the client commits it.
 - dirty staged data remains the local source of truth until upload completes.
 - COS durability begins after the sync worker uploads the staged snapshot and
   the object is visible in COS.

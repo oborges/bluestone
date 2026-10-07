@@ -2,10 +2,12 @@ package staging
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -35,6 +37,11 @@ type PathMetadataState struct {
 	// Attributes are the POSIX attributes the staged file syncs with, kept
 	// here so crash recovery uploads it with them.
 	Attributes *StagedAttributes `json:"attributes,omitempty"`
+	// Committed records that a client was told this staged file is on
+	// stable storage. From then on the sidecar is only replaced by one
+	// already on disk, so a power loss cannot leave the file without the
+	// metadata recovery needs to upload it.
+	Committed bool `json:"committed,omitempty"`
 }
 
 func objectKeyFromPath(path string) string {
@@ -89,7 +96,7 @@ func writePathMetadataState(metadataPath string, state *PathMetadataState) error
 	}
 
 	tmpPath := metadataPath + ".tmp"
-	if err := os.WriteFile(tmpPath, metadataBytes, 0600); err != nil {
+	if err := writeSidecarFile(tmpPath, metadataBytes, state.Committed); err != nil {
 		return err
 	}
 	if err := os.Rename(tmpPath, metadataPath); err != nil {
@@ -97,6 +104,45 @@ func writePathMetadataState(metadataPath string, state *PathMetadataState) error
 		return err
 	}
 	return nil
+}
+
+// writeSidecarFile writes a sidecar's bytes to path and, when durable,
+// returns only once they are on disk.
+func writeSidecarFile(path string, data []byte, durable bool) error {
+	if !durable {
+		return os.WriteFile(path, data, 0600)
+	}
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	if err != nil {
+		return err
+	}
+	if _, err := file.Write(data); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return err
+	}
+	return file.Close()
+}
+
+// syncDir flushes a directory's entries to disk, so that files created in it
+// or renamed into place are still there after a power loss.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	err = d.Sync()
+	// A platform that cannot sync a directory refuses with one of these
+	// (AIX wants a descriptor open for writing, which a directory cannot
+	// be); there is nothing more to do on it.
+	if errors.Is(err, syscall.EINVAL) || errors.Is(err, syscall.EBADF) || errors.Is(err, syscall.ENOTSUP) {
+		return nil
+	}
+	return err
 }
 
 func dirtyMetadataFromPathState(state *PathMetadataState, size int64, modTime time.Time) DirtyFileMetadata {

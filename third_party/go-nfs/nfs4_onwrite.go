@@ -59,5 +59,9 @@ func nfs4OnWrite(c *nfs4Compound, args io.Reader, res io.Writer) nfs4Status {
 	if err := file.Close(); err != nil {
 		return nfs4StatusFromErr(err)
 	}
-	return nfs4Encode(res, nfs4WriteRes{Count: uint32(n), Committed: uint32(fileSync), Verf: c.w.Server.ID})
+	committed, err := commitWrite(current.fs, current.fullPath(), writeStability(req.Stable))
+	if err != nil {
+		return nfs4StatusFromErr(err)
+	}
+	return nfs4Encode(res, nfs4WriteRes{Count: uint32(n), Committed: uint32(committed), Verf: c.w.Server.ID})
 }

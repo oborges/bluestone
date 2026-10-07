@@ -236,6 +236,15 @@ func (cfs *CachedFilesystem) FSStat(ctx context.Context, stat *gonfs.FSStat) err
 	return fsStatFrom(ctx, cfs.Filesystem, stat)
 }
 
+// Commit forwards a commit of the file's writes to stable storage
+// (implements gonfs.Committer).
+func (cfs *CachedFilesystem) Commit(filename string) error {
+	if c, ok := cfs.Filesystem.(gonfs.Committer); ok {
+		return c.Commit(filename)
+	}
+	return nil
+}
+
 // Chmod changes the mode of the named file (implements billy.Change)
 func (cfs *CachedFilesystem) Chmod(name string, mode os.FileMode) error {
 	if c, ok := cfs.Filesystem.(billy.Change); ok {
