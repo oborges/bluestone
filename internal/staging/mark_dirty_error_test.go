@@ -35,4 +35,24 @@ func TestMarkDirtyReportsUnrecordedWrite(t *testing.T) {
 	if !manager.IsDirty(path) {
 		t.Fatal("unrecorded write was not queued for sync")
 	}
+
+	// The file is dirty now, but still has no sidecar: the next write must
+	// not pass for recorded just because the file is already queued.
+	if err := manager.MarkDirty(path, session.GetSize()); err == nil {
+		t.Fatal("MarkDirty() of a file still without its sidecar succeeded")
+	}
+
+	// Once the sidecar can be written, the next write records the file.
+	if err := os.Remove(blocked); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.MarkDirty(path, session.GetSize()); err != nil {
+		t.Fatalf("MarkDirty() error = %v", err)
+	}
+	if state := sidecarOf(t, manager, path); state.OriginalPath != path {
+		t.Fatalf("sidecar names %q, want %q", state.OriginalPath, path)
+	}
+	if err := manager.CommitPath(path); err != nil {
+		t.Fatalf("CommitPath() error = %v", err)
+	}
 }

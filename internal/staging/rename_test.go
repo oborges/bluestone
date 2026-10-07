@@ -409,3 +409,96 @@ func TestSyncWorkerNotifiesObjectMutated(t *testing.T) {
 }
 
 // Made with Bob
+
+// A rename over a destination whose own upload is in flight: when that
+// upload finishes it must not mark the destination clean. The entry is the
+// renamed file's by then, and cleaning it would remove the moved bytes and
+// their sidecar without their having been uploaded.
+func TestRenameOverDestinationDuringItsUploadKeepsMovedBytes(t *testing.T) {
+	cfg := createTestConfig(t)
+	manager, err := NewStagingManager(cfg)
+	if err != nil {
+		t.Fatalf("NewStagingManager() error = %v", err)
+	}
+	defer manager.Shutdown()
+
+	oldPath := "/rename-upload-src.txt"
+	newPath := "/rename-upload-dst.txt"
+	// The destination is written twice and the source once, so that
+	// counting writes per file would give the renamed entry the number the
+	// destination's upload holds.
+	writeDirtyTestFile(t, manager, newPath, "destination, first")
+	writeDirtyTestFile(t, manager, newPath, "destination, again")
+	writeDirtyTestFile(t, manager, oldPath, "moved bytes")
+
+	cosClient := &duringPutCOSClient{MockCOSClient: NewMockCOSClient()}
+	cosClient.duringPut = func() {
+		if err := manager.RenameStagedPath(oldPath, newPath); err != nil {
+			t.Errorf("RenameStagedPath() during the destination's upload error = %v", err)
+		}
+	}
+	worker := NewSyncWorker(manager, cosClient, cfg)
+
+	if err := syncClaimed(t, manager, worker, newPath); err == nil {
+		t.Fatal("sync reported success for a destination replaced while it uploaded")
+	}
+	if !manager.IsDirty(newPath) {
+		t.Fatal("renamed file marked clean by the upload of the file it replaced")
+	}
+	if state := sidecarOf(t, manager, newPath); state.OriginalPath != newPath {
+		t.Fatalf("destination sidecar names %q, want %q", state.OriginalPath, newPath)
+	}
+	if got := readStagedBytes(t, manager, newPath, len("moved bytes")); got != "moved bytes" {
+		t.Fatalf("destination staged bytes = %q, want the moved bytes", got)
+	}
+	if err := manager.CommitPath(newPath); err != nil {
+		t.Fatalf("CommitPath() of the renamed file error = %v", err)
+	}
+
+	if err := syncClaimed(t, manager, worker, newPath); err != nil {
+		t.Fatalf("second sync error = %v", err)
+	}
+	if uploaded, _ := cosClient.GetUpload(newPath); string(uploaded) != "moved bytes" {
+		t.Fatalf("upload after the second sync = %q, want the moved bytes", uploaded)
+	}
+}
+
+// The destination's upload can also finish in the middle of the rename,
+// after the rename has written the destination's new sidecar and before it
+// has moved the dirty entry. Marking the destination clean then would take
+// that sidecar with it.
+func TestRenameKeepsDestinationSidecarWhenItsUploadFinishesMidRename(t *testing.T) {
+	cfg := createTestConfig(t)
+	manager, err := NewStagingManager(cfg)
+	if err != nil {
+		t.Fatalf("NewStagingManager() error = %v", err)
+	}
+	defer manager.Shutdown()
+
+	oldPath := "/rename-midway-src.txt"
+	newPath := "/rename-midway-dst.txt"
+	writeDirtyTestFile(t, manager, newPath, "destination")
+	writeDirtyTestFile(t, manager, oldPath, "moved bytes")
+	uploading := manager.dirtyIndex.GetMetadata(newPath).LocalDirtyGeneration
+
+	t.Cleanup(func() { moveStagedFile = os.Rename })
+	moveStagedFile = func(oldStaging, newStaging string) error {
+		if manager.markCleanIfUnchanged(newPath, uploading) {
+			t.Error("destination marked clean in the middle of a rename over it")
+		}
+		return os.Rename(oldStaging, newStaging)
+	}
+	if err := manager.RenameStagedPath(oldPath, newPath); err != nil {
+		t.Fatalf("RenameStagedPath() error = %v", err)
+	}
+
+	if !manager.IsDirty(newPath) {
+		t.Fatal("destination must be dirty with the moved bytes")
+	}
+	if state := sidecarOf(t, manager, newPath); state.OriginalPath != newPath {
+		t.Fatalf("destination sidecar names %q, want %q", state.OriginalPath, newPath)
+	}
+	if err := manager.CommitPath(newPath); err != nil {
+		t.Fatalf("CommitPath() of the renamed file error = %v", err)
+	}
+}

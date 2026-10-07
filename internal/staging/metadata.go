@@ -10,7 +10,9 @@ type DirtyFileIndex struct {
 	dirty     map[string]*DirtyFileMetadata
 	syncing   map[string]bool
 	conflicts map[string]*ConflictMetadata
-	mu        sync.RWMutex
+	// generation is the last LocalDirtyGeneration handed out.
+	generation int64
+	mu         sync.RWMutex
 }
 
 // DirtyFileMetadata contains metadata about a dirty file
@@ -20,6 +22,13 @@ type DirtyFileMetadata struct {
 	ObservedETag         string
 	ObservedSize         int64
 	ObservedLastModified time.Time
+	// LocalDirtyGeneration identifies one state of the staged file: every
+	// write, truncate and rename gives the entry a new one. It is kept only
+	// here, in memory, and comes from a counter the whole index shares, so
+	// no value is ever used twice, not even for a path dropped from the
+	// index and marked dirty again. That is what lets an upload tell, when
+	// it finishes, whether the file it read is still the file that is
+	// staged (see MarkCleanIfUnchanged).
 	LocalDirtyGeneration int64
 	StagedPath           string
 	ConflictStatus       string
@@ -28,6 +37,9 @@ type DirtyFileMetadata struct {
 	LastModified         time.Time
 	SyncAttempts         int
 	LastSyncError        error
+	// recorded reports that the sidecar a restart recovers this file by
+	// was on disk when the entry was last recorded.
+	recorded bool
 }
 
 // ConflictMetadata records a dirty staged path whose COS object changed before
@@ -66,8 +78,9 @@ func (dfi *DirtyFileIndex) MarkDirty(path string, size int64) {
 	dfi.MarkDirtyWithState(path, size, nil)
 }
 
-// MarkDirtyWithState marks a file as dirty and attaches any durable state known
-// about the staged write.
+// MarkDirtyWithState marks a file as dirty and attaches the state of the
+// sidecar recorded for the staged write. A nil state means the sidecar could
+// not be written.
 func (dfi *DirtyFileIndex) MarkDirtyWithState(path string, size int64, state *PathMetadataState) {
 	dfi.mu.Lock()
 	defer dfi.mu.Unlock()
@@ -77,29 +90,47 @@ func (dfi *DirtyFileIndex) MarkDirtyWithState(path string, size int64, state *Pa
 	}
 
 	now := time.Now()
-	if meta, exists := dfi.dirty[path]; exists {
-		meta.Size = size
-		meta.LastModified = now
-		meta.LocalDirtyGeneration++
-		applyPathStateToDirtyMetadata(meta, state)
-	} else {
-		generation := int64(1)
-		if state != nil && state.LocalDirtyGeneration > 0 {
-			generation = state.LocalDirtyGeneration
+	meta, exists := dfi.dirty[path]
+	if !exists {
+		meta = &DirtyFileMetadata{
+			Path:           path,
+			ObjectKey:      objectKeyFromPath(path),
+			ConflictStatus: ConflictStatusNone,
+			DirtySince:     now,
+			SyncAttempts:   0,
 		}
-		meta := &DirtyFileMetadata{
-			Path:                 path,
-			ObjectKey:            objectKeyFromPath(path),
-			LocalDirtyGeneration: generation,
-			ConflictStatus:       ConflictStatusNone,
-			Size:                 size,
-			DirtySince:           now,
-			LastModified:         now,
-			SyncAttempts:         0,
-		}
-		applyPathStateToDirtyMetadata(meta, state)
 		dfi.dirty[path] = meta
 	}
+	meta.Size = size
+	meta.LastModified = now
+	meta.LocalDirtyGeneration = dfi.nextGenerationLocked()
+	meta.recorded = state != nil
+	applyPathStateToDirtyMetadata(meta, state)
+}
+
+// MarkDirtyAgain records one more change to a file that is already dirty
+// and whose sidecar is on disk, and reports whether it did. It touches
+// nothing but memory. False means the path has to go through
+// MarkDirtyWithState: it is clean, or its sidecar is yet to be written.
+func (dfi *DirtyFileIndex) MarkDirtyAgain(path string, size int64) bool {
+	dfi.mu.Lock()
+	defer dfi.mu.Unlock()
+
+	meta, exists := dfi.dirty[path]
+	if !exists || !meta.recorded {
+		return false
+	}
+	meta.Size = size
+	meta.LastModified = time.Now()
+	meta.LocalDirtyGeneration = dfi.nextGenerationLocked()
+	return true
+}
+
+// nextGenerationLocked returns a LocalDirtyGeneration no entry has carried.
+// Callers hold mu.
+func (dfi *DirtyFileIndex) nextGenerationLocked() int64 {
+	dfi.generation++
+	return dfi.generation
 }
 
 // MarkClean marks a file as clean (synced to COS)
@@ -109,6 +140,26 @@ func (dfi *DirtyFileIndex) MarkClean(path string) {
 
 	delete(dfi.dirty, path)
 	delete(dfi.syncing, path)
+}
+
+// MarkCleanIfUnchanged marks a file clean, as MarkClean does, unless it has
+// changed since it carried generation. clean reports whether it is now
+// clean. False means a write, truncate or rename landed after generation was
+// read: the entry stays as it is, dirty. Checking and cleaning are one step,
+// so a change lands before it or after it, never in between, where it would
+// be marked clean without having been uploaded. wasDirty reports whether the
+// path had an entry at all; one without is clean already.
+func (dfi *DirtyFileIndex) MarkCleanIfUnchanged(path string, generation int64) (wasDirty, clean bool) {
+	dfi.mu.Lock()
+	defer dfi.mu.Unlock()
+
+	meta, wasDirty := dfi.dirty[path]
+	if wasDirty && meta.LocalDirtyGeneration != generation {
+		return true, false
+	}
+	delete(dfi.dirty, path)
+	delete(dfi.syncing, path)
+	return wasDirty, true
 }
 
 // MarkConflicted records a conflict and removes the path from the upload queue.
@@ -126,8 +177,8 @@ func (dfi *DirtyFileIndex) MarkConflicted(meta *ConflictMetadata) {
 	dfi.conflicts[meta.Path] = &metaCopy
 }
 
-// RestoreDirty restores dirty metadata from a durable sidecar without bumping
-// the local dirty generation.
+// RestoreDirty restores the dirty entry of a staged file found on disk with
+// its sidecar.
 func (dfi *DirtyFileIndex) RestoreDirty(meta DirtyFileMetadata) {
 	if meta.Path == "" {
 		return
@@ -143,13 +194,24 @@ func (dfi *DirtyFileIndex) RestoreDirty(meta DirtyFileMetadata) {
 	if metaCopy.ObjectKey == "" {
 		metaCopy.ObjectKey = objectKeyFromPath(metaCopy.Path)
 	}
-	if metaCopy.LocalDirtyGeneration <= 0 {
-		metaCopy.LocalDirtyGeneration = 1
-	}
+	metaCopy.LocalDirtyGeneration = dfi.nextGenerationLocked()
+	metaCopy.recorded = true
 	if metaCopy.ConflictStatus == "" {
 		metaCopy.ConflictStatus = ConflictStatusNone
 	}
 	dfi.dirty[meta.Path] = &metaCopy
+}
+
+// Invalidate gives the entry of path, if it has one, a new generation
+// without otherwise changing it, so that an upload of the file in flight
+// does not mark it clean when it finishes.
+func (dfi *DirtyFileIndex) Invalidate(path string) {
+	dfi.mu.Lock()
+	defer dfi.mu.Unlock()
+
+	if meta, exists := dfi.dirty[path]; exists {
+		meta.LocalDirtyGeneration = dfi.nextGenerationLocked()
+	}
 }
 
 // DropEntry removes the dirty entry without touching sync claims, unlike
@@ -163,8 +225,9 @@ func (dfi *DirtyFileIndex) DropEntry(path string) {
 
 // Rekey moves the dirty entry for oldPath to newPath, replacing any existing
 // destination entry (rename-over semantics). The syncing map is intentionally
-// untouched: sync claims belong to the workers holding them, and the bumped
-// LastModified invalidates any in-flight snapshot of either path.
+// untouched: sync claims belong to the workers holding them, and the new
+// generation invalidates any in-flight upload of either path. The caller has
+// written the destination's sidecar.
 func (dfi *DirtyFileIndex) Rekey(oldPath, newPath, stagedPath string) {
 	dfi.mu.Lock()
 	defer dfi.mu.Unlock()
@@ -186,10 +249,8 @@ func (dfi *DirtyFileIndex) Rekey(oldPath, newPath, stagedPath string) {
 	moved.ObservedETag = ""
 	moved.ObservedSize = 0
 	moved.ObservedLastModified = time.Time{}
-	moved.LocalDirtyGeneration++
-	if moved.LocalDirtyGeneration <= 0 {
-		moved.LocalDirtyGeneration = 1
-	}
+	moved.LocalDirtyGeneration = dfi.nextGenerationLocked()
+	moved.recorded = true
 	moved.LastModified = now
 	moved.SyncAttempts = 0
 	moved.LastSyncError = nil
@@ -294,9 +355,6 @@ func applyPathStateToDirtyMetadata(meta *DirtyFileMetadata, state *PathMetadataS
 	meta.ObservedETag = state.ObservedETag
 	meta.ObservedSize = state.ObservedSize
 	meta.ObservedLastModified = state.ObservedLastModified
-	if state.LocalDirtyGeneration > 0 {
-		meta.LocalDirtyGeneration = state.LocalDirtyGeneration
-	}
 	if state.StagedFilePath != "" {
 		meta.StagedPath = state.StagedFilePath
 	}

@@ -36,7 +36,10 @@ type StagingManager struct {
 	// quota (see SetBucketFullCheck).
 	bucketFull func() bool
 	// sidecarMu serializes read-modify-write updates of path metadata
-	// sidecars. Lock order: mu before sidecarMu.
+	// sidecars. A path also enters and leaves the dirty index under it,
+	// together with writing or removing its sidecar, which is what keeps a
+	// dirty file from being left without one. Lock order: mu before
+	// sidecarMu.
 	sidecarMu sync.Mutex
 }
 
@@ -73,10 +76,9 @@ type ExternalChangeSnapshot struct {
 	Reason       string
 }
 
-// EnsurePathMetadata creates or refreshes the durable sidecar for a staged path
-// without marking it dirty. Existing observed COS state and generation are
-// preserved.
-func (sm *StagingManager) EnsurePathMetadata(path, stagingPath string, size int64) error {
+// EnsurePathMetadata gives a staged path its sidecar without marking it
+// dirty. A sidecar already there for the path is kept as it is.
+func (sm *StagingManager) EnsurePathMetadata(path, stagingPath string) error {
 	sm.sidecarMu.Lock()
 	defer sm.sidecarMu.Unlock()
 
@@ -85,40 +87,26 @@ func (sm *StagingManager) EnsurePathMetadata(path, stagingPath string, size int6
 	if err != nil && !os.IsNotExist(err) {
 		return err
 	}
+	if state != nil && state.OriginalPath == path && state.StagedFilePath == stagingPath {
+		return nil
+	}
 	if state == nil {
 		state = &PathMetadataState{
 			Version:        pathMetadataVersion,
-			OriginalPath:   path,
 			ObjectKey:      objectKeyFromPath(path),
-			StagedFilePath: stagingPath,
 			ConflictStatus: ConflictStatusNone,
-			Size:           size,
 		}
 	}
-	state.Version = pathMetadataVersion
 	state.OriginalPath = path
-	if state.ObjectKey == "" {
-		state.ObjectKey = objectKeyFromPath(path)
-	}
 	state.StagedFilePath = stagingPath
-	state.Size = size
-	if state.ConflictStatus == "" {
-		state.ConflictStatus = ConflictStatusNone
-	}
 	return writePathMetadataState(metadataPath, state)
 }
 
-// MarkPathDirtyMetadata persists the local dirty generation and staged file
-// details used to compare a staged write with the object state observed before
-// or during the write.
-func (sm *StagingManager) MarkPathDirtyMetadata(path string, size int64) (*PathMetadataState, error) {
-	// Read the session's attributes before taking the sidecar lock: the
-	// lookup takes mu, which must be acquired first.
-	attrs := sm.sessionAttributes(path)
-
-	sm.sidecarMu.Lock()
-	defer sm.sidecarMu.Unlock()
-
+// recordDirtyPathLocked writes the sidecar of a path that is becoming dirty:
+// which path the staged bytes belong to, since when they are dirty, and the
+// attributes they sync with. It is written here once; later writes to the
+// file change nothing in it. Callers hold sidecarMu.
+func (sm *StagingManager) recordDirtyPathLocked(path string, attrs *StagedAttributes) (*PathMetadataState, error) {
 	stagingPath := sm.stagingFilePath(path)
 	metadataPath := sm.pathMetadataPath(stagingPath)
 	state, err := readPathMetadataState(metadataPath)
@@ -127,29 +115,17 @@ func (sm *StagingManager) MarkPathDirtyMetadata(path string, size int64) (*PathM
 			return nil, err
 		}
 		state = &PathMetadataState{
-			Version:      pathMetadataVersion,
-			OriginalPath: path,
-			ObjectKey:    objectKeyFromPath(path),
+			Version:   pathMetadataVersion,
+			ObjectKey: objectKeyFromPath(path),
 		}
 	}
 
-	now := time.Now()
-	state.Version = pathMetadataVersion
 	state.OriginalPath = path
-	if state.ObjectKey == "" {
-		state.ObjectKey = objectKeyFromPath(path)
-	}
-	state.LocalDirtyGeneration++
-	if state.LocalDirtyGeneration <= 0 {
-		state.LocalDirtyGeneration = 1
-	}
 	state.StagedFilePath = stagingPath
 	state.ConflictStatus = ConflictStatusNone
-	state.Size = size
 	if state.DirtySince.IsZero() {
-		state.DirtySince = now
+		state.DirtySince = time.Now()
 	}
-	state.LastModified = now
 	if attrs != nil {
 		state.Attributes = attrs
 	}
@@ -163,24 +139,29 @@ func (sm *StagingManager) MarkPathDirtyMetadata(path string, size int64) (*PathM
 // CommitPath makes what has been written to path survive a power loss: the
 // staged bytes, the sidecar recovery needs to tell whose bytes they are, and
 // the directory entries of both. A write may be reported to its client as on
-// stable storage only after it. A path with no session has nothing staged
-// that an earlier commit or the object store does not already hold.
+// stable storage only after it. The sidecar and the directory are flushed
+// only when they have changed since the last commit, so committing a file
+// that is being written is one flush of its bytes. A path with no session
+// has nothing staged that an earlier commit or the object store does not
+// already hold.
 func (sm *StagingManager) CommitPath(path string) error {
-	sm.mu.RLock()
-	session, exists := sm.sessions[path]
-	sm.mu.RUnlock()
-	if !exists {
+	session := sm.sessionAt(path)
+	if session == nil {
 		return nil
 	}
 
-	stagingPath, err := session.syncToDisk()
-	if err != nil || stagingPath == "" {
+	stagingPath, uncommitted, err := session.syncToDisk()
+	if err != nil || stagingPath == "" || uncommitted == 0 {
 		return err
 	}
 	if err := sm.commitPathMetadata(path, stagingPath); err != nil {
 		return err
 	}
-	return syncDir(filepath.Dir(stagingPath))
+	if err := syncDir(filepath.Dir(stagingPath)); err != nil {
+		return err
+	}
+	session.metadataCommitted(uncommitted)
+	return nil
 }
 
 // commitPathMetadata puts the sidecar of a staged file on disk and marks it
@@ -206,10 +187,19 @@ func (sm *StagingManager) commitPathMetadata(path, stagingPath string) error {
 	return writePathMetadataState(metadataPath, state)
 }
 
+// sessionAt returns the session staging path, or nil.
+func (sm *StagingManager) sessionAt(path string) *WriteSession {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return sm.sessions[path]
+}
+
 func (sm *StagingManager) pathMetadataPath(stagingPath string) string {
 	return stagingPath + ".metadata"
 }
 
+// removePathMetadata removes the sidecar of path. Callers that drop the path
+// from the dirty index with it hold sidecarMu across both.
 func (sm *StagingManager) removePathMetadata(path string) error {
 	metadataPath := sm.pathMetadataPath(sm.stagingFilePath(path))
 	if err := os.Remove(metadataPath); err != nil && !os.IsNotExist(err) {
@@ -360,6 +350,10 @@ func (sm *StagingManager) GetSessionsInDirectory(dirPath string) []*WriteSession
 // for sync all the same, which is its best chance of reaching the object
 // store, but the caller must fail the write: until that sync, a crash would
 // leave the staged bytes with nothing to say which path they belong to.
+//
+// Only the write that takes a file from clean to dirty reaches the disk: it
+// writes the sidecar. Every later one changes nothing a restart needs and
+// is recorded in memory alone.
 func (sm *StagingManager) MarkDirty(path string, size int64) error {
 	if sm.dirtyIndex.IsConflicted(path) {
 		logging.Warn("Refusing to queue conflicted staged path for sync",
@@ -368,15 +362,15 @@ func (sm *StagingManager) MarkDirty(path string, size int64) error {
 		return nil
 	}
 
-	state, err := sm.MarkPathDirtyMetadata(path, size)
-	if err != nil {
-		logging.Error("Failed to persist dirty path metadata; failing the write",
-			zap.String("path", path),
-			zap.Error(err))
-		err = fmt.Errorf("failed to persist staging metadata for %s: %w", path, err)
+	var err error
+	if !sm.dirtyIndex.MarkDirtyAgain(path, size) {
+		if err = sm.markPathDirty(path, size); err != nil {
+			logging.Error("Failed to persist dirty path metadata; failing the write",
+				zap.String("path", path),
+				zap.Error(err))
+			err = fmt.Errorf("failed to persist staging metadata for %s: %w", path, err)
+		}
 	}
-
-	sm.dirtyIndex.MarkDirtyWithState(path, size, state)
 	sm.updateSyncQueueMetrics()
 	sm.updatePressureMetrics()
 
@@ -387,10 +381,74 @@ func (sm *StagingManager) MarkDirty(path string, size int64) error {
 	return err
 }
 
+// markPathDirty takes a path that is not listed as dirty into the dirty
+// index, writing its sidecar first. The path is listed even when the sidecar
+// could not be written, and then tries again on its next write.
+func (sm *StagingManager) markPathDirty(path string, size int64) error {
+	// Look the session up before taking the sidecar lock: the lookup takes
+	// mu, which must be acquired first.
+	session := sm.sessionAt(path)
+	var attrs *StagedAttributes
+	if session != nil {
+		if current, _, set := session.stagedAttributes(); set {
+			attrs = &current
+		}
+	}
+
+	sm.sidecarMu.Lock()
+	if sm.dirtyIndex.MarkDirtyAgain(path, size) {
+		// Another write of the same file got here first.
+		sm.sidecarMu.Unlock()
+		return nil
+	}
+	state, err := sm.recordDirtyPathLocked(path, attrs)
+	sm.dirtyIndex.MarkDirtyWithState(path, size, state)
+	sm.sidecarMu.Unlock()
+
+	if err == nil && session != nil {
+		session.metadataChanged()
+	}
+	return err
+}
+
 // MarkClean marks a file as clean (synced)
 func (sm *StagingManager) MarkClean(path string) {
+	sm.sidecarMu.Lock()
 	sm.dirtyIndex.MarkClean(path)
-	if err := sm.removePathMetadata(path); err != nil {
+	err := sm.removePathMetadata(path)
+	sm.sidecarMu.Unlock()
+
+	sm.markedClean(path, err)
+}
+
+// markCleanIfUnchanged marks a file clean once an upload of it has finished,
+// unless the file has changed since it carried generation, the one the
+// upload read before it started. It reports whether the upload stands. False
+// means a write, truncate or rename landed meanwhile: the file stays dirty,
+// with its sidecar, for the next sync to upload again.
+//
+// The sidecar goes only together with the entry it belongs to. A path whose
+// entry went during the upload had its sidecar dealt with by whatever took
+// the entry, and one found there now may be a newer file's.
+func (sm *StagingManager) markCleanIfUnchanged(path string, generation int64) bool {
+	sm.sidecarMu.Lock()
+	wasDirty, clean := sm.dirtyIndex.MarkCleanIfUnchanged(path, generation)
+	var err error
+	if wasDirty && clean {
+		err = sm.removePathMetadata(path)
+	}
+	sm.sidecarMu.Unlock()
+
+	if clean {
+		sm.markedClean(path, err)
+	}
+	return clean
+}
+
+// markedClean reports a path that has just been marked clean, and err if its
+// sidecar could not be removed.
+func (sm *StagingManager) markedClean(path string, err error) {
+	if err != nil {
 		logging.Warn("Failed to remove clean path metadata",
 			zap.String("path", path),
 			zap.Error(err))
@@ -405,8 +463,11 @@ func (sm *StagingManager) MarkClean(path string) {
 
 // ForgetDirty removes stale dirty bookkeeping when staged data is intentionally gone.
 func (sm *StagingManager) ForgetDirty(path, reason string) {
+	sm.sidecarMu.Lock()
 	sm.dirtyIndex.MarkClean(path)
-	if err := sm.removePathMetadata(path); err != nil {
+	err := sm.removePathMetadata(path)
+	sm.sidecarMu.Unlock()
+	if err != nil {
 		logging.Warn("Failed to remove forgotten path metadata",
 			zap.String("path", path),
 			zap.Error(err))
@@ -495,8 +556,14 @@ func (sm *StagingManager) RecordConflict(path string, change ExternalChangeSnaps
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal conflict metadata: %w", err)
 	}
-	if err := os.WriteFile(metadataPath, metadataBytes, 0600); err != nil {
+	// The preserved copy and its record go to disk before the staged
+	// originals are removed below: the bytes may be ones a client was told
+	// are on stable storage.
+	if err := writeSidecarFile(metadataPath, metadataBytes, true); err != nil {
 		return nil, fmt.Errorf("failed to write conflict metadata: %w", err)
+	}
+	if err := syncDir(filepath.Dir(preservedPath)); err != nil {
+		return nil, fmt.Errorf("failed to flush conflict directory: %w", err)
 	}
 
 	sm.mu.Lock()
@@ -1024,19 +1091,15 @@ func (sm *StagingManager) RecoverFromDisk() error {
 				zap.String("path", state.OriginalPath))
 			continue
 		}
-		state.StagedFilePath = filePath
-		state.Size = info.Size()
-		if state.LastModified.IsZero() {
-			state.LastModified = info.ModTime()
-		}
-		if state.DirtySince.IsZero() {
-			state.DirtySince = info.ModTime()
-		}
-		if err := writePathMetadataState(metadataPath, state); err != nil {
-			logging.Warn("Failed to refresh recovered staging metadata",
-				zap.String("file", entry.Name()),
-				zap.String("metadata_path", metadataPath),
-				zap.Error(err))
+		if state.StagedFilePath != filePath {
+			// The staging directory has moved since the sidecar was written.
+			state.StagedFilePath = filePath
+			if err := writePathMetadataState(metadataPath, state); err != nil {
+				logging.Warn("Failed to refresh recovered staging metadata",
+					zap.String("file", entry.Name()),
+					zap.String("metadata_path", metadataPath),
+					zap.Error(err))
+			}
 		}
 
 		// Mark as dirty for re-sync safely preserving original maps!
