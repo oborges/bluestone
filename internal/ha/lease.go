@@ -194,6 +194,8 @@ func Acquire(ctx context.Context, opts Options) (*Manager, error) {
 			return nil, fmt.Errorf("failed to write bucket lease: %w", err)
 		}
 		logging.Error("Could not persist lease at startup; heartbeat will retry", zap.Error(err))
+	} else if winner := m.lostAcquireRace(ctx); winner != nil {
+		return nil, &ErrLeaseHeld{Lease: *winner}
 	}
 	m.writeLocalMarker()
 
@@ -207,6 +209,31 @@ func Acquire(ctx context.Context, opts Options) (*Manager, error) {
 		zap.Duration("heartbeat_interval", m.heartbeatInterval),
 		zap.Duration("lease_timeout", m.leaseTimeout))
 	return m, nil
+}
+
+// lostAcquireRace reads back the lease this node just wrote and returns the
+// holder if it is another gateway. The read and the write of Acquire are not
+// one atomic step, so two gateways starting together can both find the lease
+// free and both write it; the bucket keeps the last write, and the gateway
+// that reads back another's lease stands down here rather than serve until
+// its first heartbeat notices. This narrows the race without closing it: a
+// write that lands after this read is still only caught by the heartbeat.
+// A read that fails proves nothing either way and is left to the heartbeat
+// too, since the lease this node wrote may well be the one in the bucket.
+func (m *Manager) lostAcquireRace(ctx context.Context) *Lease {
+	current, err := m.readLease(ctx)
+	if err != nil {
+		logging.Warn("Could not read back the HA lease after writing it; the heartbeat will verify it",
+			zap.Error(err))
+		return nil
+	}
+	if current.HolderID == m.holderID {
+		return nil
+	}
+	logging.Error("Lost the HA lease to a gateway that started at the same time; standing down",
+		zap.String("taken_by", current.HolderID),
+		zap.String("taken_by_host", current.Hostname))
+	return current
 }
 
 func (m *Manager) readLease(ctx context.Context) (*Lease, error) {

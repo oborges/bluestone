@@ -36,6 +36,13 @@ well (`ha.on_lease_lost: "stop"`):
   fatally. Fresh means renewed within `ha.lease_timeout` (default 60s).
 - A *stale* lease (holder crashed) is taken over automatically, incrementing
   the lease epoch.
+- Checking the lease and writing it are two requests, not one atomic step,
+  so two gateways started at the same moment can both find it free and both
+  write it. Each reads the lease back after writing, and the one that finds
+  the other's exits like any gateway facing a fresh foreign lease. A write
+  that lands after that read is still only caught by the next heartbeat, so
+  for up to `ha.heartbeat_interval` both can serve. Do not start or promote
+  both nodes at once.
 - An active gateway that loses the lease stops serving and exits 3. It loses
   the lease when another gateway holds it (a takeover, forced or after this
   one went silent), or when the lease cannot be renewed for longer than
