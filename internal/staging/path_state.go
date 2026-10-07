@@ -21,6 +21,12 @@ const (
 // PathMetadataState is the durable per-path write-back state kept next to a
 // staged data file. It is intentionally small and local so restart recovery does
 // not depend on any external database.
+//
+// It holds what identifies the staged file and the attributes it syncs with,
+// and is written only when one of those changes. What changes with every
+// write is not in it: the size and the time of the last write are read back
+// from the data file, and the dirty generation lives only in memory (see
+// DirtyFileMetadata.LocalDirtyGeneration).
 type PathMetadataState struct {
 	Version              int       `json:"version"`
 	OriginalPath         string    `json:"original_path"`
@@ -28,19 +34,18 @@ type PathMetadataState struct {
 	ObservedETag         string    `json:"observed_etag,omitempty"`
 	ObservedSize         int64     `json:"observed_size,omitempty"`
 	ObservedLastModified time.Time `json:"observed_last_modified,omitempty"`
-	LocalDirtyGeneration int64     `json:"local_dirty_generation"`
 	StagedFilePath       string    `json:"staged_file_path"`
 	ConflictStatus       string    `json:"conflict_status"`
-	Size                 int64     `json:"size"`
 	DirtySince           time.Time `json:"dirty_since,omitempty"`
-	LastModified         time.Time `json:"last_modified,omitempty"`
 	// Attributes are the POSIX attributes the staged file syncs with, kept
 	// here so crash recovery uploads it with them.
 	Attributes *StagedAttributes `json:"attributes,omitempty"`
 	// Committed records that a client was told this staged file is on
-	// stable storage. From then on the sidecar is only replaced by one
-	// already on disk, so a power loss cannot leave the file without the
-	// metadata recovery needs to upload it.
+	// stable storage, which put this sidecar on disk. From then on the
+	// sidecar is only replaced by one already on disk, so a power loss
+	// cannot leave the file without the metadata recovery needs to upload
+	// it. A sidecar that takes the place of a committed one, as a rename
+	// over the file writes, is committed for the same reason.
 	Committed bool `json:"committed,omitempty"`
 }
 
@@ -85,6 +90,15 @@ func writePathMetadataState(metadataPath string, state *PathMetadataState) error
 	}
 	if state.ConflictStatus == "" {
 		state.ConflictStatus = ConflictStatusNone
+	}
+
+	// A committed sidecar is on disk, and may only be replaced by one that
+	// is on disk before it takes its place. That holds whoever writes the
+	// replacement and whatever it was built from, so it is settled here.
+	if !state.Committed {
+		if replaced, err := readPathMetadataState(metadataPath); err == nil && replaced.Committed {
+			state.Committed = true
+		}
 	}
 
 	if err := os.MkdirAll(filepath.Dir(metadataPath), 0700); err != nil {
@@ -145,18 +159,13 @@ func syncDir(dir string) error {
 	return err
 }
 
+// dirtyMetadataFromPathState builds the dirty entry of a staged file found on
+// disk: its identity from the sidecar, its size and last write from the data
+// file.
 func dirtyMetadataFromPathState(state *PathMetadataState, size int64, modTime time.Time) DirtyFileMetadata {
 	dirtySince := state.DirtySince
 	if dirtySince.IsZero() {
 		dirtySince = modTime
-	}
-	lastModified := state.LastModified
-	if lastModified.IsZero() {
-		lastModified = modTime
-	}
-	generation := state.LocalDirtyGeneration
-	if generation <= 0 {
-		generation = 1
 	}
 	objectKey := state.ObjectKey
 	if objectKey == "" {
@@ -168,11 +177,10 @@ func dirtyMetadataFromPathState(state *PathMetadataState, size int64, modTime ti
 		ObservedETag:         state.ObservedETag,
 		ObservedSize:         state.ObservedSize,
 		ObservedLastModified: state.ObservedLastModified,
-		LocalDirtyGeneration: generation,
 		StagedPath:           state.StagedFilePath,
 		ConflictStatus:       state.ConflictStatus,
 		Size:                 size,
 		DirtySince:           dirtySince,
-		LastModified:         lastModified,
+		LastModified:         modTime,
 	}
 }

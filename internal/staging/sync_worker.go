@@ -390,11 +390,16 @@ func (sw *SyncWorker) syncFileLocked(path string, workerID int) error {
 		}
 		session = recovered
 	}
+	// The generation is read before the staged bytes are opened: a change
+	// that lands in between is uploaded and then uploaded again, where one
+	// read after would be marked clean without ever being uploaded.
 	dirtySince := time.Now()
-	var snapshotLastModified time.Time
-	if metadata := sw.manager.dirtyIndex.GetMetadata(path); metadata != nil && !metadata.DirtySince.IsZero() {
-		dirtySince = metadata.DirtySince
-		snapshotLastModified = metadata.LastModified
+	var snapshotGeneration int64
+	if metadata := sw.manager.dirtyIndex.GetMetadata(path); metadata != nil {
+		snapshotGeneration = metadata.LocalDirtyGeneration
+		if !metadata.DirtySince.IsZero() {
+			dirtySince = metadata.DirtySince
+		}
 	}
 
 	// Flush the session and open its staged bytes. The snapshot's file does
@@ -422,7 +427,7 @@ func (sw *SyncWorker) syncFileLocked(path string, workerID int) error {
 			if currentSize != size || !currentLastWrite.Equal(lastWrite) {
 				return false
 			}
-			if currentMetadata := sw.manager.dirtyIndex.GetMetadata(path); currentMetadata != nil && currentMetadata.LastModified.After(snapshotLastModified) {
+			if currentMetadata := sw.manager.dirtyIndex.GetMetadata(path); currentMetadata != nil && currentMetadata.LocalDirtyGeneration != snapshotGeneration {
 				return false
 			}
 			return true
@@ -451,7 +456,11 @@ func (sw *SyncWorker) syncFileLocked(path string, workerID int) error {
 		sw.addUploadSample(path, size, time.Since(uploadStart))
 	}
 
-	if currentMetadata := sw.manager.dirtyIndex.GetMetadata(path); currentMetadata != nil && currentMetadata.LastModified.After(snapshotLastModified) {
+	// Mark as clean, unless the file changed while it uploaded. The check
+	// and the cleaning are one step: done apart, a write landing between
+	// them would be marked clean, and its staged bytes removed, without
+	// having been uploaded.
+	if !sw.manager.markCleanIfUnchanged(path, snapshotGeneration) {
 		return fmt.Errorf("snapshot changed during upload; leaving file dirty for retry")
 	}
 
@@ -460,9 +469,6 @@ func (sw *SyncWorker) syncFileLocked(path string, workerID int) error {
 		uploadedBytes = size
 	}
 	sw.recordSuccessfulSync(path, uploadedBytes, dirtySince, uploadDuration)
-
-	// Mark as clean
-	sw.manager.MarkClean(path)
 
 	// The object just changed in COS; caches that observed the pre-sync
 	// object (e.g. a stat during the dirty window) must not outlive it.

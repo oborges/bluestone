@@ -19,7 +19,9 @@ func stagedSidecars(t *testing.T, root string) []string {
 }
 
 // A write or truncate the gateway cannot record for recovery fails, where it
-// used to be accepted with only a warning in the log.
+// used to be accepted with only a warning in the log. What has to be
+// recorded is the change that makes a file dirty: later ones add nothing a
+// restart needs.
 func TestWriteFailsWhenItCannotBeRecorded(t *testing.T) {
 	cfg := testStagingConfig(t)
 	manager, err := staging.NewStagingManager(cfg)
@@ -28,24 +30,28 @@ func TestWriteFailsWhenItCannotBeRecorded(t *testing.T) {
 	}
 	t.Cleanup(func() { manager.Shutdown() })
 	fs := newDirtyStagingTestFilesystemWithStore(t, manager, newFakeObjectStore())
-	writeTestFile(t, fs, "file.txt", "hello")
 
-	// A directory where the sidecar's temporary file goes fails its write,
-	// as a full or failing staging disk would.
-	for _, sidecar := range stagedSidecars(t, cfg.RootDir) {
-		if err := os.Mkdir(sidecar+".tmp", 0700); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	f, err := fs.OpenFile("file.txt", os.O_WRONLY, 0)
+	f, err := fs.OpenFile("file.txt", os.O_WRONLY|os.O_CREATE, 0644)
 	if err != nil {
 		t.Fatalf("OpenFile() error = %v", err)
 	}
 	defer f.Close()
+
+	// A directory where the sidecar's temporary file goes fails its write,
+	// as a full or failing staging disk would.
+	sidecars := stagedSidecars(t, cfg.RootDir)
+	if len(sidecars) != 1 {
+		t.Fatalf("sidecars = %v, want the new file's", sidecars)
+	}
+	if err := os.Mkdir(sidecars[0]+".tmp", 0700); err != nil {
+		t.Fatal(err)
+	}
+
 	if n, err := f.Write([]byte("HELLO")); err == nil {
 		t.Fatalf("Write() = %d, nil; want an error", n)
 	}
+	// The failed write left the file queued for sync, but still unrecorded:
+	// what follows must fail the same way.
 	if err := f.Truncate(2); err == nil {
 		t.Fatal("Truncate() succeeded; want an error")
 	}

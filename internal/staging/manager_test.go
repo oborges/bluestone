@@ -594,8 +594,8 @@ func TestStagingManager_RecoverFromDiskRestoresPathMetadataState(t *testing.T) {
 	if got.ObservedETag != `"before-write"` || got.ObservedSize != 99 || !got.ObservedLastModified.Equal(observedLastModified) {
 		t.Fatalf("observed state = etag %q size %d last_modified %v", got.ObservedETag, got.ObservedSize, got.ObservedLastModified)
 	}
-	if got.LocalDirtyGeneration != state.LocalDirtyGeneration {
-		t.Fatalf("dirty generation = %d, want %d", got.LocalDirtyGeneration, state.LocalDirtyGeneration)
+	if got.Size != int64(len(data)) {
+		t.Fatalf("recovered size = %d, want the staged file's %d", got.Size, len(data))
 	}
 	if got.StagedPath != session.StagingPath {
 		t.Fatalf("staged path = %q, want %q", got.StagedPath, session.StagingPath)

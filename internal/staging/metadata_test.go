@@ -237,3 +237,40 @@ func TestDirtyFileIndex_IncrementNonExistent(t *testing.T) {
 }
 
 // Made with Bob
+
+// A generation is never handed out twice, so an upload cannot take a later
+// state of its path for the one it read: not after the path was dropped and
+// marked dirty again, and not after another file was renamed over it.
+func TestDirtyFileIndex_GenerationIsNeverReused(t *testing.T) {
+	index := NewDirtyFileIndex()
+
+	index.MarkDirty("/recreated", 1)
+	uploading := index.GetMetadata("/recreated").LocalDirtyGeneration
+	index.MarkClean("/recreated")
+	index.MarkDirty("/recreated", 1)
+	if _, clean := index.MarkCleanIfUnchanged("/recreated", uploading); clean {
+		t.Fatal("upload of a dropped file marked the file that took its path clean")
+	}
+	if !index.IsDirty("/recreated") {
+		t.Fatal("refused clean dropped the entry")
+	}
+
+	// Counting writes per file would give the renamed entry the
+	// destination's count here: one write and the rename against two writes.
+	index.MarkDirty("/src", 1)
+	index.MarkDirty("/dst", 1)
+	index.MarkDirty("/dst", 1)
+	uploading = index.GetMetadata("/dst").LocalDirtyGeneration
+	index.Rekey("/src", "/dst", "staged")
+	if _, clean := index.MarkCleanIfUnchanged("/dst", uploading); clean {
+		t.Fatal("upload of a replaced destination marked the renamed file clean")
+	}
+
+	current := index.GetMetadata("/dst").LocalDirtyGeneration
+	if wasDirty, clean := index.MarkCleanIfUnchanged("/dst", current); !wasDirty || !clean {
+		t.Fatalf("unchanged file: wasDirty %v clean %v, want both", wasDirty, clean)
+	}
+	if wasDirty, clean := index.MarkCleanIfUnchanged("/dst", current); wasDirty || !clean {
+		t.Fatalf("path without an entry: wasDirty %v clean %v, want clean and not dirty", wasDirty, clean)
+	}
+}

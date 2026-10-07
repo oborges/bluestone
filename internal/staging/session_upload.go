@@ -131,6 +131,9 @@ func (ws *WriteSession) detachFromUploadsLocked(keepBytes int64) error {
 	readers := ws.uploadReaders
 	ws.uploadReaders = 0
 	ws.fileGeneration++
+	// The staging path now names a new file: the next commit has the
+	// directory to flush as well.
+	ws.metadataVersion++
 
 	logging.Info("Moved staging session to a new file: upload in flight",
 		zap.String("path", ws.Path),

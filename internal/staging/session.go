@@ -55,6 +55,13 @@ type WriteSession struct {
 	// fileGeneration increments whenever the session moves to a new staging
 	// file, so snapshots of the old one release against the right counter.
 	fileGeneration uint64
+	// metadataVersion counts the changes to what recovery needs besides
+	// the staged bytes: the sidecar, and the directory entries of the
+	// staging file and of the sidecar. committedMetadataVersion is the count
+	// the last commit covered. While the two are equal a commit has only
+	// the bytes to flush.
+	metadataVersion          uint64
+	committedMetadataVersion uint64
 }
 
 // NewWriteSession creates a new write session
@@ -73,7 +80,7 @@ func NewWriteSession(manager *StagingManager, path string, stagingPath string) (
 	}
 
 	if manager != nil {
-		if err := manager.EnsurePathMetadata(path, stagingPath, stat.Size()); err != nil {
+		if err := manager.EnsurePathMetadata(path, stagingPath); err != nil {
 			fmt.Printf("Warning: Failed to persist staging metadata for %s: %v\n", path, err)
 		}
 	}
@@ -98,6 +105,8 @@ func NewWriteSession(manager *StagingManager, path string, stagingPath string) (
 		// A staging file that already has bytes, as in recovery, is treated
 		// as data: nothing says it was never written.
 		written: stat.Size() > 0,
+		// Nothing about this staging file has been committed yet.
+		metadataVersion: 1,
 	}, nil
 }
 
@@ -231,6 +240,24 @@ func (ws *WriteSession) persistAttributes() {
 	}
 }
 
+// metadataChanged records that the sidecar, or a directory entry of the
+// staging file or the sidecar, has changed, so the next commit flushes them.
+func (ws *WriteSession) metadataChanged() {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+	ws.metadataVersion++
+}
+
+// metadataCommitted records that a commit has flushed the sidecar and the
+// directory as they were at version, the one syncToDisk returned to it.
+func (ws *WriteSession) metadataCommitted(version uint64) {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+	if version > ws.committedMetadataVersion {
+		ws.committedMetadataVersion = version
+	}
+}
+
 // Rekey points the session at a renamed path. The open descriptor still
 // addresses the moved staging file, so only the naming changes.
 func (ws *WriteSession) Rekey(newPath, newStagingPath string) {
@@ -238,6 +265,7 @@ func (ws *WriteSession) Rekey(newPath, newStagingPath string) {
 	defer ws.mu.Unlock()
 	ws.Path = newPath
 	ws.StagingPath = newStagingPath
+	ws.metadataVersion++
 }
 
 // stagingPathIs reports whether the session's staging file is still the one
@@ -260,6 +288,7 @@ func (ws *WriteSession) moveStagingFile(newStagingPath string, move func() error
 		return err
 	}
 	ws.StagingPath = newStagingPath
+	ws.metadataVersion++
 	return nil
 }
 
@@ -360,18 +389,24 @@ func (ws *WriteSession) Sync() error {
 }
 
 // syncToDisk flushes the staging file to disk and returns its path. A session
-// already closed has no file left to flush and returns "".
-func (ws *WriteSession) syncToDisk() (string, error) {
+// already closed has no file left to flush and returns "". uncommitted is
+// zero when the sidecar and the directory are as the last commit left them,
+// and otherwise the metadata version to report to metadataCommitted once
+// they have been flushed too.
+func (ws *WriteSession) syncToDisk() (stagingPath string, uncommitted uint64, err error) {
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
 
 	if ws.File == nil {
-		return "", nil
+		return "", 0, nil
 	}
 	if err := ws.File.Sync(); err != nil {
-		return "", fmt.Errorf("failed to sync: %w", err)
+		return "", 0, fmt.Errorf("failed to sync: %w", err)
 	}
-	return ws.StagingPath, nil
+	if ws.metadataVersion != ws.committedMetadataVersion {
+		uncommitted = ws.metadataVersion
+	}
+	return ws.StagingPath, uncommitted, nil
 }
 
 // Snapshot returns stable session metadata for a sync attempt.

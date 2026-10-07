@@ -31,7 +31,8 @@ func sidecarOf(t *testing.T, manager *StagingManager, path string) *PathMetadata
 }
 
 // A committed write is one a restart finds: its sidecar is marked committed,
-// stays so across later writes, and recovery queues the file for sync.
+// a later write leaves that sidecar alone, and recovery queues the file for
+// sync.
 func TestCommitPathKeepsWriteRecoverable(t *testing.T) {
 	cfg := createTestConfig(t)
 	manager, err := NewStagingManager(cfg)
@@ -51,19 +52,26 @@ func TestCommitPathKeepsWriteRecoverable(t *testing.T) {
 		t.Fatal("sidecar not marked committed")
 	}
 
-	// A later write rewrites the sidecar; it must stay committed, or the
-	// rewrite could replace the one on disk with one that is not.
-	generation := sidecarOf(t, manager, path).LocalDirtyGeneration
+	// A later write changes nothing a restart needs: the sidecar on disk
+	// is not rewritten, and the change is recorded in memory.
+	sidecarPath := manager.pathMetadataPath(manager.stagingFilePath(path))
+	committedSidecar, err := os.Stat(sidecarPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	generation := manager.dirtyIndex.GetMetadata(path).LocalDirtyGeneration
 	if _, err := session.Write([]byte(" world"), 5); err != nil {
 		t.Fatalf("Write() error = %v", err)
 	}
 	if err := manager.MarkDirty(path, session.GetSize()); err != nil {
 		t.Fatalf("MarkDirty() error = %v", err)
 	}
-	state := sidecarOf(t, manager, path)
-	if !state.Committed || state.LocalDirtyGeneration <= generation {
-		t.Fatalf("sidecar after a later write = committed %v generation %d, want committed and past %d",
-			state.Committed, state.LocalDirtyGeneration, generation)
+	if after, err := os.Stat(sidecarPath); err != nil || !os.SameFile(committedSidecar, after) {
+		t.Fatalf("a later write replaced the committed sidecar (stat error %v)", err)
+	}
+	if got := manager.dirtyIndex.GetMetadata(path); got.LocalDirtyGeneration == generation || got.Size != 11 {
+		t.Fatalf("dirty entry after a later write = generation %d size %d, want a new generation and size 11",
+			got.LocalDirtyGeneration, got.Size)
 	}
 	if err := manager.CommitPath(path); err != nil {
 		t.Fatalf("second CommitPath() error = %v", err)
@@ -77,6 +85,9 @@ func TestCommitPathKeepsWriteRecoverable(t *testing.T) {
 	defer recovered.Shutdown()
 	if !recovered.IsDirty(path) {
 		t.Fatal("committed write not queued for sync after restart")
+	}
+	if got := recovered.dirtyIndex.GetMetadata(path); got.Size != 11 {
+		t.Fatalf("recovered size = %d, want the staged file's 11 bytes", got.Size)
 	}
 	data, err := os.ReadFile(recovered.stagingFilePath(path))
 	if err != nil || string(data) != "hello world" {
@@ -149,5 +160,18 @@ func TestRenameStagedPathKeepsCommitted(t *testing.T) {
 	}
 	if sidecarOf(t, manager, "/moved.txt").Committed {
 		t.Fatal("rename marked an uncommitted file committed")
+	}
+
+	// A committed destination has a sidecar that is on disk. The sidecar of
+	// an uncommitted file renamed over it has to go to disk before it takes
+	// that one's place, which is what the mark makes happen: a power loss
+	// must not leave the destination's name with an empty sidecar and
+	// either file's bytes.
+	stageWrite(t, manager, "/over.txt", "hello")
+	if err := manager.RenameStagedPath("/over.txt", "/new.txt"); err != nil {
+		t.Fatalf("RenameStagedPath() over a committed file error = %v", err)
+	}
+	if !sidecarOf(t, manager, "/new.txt").Committed {
+		t.Fatal("sidecar replacing a committed one was not written as committed")
 	}
 }

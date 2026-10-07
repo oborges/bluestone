@@ -63,22 +63,22 @@ func (sm *StagingManager) persistSessionAttributes(ws *WriteSession) {
 	}
 
 	sm.sidecarMu.Lock()
-	defer sm.sidecarMu.Unlock()
-
 	metadataPath := sm.pathMetadataPath(stagingPath)
 	state, err := readPathMetadataState(metadataPath)
+	if err == nil {
+		state.Attributes = &attrs
+		err = writePathMetadataState(metadataPath, state)
+	}
+	sm.sidecarMu.Unlock()
+
 	if err != nil {
 		if !os.IsNotExist(err) {
-			logging.Warn("Failed to read staging metadata for attribute update",
+			logging.Warn("Failed to persist staged attributes",
 				zap.String("metadata_path", metadataPath), zap.Error(err))
 		}
 		return
 	}
-	state.Attributes = &attrs
-	if err := writePathMetadataState(metadataPath, state); err != nil {
-		logging.Warn("Failed to persist staged attributes",
-			zap.String("metadata_path", metadataPath), zap.Error(err))
-	}
+	ws.metadataChanged()
 }
 
 // sessionAttributes returns the attributes of the session staging path, if
