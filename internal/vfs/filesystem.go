@@ -176,6 +176,19 @@ func (fs *Filesystem) Capacity() Capacity {
 	return capacity
 }
 
+// Commit makes everything written to the file durable where it is staged, so
+// that a write can be reported to its client as on stable storage: the bytes
+// survive a power loss of the gateway and upload after the restart. It is the
+// NFS server's Committer.
+func (fs *Filesystem) Commit(filename string) error {
+	if fs.featureFlags == nil || !fs.featureFlags.IsStagingEnabled() || fs.stagingManager == nil {
+		// Without staging a write is in the object store by the time its
+		// handle closes.
+		return nil
+	}
+	return fs.stagingManager.CommitPath(fs.keyPath(filename))
+}
+
 // Open opens a file for reading
 func (fs *Filesystem) Open(filename string) (billy.File, error) {
 	return fs.OpenFile(filename, os.O_RDONLY, 0)

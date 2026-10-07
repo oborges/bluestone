@@ -68,9 +68,21 @@ sync completes, the gateway must preserve the staged dirty data locally. If you
 need to know whether data is durable in COS, monitor the sync queue, dirty
 bytes, upload metrics, logs, or the debug staging endpoint.
 
+Over NFS, how safe an accepted write is on the staging disk depends on what
+the client asked for. A write sent as stable (`FILE_SYNC` or `DATA_SYNC`: a
+`sync` mount, `O_SYNC`) and a `COMMIT` (the client's `fsync` or `close`) are
+answered only once the staged bytes and their recovery metadata
+are flushed to the staging disk, so they survive a power loss of the gateway
+and upload after the restart. A write sent as `UNSTABLE`, the default of an
+`async` mount, is answered from memory and reported as `UNSTABLE`; the client
+keeps it until its `COMMIT` and sends it again if the gateway restarted in
+between.
+
 In short:
 
 - "Write accepted" means local staging accepted the write.
+- "Committed" means the write is flushed to the staging disk and survives a
+  power loss there.
 - "Sync complete" means the staged file was uploaded to COS.
 - "Durable in COS" means the uploaded object is visible in COS with the
   expected size/checksum for your validation process.

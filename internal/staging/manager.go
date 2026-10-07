@@ -160,6 +160,52 @@ func (sm *StagingManager) MarkPathDirtyMetadata(path string, size int64) (*PathM
 	return state, nil
 }
 
+// CommitPath makes what has been written to path survive a power loss: the
+// staged bytes, the sidecar recovery needs to tell whose bytes they are, and
+// the directory entries of both. A write may be reported to its client as on
+// stable storage only after it. A path with no session has nothing staged
+// that an earlier commit or the object store does not already hold.
+func (sm *StagingManager) CommitPath(path string) error {
+	sm.mu.RLock()
+	session, exists := sm.sessions[path]
+	sm.mu.RUnlock()
+	if !exists {
+		return nil
+	}
+
+	stagingPath, err := session.syncToDisk()
+	if err != nil || stagingPath == "" {
+		return err
+	}
+	if err := sm.commitPathMetadata(path, stagingPath); err != nil {
+		return err
+	}
+	return syncDir(filepath.Dir(stagingPath))
+}
+
+// commitPathMetadata puts the sidecar of a staged file on disk and marks it
+// committed, which keeps every later version of it on disk too.
+func (sm *StagingManager) commitPathMetadata(path, stagingPath string) error {
+	sm.sidecarMu.Lock()
+	defer sm.sidecarMu.Unlock()
+
+	metadataPath := sm.pathMetadataPath(stagingPath)
+	state, err := readPathMetadataState(metadataPath)
+	if err != nil {
+		if os.IsNotExist(err) && !sm.dirtyIndex.IsDirty(path) {
+			// Synced since it was written: the sidecar went once the
+			// object store had the bytes.
+			return nil
+		}
+		return fmt.Errorf("staged write of %s has no metadata to recover it by: %w", path, err)
+	}
+	if state.Committed {
+		return nil
+	}
+	state.Committed = true
+	return writePathMetadataState(metadataPath, state)
+}
+
 func (sm *StagingManager) pathMetadataPath(stagingPath string) string {
 	return stagingPath + ".metadata"
 }

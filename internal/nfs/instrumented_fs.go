@@ -217,6 +217,15 @@ func (ifs *InstrumentedFilesystem) FSStat(ctx context.Context, stat *gonfs.FSSta
 	return fsStatFrom(ctx, ifs.Filesystem, stat)
 }
 
+// Commit forwards a commit of the file's writes to stable storage
+// (implements gonfs.Committer).
+func (ifs *InstrumentedFilesystem) Commit(filename string) error {
+	if c, ok := ifs.Filesystem.(gonfs.Committer); ok {
+		return c.Commit(filename)
+	}
+	return nil
+}
+
 // Chmod changes the mode of the named file (implements billy.Change)
 func (ifs *InstrumentedFilesystem) Chmod(name string, mode os.FileMode) error {
 	if c, ok := ifs.Filesystem.(billy.Change); ok {

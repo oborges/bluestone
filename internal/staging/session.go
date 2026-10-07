@@ -359,6 +359,21 @@ func (ws *WriteSession) Sync() error {
 	return nil
 }
 
+// syncToDisk flushes the staging file to disk and returns its path. A session
+// already closed has no file left to flush and returns "".
+func (ws *WriteSession) syncToDisk() (string, error) {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+
+	if ws.File == nil {
+		return "", nil
+	}
+	if err := ws.File.Sync(); err != nil {
+		return "", fmt.Errorf("failed to sync: %w", err)
+	}
+	return ws.StagingPath, nil
+}
+
 // Snapshot returns stable session metadata for a sync attempt.
 func (ws *WriteSession) Snapshot() (stagingPath string, size int64, mode os.FileMode, uid uint32, gid uint32, refCount int32, lastWrite time.Time, multipartPartSize int64) {
 	ws.mu.Lock()
