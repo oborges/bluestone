@@ -150,8 +150,11 @@ func (sm *StagingManager) RestoreUnwrittenSession(path string, discarded *Discar
 	sm.sessions[path] = session
 	sm.mu.Unlock()
 
-	sm.MarkDirty(path, discarded.Size)
+	err = sm.MarkDirty(path, discarded.Size)
 	session.persistAttributes()
+	if err != nil {
+		return err
+	}
 	logging.Info("Restored unwritten staging session", zap.String("path", path), zap.Int64("size", discarded.Size))
 	return nil
 }

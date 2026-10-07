@@ -370,7 +370,10 @@ func (fs *Filesystem) OpenFile(filename string, flag int, perm os.FileMode) (bil
 					"error", err)
 				return nil, fmt.Errorf("failed to truncate staging file: %w", err)
 			}
-			fs.stagingManager.MarkDirty(fullPath, 0)
+			if err := fs.stagingManager.MarkDirty(fullPath, 0); err != nil {
+				fs.stagingManager.ReleaseSession(fullPath)
+				return nil, &os.PathError{Op: "open", Path: filename, Err: err}
+			}
 
 			fs.logger.Info("Truncated staging file",
 				"file_id", fileID,
@@ -1698,8 +1701,17 @@ func (f *File) writeLocked(p []byte, offset int64) (int, error) {
 		// under the session lock.
 		sessionSize := f.stagingSession.GetSize()
 
-		// Mark file as dirty and update size
-		f.stagingManager.MarkDirty(f.path, sessionSize)
+		// Mark file as dirty and update size. A write that could not be
+		// recorded for recovery is not one to tell the client was accepted.
+		if err := f.stagingManager.MarkDirty(f.path, sessionSize); err != nil {
+			f.logger.Error("STAGING WRITE ERROR",
+				"file_id", f.fileID,
+				"path", f.path,
+				"offset", offset,
+				"bytes", len(p),
+				"error", err)
+			return 0, err
+		}
 
 		f.logger.Info("STAGING WRITE",
 			"file_id", f.fileID,
@@ -2234,8 +2246,7 @@ func (f *File) truncate(size int64) error {
 				"error", err)
 			return err
 		}
-		f.stagingManager.MarkDirty(f.path, size)
-		return nil
+		return f.stagingManager.MarkDirty(f.path, size)
 	}
 
 	return f.truncateObjectLocked(size)
