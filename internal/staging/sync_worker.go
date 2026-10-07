@@ -474,12 +474,15 @@ func (sw *SyncWorker) syncFileLocked(path string, workerID int) error {
 	// object (e.g. a stat during the dirty window) must not outlive it.
 	sw.notifyObjectSynced(path)
 
-	if sw.config.CleanAfterSync && session.GetRefCount() == 0 {
-		if err := sw.manager.CleanupSession(path, true); err != nil {
+	if sw.config.CleanAfterSync {
+		cleaned, err := sw.manager.cleanupSyncedSession(path, session)
+		if err != nil {
 			return fmt.Errorf("failed to cleanup synced staging session: %w", err)
 		}
-		logging.Info("Cleaned synced staging session",
-			zap.String("path", path))
+		if cleaned {
+			logging.Info("Cleaned synced staging session",
+				zap.String("path", path))
+		}
 	}
 
 	return nil
