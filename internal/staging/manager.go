@@ -1312,6 +1312,55 @@ func (sm *StagingManager) CleanupSession(path string, deleteStagingFile bool) er
 	return nil
 }
 
+// cleanupSyncedSession removes session and its staging file once the bytes it
+// staged have been uploaded, unless the path is in use again, and reports
+// whether it did. It is in use when a handle holds the session, when the
+// file has been written since the upload and is dirty, when another session
+// has taken the path, or when a rename has moved this one away.
+//
+// Deciding and removing are one step under the manager lock, which opening a
+// file takes too. Done apart, a write arriving in between found the session
+// idle and wrote to it while it was being removed, or found the path free
+// and staged its bytes in the file about to be deleted: either way the
+// write was accepted and its bytes never uploaded.
+func (sm *StagingManager) cleanupSyncedSession(path string, session *WriteSession) (bool, error) {
+	// The staging file is named from the path, not read from the session:
+	// a rename that moves the session's file away after the check below
+	// then leaves nothing under this name, where the session's own would
+	// by then be the destination's.
+	stagingPath := sm.stagingFilePath(path)
+
+	sm.mu.Lock()
+	if sm.sessions[path] != session || session.GetRefCount() > 0 ||
+		sm.dirtyIndex.IsDirty(path) || !session.stagingPathIs(stagingPath) {
+		sm.mu.Unlock()
+		return false, nil
+	}
+	delete(sm.sessions, path)
+	if err := session.Close(); err != nil {
+		logging.Warn("Failed to close session during cleanup",
+			zap.String("path", path),
+			zap.Error(err))
+	}
+	err := os.Remove(stagingPath)
+	if os.IsNotExist(err) {
+		err = nil
+	}
+	// The sidecar went when the file was marked clean; one still here was
+	// written for a session that never became dirty.
+	_ = os.Remove(sm.pathMetadataPath(stagingPath))
+	sm.mu.Unlock()
+
+	sm.updatePressureMetrics()
+	if err != nil {
+		return false, fmt.Errorf("failed to remove staging file: %w", err)
+	}
+	logging.Debug("Removed staging file",
+		zap.String("path", path),
+		zap.String("staging_path", stagingPath))
+	return true, nil
+}
+
 // Shutdown closes all sessions and cleans up
 func (sm *StagingManager) Shutdown() error {
 	sm.mu.Lock()
