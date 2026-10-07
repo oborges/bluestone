@@ -309,20 +309,25 @@ func (sm *StagingManager) GetSessionsInDirectory(dirPath string) []*WriteSession
 	return sessions
 }
 
-// MarkDirty marks a file as dirty (needs sync)
-func (sm *StagingManager) MarkDirty(path string, size int64) {
+// MarkDirty marks a file as dirty (needs sync). An error means the write
+// could not be recorded where a restart would find it. The file is queued
+// for sync all the same, which is its best chance of reaching the object
+// store, but the caller must fail the write: until that sync, a crash would
+// leave the staged bytes with nothing to say which path they belong to.
+func (sm *StagingManager) MarkDirty(path string, size int64) error {
 	if sm.dirtyIndex.IsConflicted(path) {
 		logging.Warn("Refusing to queue conflicted staged path for sync",
 			zap.String("path", path),
 			zap.Int64("size", size))
-		return
+		return nil
 	}
 
 	state, err := sm.MarkPathDirtyMetadata(path, size)
 	if err != nil {
-		logging.Warn("Failed to persist dirty path metadata",
+		logging.Error("Failed to persist dirty path metadata; failing the write",
 			zap.String("path", path),
 			zap.Error(err))
+		err = fmt.Errorf("failed to persist staging metadata for %s: %w", path, err)
 	}
 
 	sm.dirtyIndex.MarkDirtyWithState(path, size, state)
@@ -333,6 +338,7 @@ func (sm *StagingManager) MarkDirty(path string, size int64) {
 		zap.String("path", path),
 		zap.Int64("size", size),
 		zap.Int("total_dirty", sm.dirtyIndex.Count()))
+	return err
 }
 
 // MarkClean marks a file as clean (synced)
