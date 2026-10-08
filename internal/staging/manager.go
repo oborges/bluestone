@@ -41,6 +41,12 @@ type StagingManager struct {
 	// dirty file from being left without one. Lock order: mu before
 	// sidecarMu.
 	sidecarMu sync.Mutex
+	// renameTargets counts, for each path, the renames that are moving
+	// staged bytes onto it right now. Guarded by mu. While a path is one,
+	// the staging file under its name may already be the renamed file's,
+	// with the session of the file it replaces still listed (see
+	// cleanupSyncedSession).
+	renameTargets map[string]int
 }
 
 var ErrPathConflicted = errors.New("staging path has unresolved conflict")
@@ -463,6 +469,20 @@ func (sm *StagingManager) markedClean(path string, err error) {
 
 // ForgetDirty removes stale dirty bookkeeping when staged data is intentionally gone.
 func (sm *StagingManager) ForgetDirty(path, reason string) {
+	sm.dropDirtyEntry(path)
+	sm.updateSyncQueueMetrics()
+	sm.updatePressureMetrics()
+
+	logging.Info("Forgot dirty staging entry",
+		zap.String("path", path),
+		zap.String("reason", reason),
+		zap.Int("total_dirty", sm.dirtyIndex.Count()))
+}
+
+// dropDirtyEntry takes path out of the dirty index and removes its sidecar,
+// in one step for anything marking the path dirty. It takes no lock but
+// sidecarMu, so a caller may hold mu.
+func (sm *StagingManager) dropDirtyEntry(path string) {
 	sm.sidecarMu.Lock()
 	sm.dirtyIndex.MarkClean(path)
 	err := sm.removePathMetadata(path)
@@ -472,13 +492,6 @@ func (sm *StagingManager) ForgetDirty(path, reason string) {
 			zap.String("path", path),
 			zap.Error(err))
 	}
-	sm.updateSyncQueueMetrics()
-	sm.updatePressureMetrics()
-
-	logging.Info("Forgot dirty staging entry",
-		zap.String("path", path),
-		zap.String("reason", reason),
-		zap.Int("total_dirty", sm.dirtyIndex.Count()))
 }
 
 // RecordConflict preserves dirty local staged data and makes the COS object the
@@ -667,6 +680,26 @@ func (sm *StagingManager) GetSession(path string) (*WriteSession, bool) {
 	defer sm.mu.RUnlock()
 
 	session, exists := sm.sessions[path]
+	return session, exists
+}
+
+// AcquireSession returns the session of path, if it has one, with a
+// reference taken for the caller, who releases it with ReleaseSession.
+// Finding the session and taking the reference are one step under the
+// manager lock: taken apart, the cleanup after a sync could find the session
+// idle in between and close it under the caller.
+func (sm *StagingManager) AcquireSession(path string) (*WriteSession, bool) {
+	if sm.dirtyIndex.IsConflicted(path) {
+		return nil, false
+	}
+
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	session, exists := sm.sessions[path]
+	if exists {
+		session.IncrementRefCount()
+	}
 	return session, exists
 }
 
@@ -1254,29 +1287,66 @@ func (sm *StagingManager) CleanupSession(path string, deleteStagingFile bool) er
 	}
 
 	sm.mu.Lock()
+	session, err := sm.removeSessionLocked(path, deleteStagingFile)
+	sm.mu.Unlock()
+
+	sm.closeRemovedSession(path, session)
+	if session != nil && deleteStagingFile {
+		sm.updateSyncQueueMetrics()
+	}
+	sm.updatePressureMetrics()
+	return err
+}
+
+// removeSessionLocked takes the session of path out of the manager and, with
+// deleteStagingFile, removes its staging file, its sidecar and its dirty
+// entry. Callers hold mu, which opening a file takes too, so for anyone
+// opening the path all of it is one step: a write does not find the session
+// and then lose it, nor stage its bytes in a file that is about to be
+// deleted. It returns the session, for closeRemovedSession once mu is
+// released, or nil when there is nothing to remove: the path has no session,
+// or a rename has moved the session away and owns it now.
+func (sm *StagingManager) removeSessionLocked(path string, deleteStagingFile bool) (*WriteSession, error) {
 	session, exists := sm.sessions[path]
-	if exists && !session.stagingPathIs(sm.stagingFilePath(path)) {
+	if !exists {
+		return nil, nil
+	}
+	stagingPath := sm.stagingFilePath(path)
+	if !session.stagingPathIs(stagingPath) {
 		// A rename has already moved this session's bytes to another path
 		// and is still re-keying it under this name. Cleaning up here would
 		// close the session the rename is about to hand over and delete the
-		// destination's staged bytes, losing the file. Leave it to the
-		// rename, which owns the session now.
-		sm.mu.Unlock()
+		// destination's staged bytes, losing the file.
 		logging.Info("Skipping cleanup of a session a rename has moved",
 			zap.String("path", path),
 			zap.String("event", "cleanup_skip"),
 			zap.String("reason", "renamed_away"))
-		return nil
+		return nil, nil
 	}
-	if exists {
-		delete(sm.sessions, path)
-	}
-	sm.mu.Unlock()
-
-	if !exists {
-		return nil
+	delete(sm.sessions, path)
+	if !deleteStagingFile {
+		return session, nil
 	}
 
+	if err := os.Remove(stagingPath); err != nil && !os.IsNotExist(err) {
+		return session, fmt.Errorf("failed to remove staging file: %w", err)
+	}
+	sm.dropDirtyEntry(path)
+	logging.Debug("Removed staging file",
+		zap.String("path", path),
+		zap.String("staging_path", stagingPath))
+	return session, nil
+}
+
+// closeRemovedSession closes a session removeSessionLocked returned, once mu
+// has been released. The staging file is unlinked while the session still
+// has it open, and its blocks are freed only when the last descriptor
+// closes: closing here keeps the freeing of a large file, which can take a
+// while, from holding up every open behind the manager lock.
+func (sm *StagingManager) closeRemovedSession(path string, session *WriteSession) {
+	if session == nil {
+		return
+	}
 	if session.Multipart != nil && session.Multipart.Active {
 		logging.Warn("Cleaning session with active multipart state without aborting upload",
 			zap.String("path", path),
@@ -1285,38 +1355,49 @@ func (sm *StagingManager) CleanupSession(path string, deleteStagingFile bool) er
 			zap.String("event", "cleanup"),
 			zap.String("reason", "session_cleanup"))
 	}
-
-	// Close the session
 	if err := session.Close(); err != nil {
 		logging.Warn("Failed to close session during cleanup",
 			zap.String("path", path),
 			zap.Error(err))
 	}
+}
 
-	// Delete staging file if requested
-	if deleteStagingFile {
-		if err := os.Remove(session.StagingPath); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("failed to remove staging file: %w", err)
-		}
-		// Safely clear `.metadata` journals maintaining boundaries safely tracking S3 maps
-		os.Remove(session.StagingPath + ".metadata")
-		sm.ForgetDirty(path, "staging_file_deleted")
-
-		logging.Debug("Removed staging file",
-			zap.String("path", path),
-			zap.String("staging_path", session.StagingPath))
+// discardDeletedStaging drops what is staged for a path whose delete has
+// been accepted: its dirty entry, its session and its staged bytes. It
+// reports false, and drops nothing, when the delete no longer stands because
+// the path has been created again. Creating it cancels the delete under the
+// manager lock, held here from that check to the end, so a file created
+// again is either seen here and left alone, or starts from nothing once this
+// is done: it is never created in between and then taken for the deleted
+// one.
+func (sm *StagingManager) discardDeletedStaging(path string) (bool, error) {
+	sm.mu.Lock()
+	if !sm.HasPendingDelete(path) {
+		sm.mu.Unlock()
+		return false, nil
 	}
+	// The dirty entry goes whether or not a session is listed: a file
+	// recovered after a restart can be dirty without one.
+	sm.dropDirtyEntry(path)
+	session, err := sm.removeSessionLocked(path, true)
+	sm.mu.Unlock()
 
+	sm.closeRemovedSession(path, session)
+	sm.updateSyncQueueMetrics()
 	sm.updatePressureMetrics()
-
-	return nil
+	logging.Info("Forgot dirty staging entry",
+		zap.String("path", path),
+		zap.String("reason", "delete_pending"),
+		zap.Int("total_dirty", sm.dirtyIndex.Count()))
+	return true, err
 }
 
 // cleanupSyncedSession removes session and its staging file once the bytes it
 // staged have been uploaded, unless the path is in use again, and reports
 // whether it did. It is in use when a handle holds the session, when the
 // file has been written since the upload and is dirty, when another session
-// has taken the path, or when a rename has moved this one away.
+// has taken the path, when a rename has moved this one away, or when a
+// rename is moving another file onto the path.
 //
 // Deciding and removing are one step under the manager lock, which opening a
 // file takes too. Done apart, a write arriving in between found the session
@@ -1331,17 +1412,17 @@ func (sm *StagingManager) cleanupSyncedSession(path string, session *WriteSessio
 	stagingPath := sm.stagingFilePath(path)
 
 	sm.mu.Lock()
-	if sm.sessions[path] != session || session.GetRefCount() > 0 ||
+	// A rename onto the path replaces the staging file under this name with
+	// the renamed file's bytes before it re-keys the session and the dirty
+	// entry, so until it has, the path still looks like the synced file's:
+	// its old session, idle, and nothing dirty. Removing then would delete
+	// the bytes the rename has just moved here.
+	if sm.sessions[path] != session || session.GetRefCount() > 0 || sm.renameTargets[path] > 0 ||
 		sm.dirtyIndex.IsDirty(path) || !session.stagingPathIs(stagingPath) {
 		sm.mu.Unlock()
 		return false, nil
 	}
 	delete(sm.sessions, path)
-	if err := session.Close(); err != nil {
-		logging.Warn("Failed to close session during cleanup",
-			zap.String("path", path),
-			zap.Error(err))
-	}
 	err := os.Remove(stagingPath)
 	if os.IsNotExist(err) {
 		err = nil
@@ -1351,6 +1432,7 @@ func (sm *StagingManager) cleanupSyncedSession(path string, session *WriteSessio
 	_ = os.Remove(sm.pathMetadataPath(stagingPath))
 	sm.mu.Unlock()
 
+	sm.closeRemovedSession(path, session)
 	sm.updatePressureMetrics()
 	if err != nil {
 		return false, fmt.Errorf("failed to remove staging file: %w", err)
@@ -1359,6 +1441,26 @@ func (sm *StagingManager) cleanupSyncedSession(path string, session *WriteSessio
 		zap.String("path", path),
 		zap.String("staging_path", stagingPath))
 	return true, nil
+}
+
+// beginRenameOnto and endRenameOnto bracket a rename that moves staged bytes
+// onto path, from before it touches anything of the path's until its session
+// and dirty entry are re-keyed (see renameTargets).
+func (sm *StagingManager) beginRenameOnto(path string) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	if sm.renameTargets == nil {
+		sm.renameTargets = make(map[string]int)
+	}
+	sm.renameTargets[path]++
+}
+
+func (sm *StagingManager) endRenameOnto(path string) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	if sm.renameTargets[path]--; sm.renameTargets[path] <= 0 {
+		delete(sm.renameTargets, path)
+	}
 }
 
 // Shutdown closes all sessions and cleans up

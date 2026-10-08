@@ -140,3 +140,98 @@ func TestWritesRacingSyncCleanupAreNotLost(t *testing.T) {
 	}
 	check()
 }
+
+// A rename onto a path whose file has just synced puts the renamed bytes
+// under the path's name before the path's session and dirty entry say so.
+// The cleanup after that sync, arriving in between, must not take them for
+// the synced file's and remove them.
+func TestCleanupSyncedSessionLeavesRenameDestinationAlone(t *testing.T) {
+	cfg := createTestConfig(t)
+	manager, err := NewStagingManager(cfg)
+	if err != nil {
+		t.Fatalf("NewStagingManager() error = %v", err)
+	}
+	defer manager.Shutdown()
+
+	// The destination as its sync leaves it: uploaded, clean, and its idle
+	// session about to be cleaned up.
+	synced := stageWrite(t, manager, "/dst.txt", "old")
+	manager.ReleaseSession("/dst.txt")
+	manager.MarkClean("/dst.txt")
+	// The file renamed onto it is dirty with no session of its own, as one
+	// found on disk at start is.
+	stageWrite(t, manager, "/src.txt", "renamed")
+	manager.ReleaseSession("/src.txt")
+	if err := manager.CleanupSession("/src.txt", false); err != nil {
+		t.Fatalf("CleanupSession() error = %v", err)
+	}
+
+	t.Cleanup(func() { moveStagedFile = os.Rename })
+	moveStagedFile = func(oldStaging, newStaging string) error {
+		if err := os.Rename(oldStaging, newStaging); err != nil {
+			return err
+		}
+		cleaned, err := manager.cleanupSyncedSession("/dst.txt", synced)
+		if err != nil || cleaned {
+			t.Errorf("cleanup of the destination during the rename = %v, %v; want it to keep off", cleaned, err)
+		}
+		return nil
+	}
+	if err := manager.RenameStagedPath("/src.txt", "/dst.txt"); err != nil {
+		t.Fatalf("RenameStagedPath() error = %v", err)
+	}
+
+	if data, err := os.ReadFile(manager.stagingFilePath("/dst.txt")); err != nil || string(data) != "renamed" {
+		t.Fatalf("staged bytes of the renamed file = %q, %v", data, err)
+	}
+	if !manager.IsDirty("/dst.txt") || sidecarOf(t, manager, "/dst.txt").OriginalPath != "/dst.txt" {
+		t.Fatal("renamed file is not dirty with its sidecar")
+	}
+	cosClient := NewMockCOSClient()
+	if err := syncClaimed(t, manager, NewSyncWorker(manager, cosClient, cfg), "/dst.txt"); err != nil {
+		t.Fatalf("sync of the renamed file error = %v", err)
+	}
+	if uploaded, _ := cosClient.GetUpload("/dst.txt"); string(uploaded) != "renamed" {
+		t.Fatalf("upload = %q, want the renamed file's bytes", uploaded)
+	}
+
+	// Once the rename is over, the cleanup works on the path as before.
+	if manager.renameTargets["/dst.txt"] != 0 {
+		t.Fatalf("rename left the destination marked: %v", manager.renameTargets)
+	}
+}
+
+// A reader takes a session and its reference in one step, so the cleanup
+// after a sync never finds idle a session a reader is about to use.
+func TestAcquireSessionHoldsOffSyncCleanup(t *testing.T) {
+	manager, err := NewStagingManager(createTestConfig(t))
+	if err != nil {
+		t.Fatalf("NewStagingManager() error = %v", err)
+	}
+	defer manager.Shutdown()
+	const path = "/file.txt"
+
+	if _, ok := manager.AcquireSession(path); ok {
+		t.Fatal("AcquireSession() of a path with no session succeeded")
+	}
+	session := stageWrite(t, manager, path, "hello")
+	manager.ReleaseSession(path)
+	manager.MarkClean(path)
+
+	acquired, ok := manager.AcquireSession(path)
+	if !ok || acquired != session || session.GetRefCount() != 1 {
+		t.Fatalf("AcquireSession() = %v, %v with %d references; want the session with one", acquired, ok, session.GetRefCount())
+	}
+	if cleaned, err := manager.cleanupSyncedSession(path, session); err != nil || cleaned {
+		t.Fatalf("cleanup with a reader on the session = %v, %v", cleaned, err)
+	}
+	buf := make([]byte, 5)
+	if n, err := acquired.Read(buf, 0); err != nil || string(buf[:n]) != "hello" {
+		t.Fatalf("read through the acquired session = %q, %v", buf[:n], err)
+	}
+
+	manager.ReleaseSession(path)
+	if cleaned, err := manager.cleanupSyncedSession(path, session); err != nil || !cleaned {
+		t.Fatalf("cleanup once the reader is gone = %v, %v", cleaned, err)
+	}
+}

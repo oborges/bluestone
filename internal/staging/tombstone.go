@@ -114,10 +114,10 @@ func (sm *StagingManager) RegisterPendingDelete(path string) (bool, error) {
 	}
 	defer sm.dirtyIndex.UnlockFile(path)
 
-	// Drop the pending sync so workers stop considering this path.
-	sm.ForgetDirty(path, "delete_pending")
-
-	if err := sm.CleanupSession(path, true); err != nil {
+	// Drop the pending sync, so workers stop considering this path, and
+	// the staged bytes with it; unless the path has been created again in
+	// the meantime, which leaves nothing of the deleted file to drop.
+	if _, err := sm.discardDeletedStaging(path); err != nil {
 		// Leftover staging data is reaped on restart because the tombstone
 		// supersedes it during recovery.
 		logging.Warn("Failed to cleanup staged data for pending delete",
