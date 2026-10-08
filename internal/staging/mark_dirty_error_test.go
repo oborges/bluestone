@@ -3,6 +3,7 @@ package staging
 import (
 	"os"
 	"testing"
+	"time"
 )
 
 // A write whose sidecar cannot be written is reported, and still queued: the
@@ -54,5 +55,36 @@ func TestMarkDirtyReportsUnrecordedWrite(t *testing.T) {
 	}
 	if err := manager.CommitPath(path); err != nil {
 		t.Fatalf("CommitPath() error = %v", err)
+	}
+}
+
+// Writes to a file that is already queued do not each work the gauges out
+// again: they ask for one refresh, which then happens.
+func TestWritesToQueuedFileRefreshGaugesOnce(t *testing.T) {
+	manager, err := NewStagingManager(createTestConfig(t))
+	if err != nil {
+		t.Fatalf("NewStagingManager() error = %v", err)
+	}
+	defer manager.Shutdown()
+	const path = "/file.txt"
+
+	session := stageWrite(t, manager, path, "hello")
+	if manager.metricsRefreshPending.Load() {
+		t.Fatal("the write that queued the file put its refresh off")
+	}
+	for i := 0; i < 100; i++ {
+		if err := manager.MarkDirty(path, session.GetSize()); err != nil {
+			t.Fatalf("MarkDirty() error = %v", err)
+		}
+	}
+	if !manager.metricsRefreshPending.Load() {
+		t.Fatal("writes to a queued file asked for no refresh of the gauges")
+	}
+	deadline := time.Now().Add(10 * metricsRefreshInterval)
+	for manager.metricsRefreshPending.Load() {
+		if time.Now().After(deadline) {
+			t.Fatal("the refresh the writes asked for never ran")
+		}
+		time.Sleep(metricsRefreshInterval / 10)
 	}
 }

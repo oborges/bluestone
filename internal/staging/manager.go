@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -47,7 +48,14 @@ type StagingManager struct {
 	// with the session of the file it replaces still listed (see
 	// cleanupSyncedSession).
 	renameTargets map[string]int
+	// metricsRefreshPending records that a refresh of the queue and
+	// pressure gauges is already on its way (see refreshMetricsSoon).
+	metricsRefreshPending atomic.Bool
 }
+
+// metricsRefreshInterval is how far the sync queue and pressure gauges may
+// lag behind the writes to a file that is already queued.
+const metricsRefreshInterval = 250 * time.Millisecond
 
 var ErrPathConflicted = errors.New("staging path has unresolved conflict")
 
@@ -403,16 +411,21 @@ func (sm *StagingManager) MarkDirty(path string, size int64) error {
 	}
 
 	var err error
-	if !sm.dirtyIndex.MarkDirtyAgain(path, size) {
+	if sm.dirtyIndex.MarkDirtyAgain(path, size) {
+		// The gauges are worked out from every dirty file and session;
+		// done on each write to a file already queued, that would be most
+		// of what such a write costs.
+		sm.refreshMetricsSoon()
+	} else {
 		if err = sm.markPathDirty(path, size); err != nil {
 			logging.Error("Failed to persist dirty path metadata; failing the write",
 				zap.String("path", path),
 				zap.Error(err))
 			err = fmt.Errorf("failed to persist staging metadata for %s: %w", path, err)
 		}
+		sm.updateSyncQueueMetrics()
+		sm.updatePressureMetrics()
 	}
-	sm.updateSyncQueueMetrics()
-	sm.updatePressureMetrics()
 
 	logging.Debug("Marked file as dirty",
 		zap.String("path", path),
@@ -446,6 +459,19 @@ func (sm *StagingManager) markPathDirty(path string, size int64) error {
 	}
 	sm.dirtyIndex.MarkDirtyWithState(path, size, state)
 	return err
+}
+
+// refreshMetricsSoon refreshes the sync queue and pressure gauges within
+// metricsRefreshInterval, however many times it is called until then.
+func (sm *StagingManager) refreshMetricsSoon() {
+	if !sm.metricsRefreshPending.CompareAndSwap(false, true) {
+		return
+	}
+	time.AfterFunc(metricsRefreshInterval, func() {
+		sm.metricsRefreshPending.Store(false)
+		sm.updateSyncQueueMetrics()
+		sm.updatePressureMetrics()
+	})
 }
 
 // MarkClean marks a file as clean (synced)
