@@ -52,6 +52,13 @@ func (sm *StagingManager) RenameStagedPath(oldPath, newPath string) error {
 		return err
 	}
 
+	// From here until the destination's session and dirty entry are
+	// re-keyed, the staging file under the destination's name may be the
+	// moved one while everything else there still describes the file it
+	// replaces. The cleanup after a sync of that file must keep off it.
+	sm.beginRenameOnto(newPath)
+	defer sm.endRenameOnto(newPath)
+
 	// The rename recreates the destination, so a pending delete there no
 	// longer applies. Cancel before the new dirty entry appears; otherwise
 	// tombstone processing could discard the moved bytes.

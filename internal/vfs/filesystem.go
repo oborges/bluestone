@@ -288,10 +288,9 @@ func (fs *Filesystem) OpenFile(filename string, flag int, perm os.FileMode) (bil
 			}
 		} else {
 			// Read-only file: check if there's an existing staging session
-			session, exists := fs.stagingManager.GetSession(fullPath)
+			session, exists := fs.stagingManager.AcquireSession(fullPath)
 			if exists {
 				file.stagingSession = session
-				session.IncrementRefCount()
 
 				fs.logger.Debug("Staging session acquired for read",
 					"file_id", fileID,

@@ -294,3 +294,65 @@ func TestPendingDeleteStatsExposed(t *testing.T) {
 }
 
 // Made with Bob
+
+// A delete whose cleanup was put off, as when an upload was in flight, must
+// not take a file created again in the meantime for the deleted one: that
+// file's staged bytes are a write the client was told was accepted.
+func TestDiscardDeletedStagingLeavesFileCreatedAgain(t *testing.T) {
+	manager, err := NewStagingManager(createTestConfig(t))
+	if err != nil {
+		t.Fatalf("NewStagingManager() error = %v", err)
+	}
+	defer manager.Shutdown()
+
+	// A delete that stands drops everything staged for the path.
+	const gone = "/gone.txt"
+	deleted := writeDirtyTestFile(t, manager, gone, "old")
+	if !manager.TryLockSync(gone) {
+		t.Fatal("could not claim the path as an upload in flight does")
+	}
+	if immediate, err := manager.RegisterPendingDelete(gone); err != nil || immediate {
+		t.Fatalf("RegisterPendingDelete() during an upload = %v, %v; want it put off", immediate, err)
+	}
+	manager.UnlockSync(gone)
+	if dropped, err := manager.discardDeletedStaging(gone); err != nil || !dropped {
+		t.Fatalf("discardDeletedStaging() of a deleted path = %v, %v", dropped, err)
+	}
+	if manager.IsDirty(gone) || sidecarExists(t, manager, gone) {
+		t.Fatal("deleted path still dirty, or still has its sidecar")
+	}
+	if _, err := os.Stat(deleted.StagingPath); !os.IsNotExist(err) {
+		t.Fatalf("staged bytes of the deleted path still there, stat error = %v", err)
+	}
+	if _, exists := manager.GetSession(gone); exists {
+		t.Fatal("session of the deleted path still listed")
+	}
+
+	// One created again before the cleanup gets to it is left alone.
+	const back = "/back.txt"
+	writeDirtyTestFile(t, manager, back, "old")
+	if !manager.TryLockSync(back) {
+		t.Fatal("could not claim the path as an upload in flight does")
+	}
+	if _, err := manager.RegisterPendingDelete(back); err != nil {
+		t.Fatalf("RegisterPendingDelete() error = %v", err)
+	}
+	manager.UnlockSync(back)
+	recreated := writeDirtyTestFile(t, manager, back, "new")
+	if manager.HasPendingDelete(back) {
+		t.Fatal("creating the file again did not cancel its delete")
+	}
+
+	if dropped, err := manager.discardDeletedStaging(back); err != nil || dropped {
+		t.Fatalf("discardDeletedStaging() of a path created again = %v, %v; want nothing dropped", dropped, err)
+	}
+	if !manager.IsDirty(back) || !sidecarExists(t, manager, back) {
+		t.Fatal("file created again lost its dirty entry or its sidecar")
+	}
+	if data, err := os.ReadFile(recreated.StagingPath); err != nil || string(data) != "new" {
+		t.Fatalf("staged bytes of the file created again = %q, %v", data, err)
+	}
+	if current, _ := manager.GetSession(back); current != recreated {
+		t.Fatal("session of the file created again is no longer listed")
+	}
+}

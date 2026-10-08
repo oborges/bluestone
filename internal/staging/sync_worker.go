@@ -185,13 +185,19 @@ func (sw *SyncWorker) processPendingDeletes(workerID int) {
 			continue
 		}
 
-		// The accepted delete supersedes any staged bytes left for the path.
-		sw.manager.ForgetDirty(path, "delete_pending")
-		if err := sw.manager.CleanupSession(path, true); err != nil {
+		// The accepted delete supersedes any staged bytes left for the
+		// path. A path created again since the check above has no delete
+		// pending any more, and what is staged for it is the new file's.
+		stillDeleted, cleanupErr := sw.manager.discardDeletedStaging(path)
+		if cleanupErr != nil {
 			logging.Warn("Failed to cleanup staged data for pending delete",
 				zap.Int("worker_id", workerID),
 				zap.String("path", path),
-				zap.Error(err))
+				zap.Error(cleanupErr))
+		}
+		if !stillDeleted {
+			sw.manager.dirtyIndex.UnlockFile(path)
+			continue
 		}
 
 		ctx, cancel := context.WithTimeout(sw.ctx, 60*time.Second)
