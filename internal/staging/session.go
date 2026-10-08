@@ -391,16 +391,63 @@ func (ws *WriteSession) Read(buffer []byte, offset int64) (int, error) {
 	return n, err
 }
 
+// flushStagingFile flushes a staging file to disk. It is a variable so a test
+// can hold a flush open and see what waits for it.
+var flushStagingFile = (*os.File).Sync
+
+// flushThen flushes the staging file to disk and then runs then, holding the
+// session lock, while the file it flushed is still the one the session writes
+// to. It reports false, without running then, for a session that is closed.
+//
+// The lock is not held while the disk works. A flush lasts as long as the
+// disk needs for what was written, and whatever wants the session's lock
+// meanwhile would wait with it: a write to the file, and, through the
+// manager, every other file's writes, opens and stats. The manager adds up
+// the size of each session before a write and takes a session's lock under
+// its own when a file is opened, so one session held for a flush stopped
+// them all.
+//
+// What was written before the call is on disk when then runs. A write that
+// arrives while the disk works may not be, and nothing has told its client
+// that it is. A session that moved to a new staging file meanwhile (see
+// detachFromUploadsLocked) has that file flushed in turn: it holds the same
+// bytes, and is the one a restart would find.
+func (ws *WriteSession) flushThen(then func()) (bool, error) {
+	for {
+		ws.mu.Lock()
+		file := ws.File
+		ws.mu.Unlock()
+		if file == nil {
+			return false, nil
+		}
+
+		// Closing the file while it is flushed is safe: the descriptor
+		// stays open until the flush returns.
+		err := flushStagingFile(file)
+
+		ws.mu.Lock()
+		if ws.File != file {
+			ws.mu.Unlock()
+			continue
+		}
+		if err == nil && then != nil {
+			then()
+		}
+		ws.mu.Unlock()
+		if err != nil {
+			return true, fmt.Errorf("failed to sync: %w", err)
+		}
+		return true, nil
+	}
+}
+
 // Sync flushes the staging file to disk
 func (ws *WriteSession) Sync() error {
-	ws.mu.Lock()
-	defer ws.mu.Unlock()
-
-	if err := ws.File.Sync(); err != nil {
-		return fmt.Errorf("failed to sync: %w", err)
+	open, err := ws.flushThen(nil)
+	if err == nil && !open {
+		return fmt.Errorf("failed to sync: %w", os.ErrClosed)
 	}
-
-	return nil
+	return err
 }
 
 // syncToDisk flushes the staging file to disk and returns its path. A session
@@ -409,19 +456,13 @@ func (ws *WriteSession) Sync() error {
 // and otherwise the metadata version to report to metadataCommitted once
 // they have been flushed too.
 func (ws *WriteSession) syncToDisk() (stagingPath string, uncommitted uint64, err error) {
-	ws.mu.Lock()
-	defer ws.mu.Unlock()
-
-	if ws.File == nil {
-		return "", 0, nil
-	}
-	if err := ws.File.Sync(); err != nil {
-		return "", 0, fmt.Errorf("failed to sync: %w", err)
-	}
-	if ws.metadataVersion != ws.committedMetadataVersion {
-		uncommitted = ws.metadataVersion
-	}
-	return ws.StagingPath, uncommitted, nil
+	_, err = ws.flushThen(func() {
+		stagingPath = ws.StagingPath
+		if ws.metadataVersion != ws.committedMetadataVersion {
+			uncommitted = ws.metadataVersion
+		}
+	})
+	return stagingPath, uncommitted, err
 }
 
 // Snapshot returns stable session metadata for a sync attempt.

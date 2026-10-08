@@ -29,35 +29,41 @@ type UploadSnapshot struct {
 // OpenUploadSnapshot opens the staged bytes for an upload. The size and last
 // write it reports describe the file it returns.
 func (ws *WriteSession) OpenUploadSnapshot() (*UploadSnapshot, error) {
-	ws.mu.Lock()
-	defer ws.mu.Unlock()
+	var snapshot *UploadSnapshot
+	var openErr error
+	open, err := ws.flushThen(func() {
+		// A descriptor of its own, so closing the session does not close
+		// the upload's file.
+		file, err := os.Open(ws.StagingPath)
+		if err != nil {
+			openErr = fmt.Errorf("failed to open staging file: %w", err)
+			return
+		}
 
-	if ws.File == nil {
-		return nil, fmt.Errorf("staging session for %s is closed", ws.Path)
-	}
-	if err := ws.File.Sync(); err != nil {
-		return nil, fmt.Errorf("failed to sync: %w", err)
-	}
-	// A descriptor of its own, so closing the session does not close the
-	// upload's file.
-	file, err := os.Open(ws.StagingPath)
+		partSize := int64(0)
+		if ws.Multipart != nil {
+			partSize = ws.Multipart.PartSize
+		}
+		ws.uploadReaders++
+		snapshot = &UploadSnapshot{
+			File:       file,
+			Size:       ws.Size,
+			LastWrite:  ws.LastWrite,
+			PartSize:   partSize,
+			session:    ws,
+			generation: ws.fileGeneration,
+		}
+	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to open staging file: %w", err)
+		return nil, err
 	}
-
-	partSize := int64(0)
-	if ws.Multipart != nil {
-		partSize = ws.Multipart.PartSize
+	if !open {
+		ws.mu.Lock()
+		path := ws.Path
+		ws.mu.Unlock()
+		return nil, fmt.Errorf("staging session for %s is closed", path)
 	}
-	ws.uploadReaders++
-	return &UploadSnapshot{
-		File:       file,
-		Size:       ws.Size,
-		LastWrite:  ws.LastWrite,
-		PartSize:   partSize,
-		session:    ws,
-		generation: ws.fileGeneration,
-	}, nil
+	return snapshot, openErr
 }
 
 // Close releases the snapshot and its file.
