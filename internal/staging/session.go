@@ -306,22 +306,36 @@ func (ws *WriteSession) Write(data []byte, offset int64) (int, error) {
 	}
 	defer releaseReservation()
 
+	n, droppedTime, err := ws.write(data, offset)
+	if droppedTime {
+		// The sidecar still holds the time the write has just made void,
+		// and nothing else rewrites it for a file that is already dirty:
+		// left there, a restart would bring the time back and upload the
+		// new bytes dated before they were written.
+		ws.persistAttributes()
+	}
+	return n, err
+}
+
+// write is Write under the session lock. droppedTime reports that it
+// cleared a modification time a client had set.
+func (ws *WriteSession) write(data []byte, offset int64) (n int, droppedTime bool, err error) {
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
 
 	if err := ws.detachFromUploadsLocked(ws.Size); err != nil {
-		return 0, err
+		return 0, false, err
 	}
 
 	// Seek to offset
 	if _, err := ws.File.Seek(offset, 0); err != nil {
-		return 0, fmt.Errorf("failed to seek: %w", err)
+		return 0, false, fmt.Errorf("failed to seek: %w", err)
 	}
 
 	// Write data
-	n, err := ws.File.Write(data)
+	n, err = ws.File.Write(data)
 	if err != nil {
-		return n, fmt.Errorf("failed to write: %w", err)
+		return n, false, fmt.Errorf("failed to write: %w", err)
 	}
 
 	// Update size
@@ -339,9 +353,10 @@ func (ws *WriteSession) Write(data []byte, offset int64) (int, error) {
 	ws.LastAccess = now
 	// Writing moves the modification time again, so a time a client set
 	// earlier no longer stands.
+	droppedTime = !ws.mtime.IsZero()
 	ws.mtime = time.Time{}
 
-	return n, nil
+	return n, droppedTime, nil
 }
 
 // Read reads data from the staging file at the specified offset

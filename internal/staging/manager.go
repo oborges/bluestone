@@ -157,33 +157,54 @@ func (sm *StagingManager) CommitPath(path string) error {
 	}
 
 	stagingPath, uncommitted, err := session.syncToDisk()
-	if err != nil || stagingPath == "" || uncommitted == 0 {
+	if err != nil || stagingPath == "" {
 		return err
 	}
-	if err := sm.commitPathMetadata(path, stagingPath); err != nil {
+	// Nothing recorded as changed is not proof that the sidecar is still
+	// there, and a commit must not answer for a dirty file that has none.
+	if uncommitted == 0 && !sm.sidecarMissing(path, stagingPath) {
+		return nil
+	}
+	if err := sm.commitPathMetadata(path, stagingPath, session); err != nil {
 		return err
 	}
 	if err := syncDir(filepath.Dir(stagingPath)); err != nil {
 		return err
 	}
-	session.metadataCommitted(uncommitted)
+	if uncommitted != 0 {
+		session.metadataCommitted(uncommitted)
+	}
 	return nil
 }
 
+// sidecarMissing reports whether path is dirty and has no sidecar on disk.
+func (sm *StagingManager) sidecarMissing(path, stagingPath string) bool {
+	_, err := os.Lstat(sm.pathMetadataPath(stagingPath))
+	return os.IsNotExist(err) && sm.dirtyIndex.IsDirty(path)
+}
+
 // commitPathMetadata puts the sidecar of a staged file on disk and marks it
-// committed, which keeps every later version of it on disk too.
-func (sm *StagingManager) commitPathMetadata(path, stagingPath string) error {
+// committed, which keeps every later version of it on disk too. A dirty file
+// whose sidecar has gone gets it back first, written from what session holds
+// in memory.
+func (sm *StagingManager) commitPathMetadata(path, stagingPath string, session *WriteSession) error {
 	sm.sidecarMu.Lock()
 	defer sm.sidecarMu.Unlock()
 
 	metadataPath := sm.pathMetadataPath(stagingPath)
 	state, err := readPathMetadataState(metadataPath)
-	if err != nil {
-		if os.IsNotExist(err) && !sm.dirtyIndex.IsDirty(path) {
+	if os.IsNotExist(err) {
+		if !sm.dirtyIndex.IsDirty(path) {
 			// Synced since it was written: the sidecar went once the
 			// object store had the bytes.
 			return nil
 		}
+		logging.Warn("Dirty staged file had lost its sidecar; writing it again",
+			zap.String("path", path),
+			zap.String("metadata_path", metadataPath))
+		state, err = sm.recordDirtyPathLocked(path, sessionAttributesIfSet(session))
+	}
+	if err != nil {
 		return fmt.Errorf("staged write of %s has no metadata to recover it by: %w", path, err)
 	}
 	if state.Committed {
@@ -191,6 +212,19 @@ func (sm *StagingManager) commitPathMetadata(path, stagingPath string) error {
 	}
 	state.Committed = true
 	return writePathMetadataState(metadataPath, state)
+}
+
+// sessionAttributesIfSet returns the attributes session syncs with, or nil
+// when it has none of its own or there is no session.
+func sessionAttributesIfSet(session *WriteSession) *StagedAttributes {
+	if session == nil {
+		return nil
+	}
+	attrs, _, set := session.stagedAttributes()
+	if !set {
+		return nil
+	}
+	return &attrs
 }
 
 // sessionAt returns the session staging path, or nil.
@@ -394,26 +428,23 @@ func (sm *StagingManager) markPathDirty(path string, size int64) error {
 	// Look the session up before taking the sidecar lock: the lookup takes
 	// mu, which must be acquired first.
 	session := sm.sessionAt(path)
-	var attrs *StagedAttributes
-	if session != nil {
-		if current, _, set := session.stagedAttributes(); set {
-			attrs = &current
-		}
-	}
+	attrs := sessionAttributesIfSet(session)
 
 	sm.sidecarMu.Lock()
+	defer sm.sidecarMu.Unlock()
 	if sm.dirtyIndex.MarkDirtyAgain(path, size) {
 		// Another write of the same file got here first.
-		sm.sidecarMu.Unlock()
 		return nil
 	}
 	state, err := sm.recordDirtyPathLocked(path, attrs)
-	sm.dirtyIndex.MarkDirtyWithState(path, size, state)
-	sm.sidecarMu.Unlock()
-
+	// The session learns of the new sidecar before the entry is listed.
+	// Once it is, another write of the file marks it dirty without coming
+	// through here, and a commit of that write has to find the sidecar
+	// still to flush.
 	if err == nil && session != nil {
 		session.metadataChanged()
 	}
+	sm.dirtyIndex.MarkDirtyWithState(path, size, state)
 	return err
 }
 

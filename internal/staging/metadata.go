@@ -126,6 +126,17 @@ func (dfi *DirtyFileIndex) MarkDirtyAgain(path string, size int64) bool {
 	return true
 }
 
+// MarkUnrecorded records that the sidecar of a dirty path is not on disk, so
+// its next change goes through MarkDirtyWithState and writes it.
+func (dfi *DirtyFileIndex) MarkUnrecorded(path string) {
+	dfi.mu.Lock()
+	defer dfi.mu.Unlock()
+
+	if meta, exists := dfi.dirty[path]; exists {
+		meta.recorded = false
+	}
+}
+
 // nextGenerationLocked returns a LocalDirtyGeneration no entry has carried.
 // Callers hold mu.
 func (dfi *DirtyFileIndex) nextGenerationLocked() int64 {

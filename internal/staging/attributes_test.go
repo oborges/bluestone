@@ -196,3 +196,47 @@ func TestStreamsPersistThroughRecovery(t *testing.T) {
 		t.Fatalf("recovered streams = %v, want %v", got, want)
 	}
 }
+
+// A write voids a modification time a client had set. The sidecar must stop
+// carrying it too: nothing else rewrites the sidecar of a file that is
+// already dirty, and a restart would bring the time back and upload the new
+// bytes dated before they were written.
+func TestWriteDropsSetModificationTimeFromSidecar(t *testing.T) {
+	cfg := createTestConfig(t)
+	manager, err := NewStagingManager(cfg)
+	if err != nil {
+		t.Fatalf("NewStagingManager() error = %v", err)
+	}
+	const path = "/file.txt"
+
+	session := stageWrite(t, manager, path, "hello")
+	set := time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC)
+	session.SetTimes(time.Time{}, set)
+	if attrs := readSidecarAttributes(t, manager, path); attrs == nil || !attrs.Mtime.Equal(set) {
+		t.Fatalf("sidecar after SetTimes = %+v, want the time set", attrs)
+	}
+
+	if _, err := session.Write([]byte(" world"), 5); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	if err := manager.MarkDirty(path, session.GetSize()); err != nil {
+		t.Fatalf("MarkDirty() error = %v", err)
+	}
+	if attrs := readSidecarAttributes(t, manager, path); attrs == nil || !attrs.Mtime.IsZero() {
+		t.Fatalf("sidecar after a later write still carries the time set before it: %+v", attrs)
+	}
+
+	manager.Shutdown()
+	recovered, err := NewStagingManager(cfg)
+	if err != nil {
+		t.Fatalf("NewStagingManager() after restart error = %v", err)
+	}
+	defer recovered.Shutdown()
+	restored, ok := recovered.GetSession(path)
+	if !ok {
+		t.Fatal("no session recovered for the staged file")
+	}
+	if mtime := restored.Attributes().Mtime; !mtime.IsZero() {
+		t.Fatalf("recovered file syncs with modification time %v, set before its last write", mtime)
+	}
+}
