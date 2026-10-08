@@ -116,22 +116,56 @@ func TestCommitPathWithNothingOutstanding(t *testing.T) {
 	}
 }
 
-// A dirty file without its sidecar could not be recovered, so it cannot be
-// reported as committed.
-func TestCommitPathFailsWithoutSidecar(t *testing.T) {
-	manager, err := NewStagingManager(createTestConfig(t))
+// A commit does not answer for a dirty file that has no sidecar: one that has
+// gone is written again from what is in memory, whether or not anything was
+// recorded as changed since the last commit.
+func TestCommitPathRestoresLostSidecar(t *testing.T) {
+	cfg := createTestConfig(t)
+	manager, err := NewStagingManager(cfg)
 	if err != nil {
 		t.Fatalf("NewStagingManager() error = %v", err)
 	}
-	defer manager.Shutdown()
 
-	const path = "/file.txt"
-	stageWrite(t, manager, path, "hello")
-	if err := os.Remove(manager.pathMetadataPath(manager.stagingFilePath(path))); err != nil {
-		t.Fatal(err)
+	for _, tc := range []struct {
+		path      string
+		committed bool
+	}{
+		{"/never-committed.txt", false},
+		{"/committed.txt", true},
+	} {
+		session := stageWrite(t, manager, tc.path, "hello")
+		session.SetMode(0640)
+		if tc.committed {
+			if err := manager.CommitPath(tc.path); err != nil {
+				t.Fatalf("CommitPath(%s) error = %v", tc.path, err)
+			}
+		}
+		if err := os.Remove(manager.pathMetadataPath(manager.stagingFilePath(tc.path))); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := manager.CommitPath(tc.path); err != nil {
+			t.Fatalf("CommitPath(%s) without its sidecar error = %v", tc.path, err)
+		}
+		state := sidecarOf(t, manager, tc.path)
+		if !state.Committed || state.OriginalPath != tc.path {
+			t.Fatalf("sidecar of %s after the commit = committed %v path %q", tc.path, state.Committed, state.OriginalPath)
+		}
+		if state.Attributes == nil || state.Attributes.Mode != 0640 {
+			t.Fatalf("sidecar of %s after the commit lost the file's attributes: %+v", tc.path, state.Attributes)
+		}
 	}
-	if err := manager.CommitPath(path); err == nil {
-		t.Fatal("CommitPath() of a dirty file with no sidecar succeeded")
+
+	manager.Shutdown()
+	recovered, err := NewStagingManager(cfg)
+	if err != nil {
+		t.Fatalf("NewStagingManager() after restart error = %v", err)
+	}
+	defer recovered.Shutdown()
+	for _, path := range []string{"/never-committed.txt", "/committed.txt"} {
+		if !recovered.IsDirty(path) {
+			t.Fatalf("%s not queued for sync after restart", path)
+		}
 	}
 }
 
@@ -173,5 +207,44 @@ func TestRenameStagedPathKeepsCommitted(t *testing.T) {
 	}
 	if !sidecarOf(t, manager, "/new.txt").Committed {
 		t.Fatal("sidecar replacing a committed one was not written as committed")
+	}
+}
+
+// The write that queues a file tells the session of the new sidecar before
+// the file is listed as dirty. Another write of the file takes the listing
+// as its cue to skip the sidecar, and its commit must still find the sidecar
+// to flush.
+func TestQueuedFileIsNeverListedBeforeItsSidecarIsPending(t *testing.T) {
+	manager, err := NewStagingManager(createTestConfig(t))
+	if err != nil {
+		t.Fatalf("NewStagingManager() error = %v", err)
+	}
+	defer manager.Shutdown()
+	const path = "/file.txt"
+
+	// A session whose last commit covered everything, and whose file has
+	// since synced: clean, with nothing pending.
+	session := stageWrite(t, manager, path, "hello")
+	for i := 0; i < 2000; i++ {
+		session.mu.Lock()
+		session.committedMetadataVersion = session.metadataVersion
+		session.mu.Unlock()
+		manager.MarkClean(path)
+
+		listed := make(chan bool)
+		go func() {
+			for !manager.IsDirty(path) {
+			}
+			session.mu.Lock()
+			pending := session.metadataVersion != session.committedMetadataVersion
+			session.mu.Unlock()
+			listed <- pending
+		}()
+		if err := manager.MarkDirty(path, session.GetSize()); err != nil {
+			t.Fatalf("MarkDirty() error = %v", err)
+		}
+		if !<-listed {
+			t.Fatalf("round %d: file listed as dirty with its new sidecar not yet pending for the next commit", i)
+		}
 	}
 }

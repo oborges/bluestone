@@ -2,6 +2,7 @@ package staging
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"testing"
 )
@@ -500,5 +501,46 @@ func TestRenameKeepsDestinationSidecarWhenItsUploadFinishesMidRename(t *testing.
 	}
 	if err := manager.CommitPath(newPath); err != nil {
 		t.Fatalf("CommitPath() of the renamed file error = %v", err)
+	}
+}
+
+// A rename that does not happen leaves the destination as it was. When the
+// destination is dirty and what it had for a sidecar could not be read back,
+// there is nothing to put back: it gets a sidecar written from memory
+// rather than none, since nothing else would write one for a file that is
+// already dirty.
+func TestFailedRenameLeavesDirtyDestinationWithSidecar(t *testing.T) {
+	manager, err := NewStagingManager(createTestConfig(t))
+	if err != nil {
+		t.Fatalf("NewStagingManager() error = %v", err)
+	}
+	defer manager.Shutdown()
+
+	stageWrite(t, manager, "/src.txt", "moved")
+	kept := stageWrite(t, manager, "/dst.txt", "kept")
+	kept.SetMode(0640)
+	sidecar := manager.pathMetadataPath(manager.stagingFilePath("/dst.txt"))
+	if err := os.WriteFile(sidecar, []byte("{"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() { moveStagedFile = os.Rename })
+	moveStagedFile = func(string, string) error { return errors.New("disk gone") }
+	if err := manager.RenameStagedPath("/src.txt", "/dst.txt"); err == nil {
+		t.Fatal("RenameStagedPath() succeeded though the staged bytes could not be moved")
+	}
+
+	state := sidecarOf(t, manager, "/dst.txt")
+	if state.OriginalPath != "/dst.txt" || state.Attributes == nil || state.Attributes.Mode != 0640 {
+		t.Fatalf("destination sidecar after the failed rename = path %q attributes %+v", state.OriginalPath, state.Attributes)
+	}
+	if !manager.IsDirty("/dst.txt") {
+		t.Fatal("destination no longer dirty after the failed rename")
+	}
+	if data, err := os.ReadFile(manager.stagingFilePath("/dst.txt")); err != nil || string(data) != "kept" {
+		t.Fatalf("destination bytes after the failed rename = %q, %v", data, err)
+	}
+	if err := manager.CommitPath("/dst.txt"); err != nil {
+		t.Fatalf("CommitPath() of the destination error = %v", err)
 	}
 }

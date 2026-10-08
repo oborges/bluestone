@@ -113,10 +113,7 @@ func (sm *StagingManager) RenameStagedPath(oldPath, newPath string) error {
 	}
 	if err := moveStagedData(); err != nil {
 		// Nothing moved: take back the intent written above.
-		sm.restorePathMetadata(newSidecar, replacedSidecar)
-		if dest := sm.sessionAt(newPath); dest != nil {
-			dest.metadataChanged()
-		}
+		sm.restorePathMetadata(newPath, newSidecar, replacedSidecar)
 		if os.IsNotExist(err) {
 			// The staged bytes went between the check above and the move:
 			// a sync worker uploaded the file and cleaned up after itself.
@@ -204,9 +201,16 @@ func (sm *StagingManager) dropEntryWithoutStagedBytes(path string) {
 	sm.updateSyncQueueMetrics()
 }
 
-// restorePathMetadata puts a sidecar back to what it was before a rename
-// wrote its intent there: the state it replaced, or nothing.
-func (sm *StagingManager) restorePathMetadata(metadataPath string, replaced *PathMetadataState) {
+// restorePathMetadata puts the sidecar of path back to what it was before a
+// rename wrote its intent there: the state it replaced, or nothing. A path
+// that is dirty is never left with nothing: if what it had could not be read
+// before the rename replaced it, or cannot be written back, its sidecar is
+// written again from what is in memory.
+func (sm *StagingManager) restorePathMetadata(path, metadataPath string, replaced *PathMetadataState) {
+	// Look the session up before taking the sidecar lock: the lookup takes
+	// mu, which must be acquired first.
+	session := sm.sessionAt(path)
+
 	sm.sidecarMu.Lock()
 	defer sm.sidecarMu.Unlock()
 
@@ -220,6 +224,20 @@ func (sm *StagingManager) restorePathMetadata(metadataPath string, replaced *Pat
 		logging.Warn("Failed to take back the staging metadata of a rename that did not happen",
 			zap.String("metadata_path", metadataPath),
 			zap.Error(err))
+	}
+	if (replaced == nil || err != nil) && sm.dirtyIndex.IsDirty(path) {
+		if _, err := sm.recordDirtyPathLocked(path, sessionAttributesIfSet(session)); err != nil {
+			// The next write of the file tries again, and fails until it
+			// has a sidecar.
+			sm.dirtyIndex.MarkUnrecorded(path)
+			logging.Error("Dirty staged file is left without its sidecar after a rename that did not happen",
+				zap.String("path", path),
+				zap.String("metadata_path", metadataPath),
+				zap.Error(err))
+		}
+	}
+	if session != nil {
+		session.metadataChanged()
 	}
 }
 
