@@ -263,3 +263,72 @@ func TestOpenUploadSnapshotDoesNotHoldSessionWhileFlushing(t *testing.T) {
 		t.Fatalf("snapshot reads %q, want %q", data[:n], "hello world")
 	}
 }
+
+// A session can be held for a long time by one operation: a write to it that
+// the kernel makes wait for a slow disk, or a copy of its bytes. Whatever
+// the manager does for every file must not wait for it: counting what is
+// staged before a write, and opening, closing or looking up a file, even the
+// busy one itself.
+func TestBusySessionDoesNotHoldUpTheManager(t *testing.T) {
+	manager, err := NewStagingManager(createTestConfig(t))
+	if err != nil {
+		t.Fatalf("NewStagingManager() error = %v", err)
+	}
+	defer manager.Shutdown()
+	const busy, other = "/busy.txt", "/other.txt"
+
+	busySession := stageWrite(t, manager, busy, "hello")
+	otherSession := stageWrite(t, manager, other, "hello")
+
+	// What a write to the file does for as long as the disk takes.
+	busySession.mu.Lock()
+	released := false
+	release := func() {
+		if !released {
+			released = true
+			busySession.mu.Unlock()
+		}
+	}
+	defer release()
+
+	finishes(t, "counting the staged bytes", func() {
+		if size := manager.GetTotalStagingSize(); size != 10 {
+			t.Errorf("GetTotalStagingSize() = %d, want the 10 bytes staged", size)
+		}
+	})
+	finishes(t, "a write to another file", func() {
+		if _, err := otherSession.Write([]byte(" world"), 5); err != nil {
+			t.Errorf("Write() to another file error = %v", err)
+		}
+		if err := manager.MarkDirty(other, otherSession.GetSize()); err != nil {
+			t.Errorf("MarkDirty() of another file error = %v", err)
+		}
+	})
+	finishes(t, "an open and a close of the busy file", func() {
+		session, err := manager.GetOrCreateSession(busy)
+		if err != nil {
+			t.Errorf("GetOrCreateSession() error = %v", err)
+			return
+		}
+		if refs := session.GetRefCount(); refs != 2 {
+			t.Errorf("references after a second open = %d, want 2", refs)
+		}
+		manager.ReleaseSession(busy)
+	})
+	finishes(t, "an open of another file", func() {
+		if _, err := manager.GetOrCreateSession("/third.txt"); err != nil {
+			t.Errorf("GetOrCreateSession() of another file error = %v", err)
+		}
+	})
+	finishes(t, "the manager's statistics", func() { manager.Stats() })
+
+	release()
+	if refs := busySession.GetRefCount(); refs != 1 {
+		t.Fatalf("references after the open was released = %d, want 1", refs)
+	}
+	manager.ReleaseSession(busy)
+	manager.ReleaseSession(busy)
+	if refs := busySession.GetRefCount(); refs != 0 {
+		t.Fatalf("references after more releases than opens = %d, want 0", refs)
+	}
+}

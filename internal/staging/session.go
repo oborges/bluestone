@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/oborges/bluestone/pkg/types"
@@ -12,6 +13,10 @@ import (
 
 // WriteSession represents an active write session for a file path
 // Sessions are path-scoped and survive file handle open/close cycles
+//
+// Size and RefCount are read without the session lock (GetSize,
+// GetRefCount). Once a session is in use they are only written with the
+// atomic operations, Size under the lock as well.
 type WriteSession struct {
 	Manager     *StagingManager
 	Path        string
@@ -341,7 +346,7 @@ func (ws *WriteSession) write(data []byte, offset int64) (n int, droppedTime boo
 	// Update size
 	newSize := offset + int64(n)
 	if newSize > ws.Size {
-		ws.Size = newSize
+		atomic.StoreInt64(&ws.Size, newSize)
 	}
 
 	ws.Multipart.MarkModified(offset)
@@ -474,7 +479,7 @@ func (ws *WriteSession) Snapshot() (stagingPath string, size int64, mode os.File
 	if ws.Multipart != nil {
 		partSize = ws.Multipart.PartSize
 	}
-	return ws.StagingPath, ws.Size, ws.Mode, ws.UID, ws.GID, ws.RefCount, ws.LastWrite, partSize
+	return ws.StagingPath, ws.Size, ws.Mode, ws.UID, ws.GID, ws.GetRefCount(), ws.LastWrite, partSize
 }
 
 // Close closes the staging file
@@ -492,40 +497,35 @@ func (ws *WriteSession) Close() error {
 	return nil
 }
 
-// GetSize returns the current file size
+// GetSize returns the current file size. It does not take the session lock,
+// and neither do the reference count methods below. The manager uses them
+// under locks of its own that every file shares: it adds up the size of each
+// session before a write, and counts a reference whenever a file is opened
+// or closed. Waiting there for one session, held for as long as the disk
+// takes over a write to it, kept the writes, opens and stats of every other
+// file waiting too.
 func (ws *WriteSession) GetSize() int64 {
-	ws.mu.Lock()
-	defer ws.mu.Unlock()
-
-	return ws.Size
+	return atomic.LoadInt64(&ws.Size)
 }
 
 // IncrementRefCount increments the reference count
 func (ws *WriteSession) IncrementRefCount() {
-	ws.mu.Lock()
-	defer ws.mu.Unlock()
-
-	ws.RefCount++
-	ws.LastAccess = time.Now()
+	atomic.AddInt32(&ws.RefCount, 1)
 }
 
 // DecrementRefCount decrements the reference count
 func (ws *WriteSession) DecrementRefCount() {
-	ws.mu.Lock()
-	defer ws.mu.Unlock()
-
-	if ws.RefCount > 0 {
-		ws.RefCount--
+	for {
+		current := atomic.LoadInt32(&ws.RefCount)
+		if current <= 0 || atomic.CompareAndSwapInt32(&ws.RefCount, current, current-1) {
+			return
+		}
 	}
-	ws.LastAccess = time.Now()
 }
 
 // GetRefCount returns the current reference count
 func (ws *WriteSession) GetRefCount() int32 {
-	ws.mu.Lock()
-	defer ws.mu.Unlock()
-
-	return ws.RefCount
+	return atomic.LoadInt32(&ws.RefCount)
 }
 
 // Truncate truncates the staging file to the specified size
@@ -563,7 +563,7 @@ func (ws *WriteSession) Truncate(size int64) error {
 	ws.Multipart.MarkModified(firstChanged)
 
 	// Update size and mark as dirty
-	ws.Size = size
+	atomic.StoreInt64(&ws.Size, size)
 	if size == 0 {
 		ws.written = false
 	}
@@ -599,7 +599,7 @@ func (ws *WriteSession) Prefetch(fetcher func() error) error {
 	}
 
 	if stat, err := ws.File.Stat(); err == nil {
-		ws.Size = stat.Size()
+		atomic.StoreInt64(&ws.Size, stat.Size())
 	}
 
 	ws.Prefetched = true
