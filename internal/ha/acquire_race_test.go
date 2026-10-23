@@ -12,10 +12,10 @@ import (
 // hookStore is a memStore that lets a test act between the steps of Acquire.
 type hookStore struct {
 	*memStore
-	// beforeGet and afterPut run on every read and after every successful
+	// afterGet and afterPut run after every read and after every successful
 	// write of the lease.
-	beforeGet func()
-	afterPut  func()
+	afterGet func()
+	afterPut func()
 	// failGets fails that many reads, counted from the first write on.
 	failGets int
 	put      bool
@@ -23,9 +23,6 @@ type hookStore struct {
 }
 
 func (s *hookStore) GetObject(ctx context.Context, key string) ([]byte, error) {
-	if s.beforeGet != nil {
-		s.beforeGet()
-	}
 	s.mu.Lock()
 	fail := s.put && s.failGets > 0
 	if fail {
@@ -35,7 +32,11 @@ func (s *hookStore) GetObject(ctx context.Context, key string) ([]byte, error) {
 	if fail {
 		return nil, errStoreDown
 	}
-	return s.memStore.GetObject(ctx, key)
+	data, err := s.memStore.GetObject(ctx, key)
+	if s.afterGet != nil {
+		s.afterGet()
+	}
+	return data, err
 }
 
 func (s *hookStore) PutObject(ctx context.Context, key string, data []byte, metadata map[string]string) error {
@@ -107,10 +108,15 @@ func TestAcquireStandsDownWhenAnotherGatewayWroteLast(t *testing.T) {
 
 // Two gateways that start together both find the lease free and both write
 // it. Only the one whose write the bucket kept may serve.
+//
+// Each gateway waits for the other after its first read, not before it:
+// held before, one could read, write and wait while the other was still to
+// be scheduled, and that one then read a fresh lease, never wrote, and left
+// the first waiting for good.
 func TestSimultaneousAcquireLeavesOneHolder(t *testing.T) {
 	mem := newMemStore()
 	reads, writes := newBarrier(2), newBarrier(2)
-	store := &hookStore{memStore: mem, beforeGet: reads.wait, afterPut: writes.wait}
+	store := &hookStore{memStore: mem, afterGet: reads.wait, afterPut: writes.wait}
 
 	managers := make([]*Manager, 2)
 	errs := make([]error, 2)
