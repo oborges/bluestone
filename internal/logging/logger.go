@@ -4,15 +4,17 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync/atomic"
 
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
 
 var (
-	// Global logger instance
-	logger *zap.Logger
-	sugar  *zap.SugaredLogger
+	// Global logger instance. Logging from goroutines can start before
+	// Initialize, as in tests, so both are read and set atomically.
+	logger atomic.Pointer[zap.Logger]
+	sugar  atomic.Pointer[zap.SugaredLogger]
 )
 
 // Config represents logging configuration
@@ -56,8 +58,8 @@ func Initialize(config Config) error {
 		return fmt.Errorf("failed to build logger: %w", err)
 	}
 
-	logger = l
-	sugar = l.Sugar()
+	logger.Store(l)
+	sugar.Store(l.Sugar())
 
 	return nil
 }
@@ -80,27 +82,34 @@ func parseLevel(level string) (zapcore.Level, error) {
 
 // GetLogger returns the global logger
 func GetLogger() *zap.Logger {
-	if logger == nil {
-		// Fallback to default logger
-		logger, _ = zap.NewProduction()
+	if l := logger.Load(); l != nil {
+		return l
 	}
-	return logger
+	// Fallback to default logger
+	l, _ := zap.NewProduction()
+	if logger.CompareAndSwap(nil, l) {
+		return l
+	}
+	return logger.Load()
 }
 
 // GetSugaredLogger returns the global sugared logger
 func GetSugaredLogger() *zap.SugaredLogger {
-	if sugar == nil {
-		// Fallback to default logger
-		l, _ := zap.NewProduction()
-		sugar = l.Sugar()
+	if s := sugar.Load(); s != nil {
+		return s
 	}
-	return sugar
+	// Fallback to default logger
+	l, _ := zap.NewProduction()
+	if sugar.CompareAndSwap(nil, l.Sugar()) {
+		return sugar.Load()
+	}
+	return sugar.Load()
 }
 
 // Sync flushes any buffered log entries
 func Sync() error {
-	if logger != nil {
-		return logger.Sync()
+	if l := logger.Load(); l != nil {
+		return l.Sync()
 	}
 	return nil
 }
